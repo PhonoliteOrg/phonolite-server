@@ -12,6 +12,7 @@ use crate::config::{resolve_path, ServerConfig};
 use crate::state::AppState;
 use crate::streaming::{
     build_raw_opus_meta, parse_frame_ms, parse_transcode_mode, parse_transcode_quality,
+    transcode_mode_label, transcode_quality_label,
 };
 use crate::transcode::{BitrateSelector, TranscodeMode, TranscodeQuality};
 use common::join_relpath;
@@ -720,7 +721,15 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             }
             client.session.active_track = Some(track_id.clone());
             ensure_active_in_queue(&mut client.session);
+            let mut frame_ms = active_frame_ms(&client.session);
+            let mut mode_label: Option<&str> = None;
+            let mut quality_label: Option<&str> = None;
             if let Some(stream_id) = client.session.track_streams.get(&track_id).cloned() {
+                if let Some(outgoing) = client.session.outgoing.get(&stream_id) {
+                    frame_ms = outgoing.frame_ms;
+                    mode_label = Some(transcode_mode_label(outgoing.mode));
+                    quality_label = Some(transcode_quality_label(outgoing.quality));
+                }
                 tracing::info!(
                     "QUIC seek switching streams track={} stream_id={}",
                     track_id,
@@ -732,7 +741,6 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     .conn
                     .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
             }
-            let frame_ms = active_frame_ms(&client.session);
             if let Err(err) = start_track_stream(
                 state,
                 client,
@@ -740,8 +748,8 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 StreamRole::Active,
                 frame_ms,
                 position_ms,
-                None,
-                None,
+                mode_label,
+                quality_label,
             ) {
                 tracing::warn!("QUIC seek failed: {}", err);
                 send_control(client, ControlResponse::Error { message: &err });
