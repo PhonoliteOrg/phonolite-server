@@ -721,40 +721,30 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             client.session.active_track = Some(track_id.clone());
             ensure_active_in_queue(&mut client.session);
             if let Some(stream_id) = client.session.track_streams.get(&track_id).cloned() {
-                if let Some(outgoing) = client.session.outgoing.get_mut(&stream_id) {
-                    if let Err(err) = seek_track_stream(state, outgoing, &track_id, position_ms) {
-                        tracing::warn!("QUIC seek failed: {}", err);
-                        send_control(
-                            client,
-                            ControlResponse::Error { message: &err },
-                        );
-                    }
-                } else {
-                    let err = "stream not found".to_string();
-                    tracing::warn!("QUIC seek failed: {}", err);
-                    send_control(
-                        client,
-                        ControlResponse::Error { message: &err },
-                    );
-                }
-            } else {
-                let frame_ms = active_frame_ms(&client.session);
-                if let Err(err) = start_track_stream(
-                    state,
-                    client,
+                tracing::info!(
+                    "QUIC seek switching streams track={} stream_id={}",
                     track_id,
-                    StreamRole::Active,
-                    frame_ms,
-                    position_ms,
-                    None,
-                    None,
-                ) {
-                    tracing::warn!("QUIC seek fallback failed: {}", err);
-                    send_control(
-                        client,
-                        ControlResponse::Error { message: &err },
-                    );
-                }
+                    stream_id
+                );
+                client.session.track_streams.remove(&track_id);
+                client.session.outgoing.remove(&stream_id);
+                let _ = client
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+            }
+            let frame_ms = active_frame_ms(&client.session);
+            if let Err(err) = start_track_stream(
+                state,
+                client,
+                track_id,
+                StreamRole::Active,
+                frame_ms,
+                position_ms,
+                None,
+                None,
+            ) {
+                tracing::warn!("QUIC seek failed: {}", err);
+                send_control(client, ControlResponse::Error { message: &err });
             }
         }
         ControlMessage::Ping { ts } => {
