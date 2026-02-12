@@ -1,0 +1,43 @@
+<header class="nav {{nav_class}}">
+  <div class="brand">
+    <div class="brand-mark">RF</div>
+    <div>
+      <div class="brand-title">Phonolite</div>
+      <div class="brand-sub">admin console</div>
+    </div>
+  </div>
+  <div class="nav-links">
+    <a href="/library">Library</a>
+    <a href="/">Users</a>
+    <a href="/activity" class="nav-activity">Activity<span class="nav-badge" id="activity-badge" hidden>0</span></a>
+    <a href="/settings">Settings</a>
+    <div class="nav-menu">
+      <button class="button ghost nav-icon" type="button" id="nav-menu-toggle" aria-label="Admin actions">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 2v8"/>
+          <path d="M7.03 4.47a9 9 0 1 0 9.94 0"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+<div class="modal" id="nav-modal" aria-hidden="true">
+  <div class="modal-backdrop" data-modal-close></div>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3>Admin actions</h3>
+      <button class="modal-close" type="button" data-modal-close aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <div class="stack">
+      <form method="post" action="/logout">
+        <button class="nav-item" type="submit">Log out</button>
+      </form>
+      <button class="nav-item" type="button" data-action="restart">Restart server</button>
+      <button class="nav-item danger" type="button" data-action="shutdown">Shut down</button>
+    </div>
+  </div>
+</div>

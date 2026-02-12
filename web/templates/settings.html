@@ -1,0 +1,136 @@
+<div class="page-title">
+  <div>
+    <h2>Settings</h2>
+    <p class="muted">Update configuration values. Port and index path changes require a restart.</p>
+  </div>
+</div>
+{{message}}
+<form method="post" action="/settings" id="settings">
+  <div class="card">
+    <h3>Library</h3>
+    <p class="hint">Config file: <code>{{config_path}}</code></p>
+    <label>Music root (relative to config file if not absolute)</label>
+    <input name="music_root" type="text" value="{{music_root}}" placeholder="Not set" />
+    <p class="hint">Path must exist. The server reports an error if the folder is not found.</p>
+    <label>Index path (relative to config file if not absolute)</label>
+    <input name="index_path" type="text" value="{{index_path}}" required />
+    <p class="hint">Default index location: <code>{{index_full_path}}</code></p>
+    <label>Metadata assets path (relative to config file if not absolute)</label>
+    <input name="metadata_path" type="text" value="{{metadata_path}}" required />
+    <p class="hint">Default metadata location: <code>{{metadata_full_path}}</code></p>
+    <div class="divider"></div>
+    <div class="stack">
+      <p class="muted">
+        Scan checks for new files and missing metadata. Reindex clears the index and all downloaded
+        metadata/artwork before rescanning.
+      </p>
+      <div class="row">
+        <button class="button" type="submit" formaction="/settings/scan" formmethod="post">
+          Scan library
+        </button>
+        <button
+          class="button warn"
+          type="submit"
+          id="open-reindex"
+          data-action="reindex"
+          formaction="/settings/reindex"
+          formmethod="post"
+        >
+          Reindex library
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="card server-card">
+    <h3>Server</h3>
+    <div class="field-row">
+      <label for="port">Port</label>
+      <input id="port" name="port" type="number" min="1" max="65535" value="{{port}}" required />
+    </div>
+    <div class="field-row">
+      <label for="quic_port">QUIC port</label>
+      <input
+        id="quic_port"
+        name="quic_port"
+        type="number"
+        min="1"
+        max="65535"
+        value="{{quic_port}}"
+        required
+      />
+    </div>
+    <p class="hint">QUIC port must be different from the HTTP port.</p>
+    <div class="field-row">
+      <label for="session_ttl_secs">Session TTL (seconds)</label>
+      <input
+        id="session_ttl_secs"
+        name="session_ttl_secs"
+        type="number"
+        min="1"
+        value="{{session_ttl_secs}}"
+        required
+      />
+    </div>
+  </div>
+  <div class="card">
+    <h3>Library watcher</h3>
+    <label class="row">
+      <input name="watch_music" type="checkbox" {{watch_checked}} />
+      Watch music folder for changes
+    </label>
+    <label>Watch debounce (seconds)</label>
+    <input name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
+  </div>
+  <div class="card">
+    <h3>Listening stats</h3>
+    <label class="row">
+      <input name="stats_collection_enabled" type="checkbox" {{stats_collection_checked}} />
+      Enable per-user listening stats (monthly + yearly)
+    </label>
+    <p class="hint">Disabled by default. When enabled, the server aggregates playtime by month/year.</p>
+  </div>
+  <div class="card" id="metadata-card">
+    <div class="row space-between">
+      <div>
+        <h3>External metadata</h3>
+        <p class="muted">Add providers to fill missing summaries and genres.</p>
+      </div>
+      <button class="button ghost" type="button" id="open-metadata-add">Add source</button>
+    </div>
+    <div class="source-list" id="metadata-sources">
+      {{metadata_sources}}
+    </div>
+    <label>Retry interval (seconds)</label>
+    <input
+      name="external_metadata_min_interval_secs"
+      type="number"
+      min="1"
+      value="{{external_min_interval_secs}}"
+      required
+    />
+    <label>Request timeout (seconds)</label>
+    <input
+      name="external_metadata_timeout_secs"
+      type="number"
+      min="1"
+      value="{{external_timeout_secs}}"
+      required
+    />
+    <label class="row">
+      <input name="external_metadata_on_tag_error" type="checkbox" {{external_tag_error_checked}} />
+      Enrich when tag reading fails
+    </label>
+    <label>Max items to enrich per scan</label>
+    <input name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
+  </div>
+</form>
+<div class="card">
+  <div class="row space-between">
+    <div>
+      <h3>Save changes</h3>
+      <p class="muted">Settings apply immediately except port and index path.</p>
+    </div>
+    <button type="submit" form="settings" id="save-settings" class="button" disabled>Save settings</button>
+  </div>
+</div>
+{{modals}}

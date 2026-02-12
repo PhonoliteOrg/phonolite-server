@@ -1,0 +1,16 @@
+<div class="card auth-card">
+  <div class="page-title">
+    <div>
+      <h2>Admin login</h2>
+      <p class="muted">Sign in to manage users and server settings.</p>
+    </div>
+  </div>
+  {{message}}
+  <form method="post" action="/login" class="stack">
+    <label>Username</label>
+    <input name="username" type="text" required />
+    <label>Password</label>
+    <input name="password" type="password" required />
+    <button type="submit">Sign in</button>
+  </form>
+</div>

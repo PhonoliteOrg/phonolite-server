@@ -1,0 +1,36 @@
+<div class="modal" id="modal-metadata-edit">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3>Edit metadata source</h3>
+    </div>
+    <form class="stack" id="form-metadata-edit">
+      <input type="hidden" name="source_id" />
+      <label>Provider</label>
+      <select name="provider" id="metadata-edit-provider">
+        <option value="theaudiodb">TheAudioDB</option>
+        <option value="musicbrainz">MusicBrainz</option>
+      </select>
+      <div class="provider-fields" data-provider="theaudiodb">
+        <label>API key</label>
+        <input name="api_key" type="password" placeholder="TheAudioDB API key" />
+      </div>
+      <div class="provider-fields" data-provider="musicbrainz">
+        <label>User agent</label>
+        <input
+          name="user_agent"
+          type="text"
+          placeholder="AppName/1.0 (contact@example.com)"
+        />
+      </div>
+      <div class="inline-error" id="metadata-edit-error"></div>
+      <div class="row space-between">
+        <button class="button ghost" type="button" id="metadata-test">Test</button>
+        <div class="row">
+          <button class="button ghost" type="button" data-close>Cancel</button>
+          <button class="button" type="submit">Save changes</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>

@@ -1,0 +1,13 @@
+﻿[package]
+name = "codecs_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+ffi-opus = []
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"

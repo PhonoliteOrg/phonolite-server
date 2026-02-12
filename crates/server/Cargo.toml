@@ -1,0 +1,38 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+library = { path = "../library" }
+metadata = { path = "../metadata" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+mime_guess = { workspace = true }
+tokio-util = { workspace = true }
+blake3 = { workspace = true }
+notify = { workspace = true }
+redb = { workspace = true }
+bincode = { workspace = true }
+argon2 = { workspace = true }
+rand_core = { workspace = true }
+serde_yaml = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+codecs_ffi = { path = "../codecs_ffi", features = ["ffi-opus"] }
+rand = "0.9.2"
+sha2 = "0.10.9"
+uuid = { version = "1.19.0", features = ["v4"] }
+time = "0.3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "pcm"] }
+tokio-stream = "0.1"
+futures-util = { version = "0.3", features = ["sink"] }
+quiche = { version = "0.20", default-features = false, features = ["boringssl-vendored"] }
+rcgen = "0.13"

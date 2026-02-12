@@ -1,0 +1,16 @@
+<div class="search-card">
+  <form method="get" action="/library" class="search-form">
+    <div class="search-input-wrapper">
+        <input type="text" name="search" placeholder="Search artists, albums, tracks..." value="{{value}}" class="search-input" />
+        <div class="search-icon-container">
+            {{clear_button}}
+            <button class="icon-button search-submit" type="submit" title="Search" aria-label="Search">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M10.5 3a7.5 7.5 0 0 1 5.96 12.05l4.25 4.25a1 1 0 1 1-1.41 1.41l-4.25-4.25A7.5 7.5 0 1 1 10.5 3Zm0 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Z"/>
+              </svg>
+            </button>
+        </div>
+    </div>
+    {{hidden_filter}}
+  </form>
+</div>

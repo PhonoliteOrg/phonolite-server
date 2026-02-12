@@ -1,0 +1,32 @@
+<div class="stack">
+    {{message}}
+    <div class="card" id="users-card" data-current-user-id="{{current_user_id}}" data-current-user-role="{{current_user_role}}">
+        <div class="row space-between">
+            <h2>Users</h2>
+            <div class="row">
+                <button id="toggle-edit" class="button ghost">Edit mode</button>
+                <button id="open-add" class="button primary">Add User</button>
+            </div>
+        </div>
+        <div id="users-inline-message" class="inline-error"></div>
+        <div id="bulk-bar" class="bulk-bar row space-between hidden">
+            <span id="bulk-count">0 selected</span>
+            <button id="bulk-delete" class="button danger small">Delete Selected</button>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th class="select-cell"></th>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{user_rows}}
+            </tbody>
+        </table>
+    </div>
+</div>
+{{modals}}

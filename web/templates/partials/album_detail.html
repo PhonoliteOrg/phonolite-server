@@ -1,0 +1,30 @@
+<div class="detail-shell">
+  <div class="card detail-album">
+    {{cover}}
+    <div class="detail-album-body">
+      <div class="detail-section-title">
+        <div>
+          <h3>{{title}}</h3>
+          <p class="muted"><a href="{{artist_link}}">{{artist_name}}</a></p>
+        </div>
+      </div>
+      <div class="meta-grid">
+        <div class="meta-row"><span class="meta-label">Year</span><span class="meta-value">{{year}}</span></div>
+        <div class="meta-row"><span class="meta-label">Genres</span><span class="meta-value">{{genres}}</span></div>
+        <div class="meta-row"><span class="meta-label">Folder</span><span class="meta-value"><code>{{folder}}</code></span></div>
+      </div>
+    </div>
+  </div>
+  <div class="card detail-bio">
+    <div class="detail-section-title">
+      <h3>Summary</h3>
+    </div>
+    <p class="detail-text">{{summary}}</p>
+  </div>
+  <div class="card detail-tracks">
+    <div class="detail-section-title">
+      <h3>Tracks</h3>
+    </div>
+    {{track_table}}
+  </div>
+</div>

@@ -1,0 +1,14 @@
+<div class="source-row" data-source-id="{{id}}" data-provider="{{provider}}" data-api-key="{{api_key}}" data-user-agent="{{user_agent}}">
+  <div class="source-main">
+    <div class="source-title">{{label}}</div>
+    <div class="source-meta">{{detail}}</div>
+  </div>
+  <div class="source-actions">
+    <label class="toggle-wrap">
+      <input class="toggle source-toggle" type="checkbox" data-source-id="{{id}}" {{checked}} />
+      <span class="toggle-label">Enabled</span>
+    </label>
+    <button type="button" class="icon-button" data-action="edit-source" title="Edit source" aria-label="Edit source"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm2.92 2.83H5v-.92l9.06-9.06.92.92L5.92 20.08zM20.71 7.04a1.003 1.003 0 0 0 0-1.42l-2.34-2.34a1.003 1.003 0 0 0-1.42 0l-1.83 1.83 3.75 3.75 1.84-1.82z"/></svg></button>
+    <button type="button" class="icon-button danger" data-action="delete-source" title="Delete source" aria-label="Delete source"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 3h6l1 2h4v2h-2v12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9z"/></svg></button>
+  </div>
+</div>

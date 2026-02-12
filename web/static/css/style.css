@@ -1,0 +1,125 @@
+
+/* Tile Layout */
+.tile-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 20px;
+}
+
+.tile {
+    display: flex;
+    flex-direction: column;
+    background-color: #282828;
+    border-radius: 8px;
+    padding: 16px;
+    text-decoration: none;
+    color: white;
+    transition: background-color 0.2s ease;
+}
+
+.tile:hover {
+    background-color: #383838;
+}
+
+.tile-cover {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background-color: #333;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid #444;
+    margin-bottom: 12px;
+}
+
+.tile-body {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+}
+
+.tile-title {
+    font-weight: bold;
+    font-size: 1.1em;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-meta {
+    font-size: 0.9em;
+    color: #aaa;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-summary {
+    font-size: 0.9em;
+    color: #888;
+    margin-top: auto;
+    padding-top: 8px;
+    max-height: 5.4em; /* 3 lines */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-genres {
+    font-size: 0.8em;
+    color: #999;
+    margin-top: 4px;
+}
+
+/* Artist specific tile style */
+.tile-artist .tile-cover {
+    border-radius: 50%;
+    object-fit: contain;
+}
+
+.tile-artist .tile-body {
+    text-align: center;
+}
+/* Extracted from app.js */
+.card, .album-card {
+  border-left: none !important;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1) !important;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.album-card {
+  display: flex;
+  flex-direction: column;
+  padding: 0 !important;
+}
+.album-card img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+.album-card > div:not(img) {
+  padding: 12px;
+}
+
+/* Extracted from Rust inline styles */
+.text-center { text-align: center; }
+.artist-cover-img { border-radius: 50%; object-fit: contain; background-color: #222; }
+.artist-cover-placeholder { border-radius: 50%; background-color: #222; }
+.filter-row-container { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.search-card { padding: 8px 16px; }
+.search-form { display: flex; align-items: center; position: relative; }
+.search-input-wrapper { position: relative; flex-grow: 1; display: flex; align-items: center; }
+.search-input { width: 100%; padding: 12px 0; padding-right: 80px; border: none; background: transparent; font-size: 1.1em; outline: none; }
+.search-icon-container { position: absolute; right: 0; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 4px; }
+.search-submit { color: var(--primary); }
+.snapshot-card { margin-top: 10px; display: flex; justify-content: space-around; padding: 12px; text-align: center; }
+.snapshot-value { font-size: 1.2em; font-weight: bold; }
+.snapshot-label { font-size: 0.85em; }
+.artist-header-default { padding: 40px; background: #333; border-radius: 8px; color: white; }
+.artist-header-dynamic { background-size: cover; background-position: center; padding: 40px; border-radius: 8px; color: white; }
+.artist-logo { max-height: 150px; max-width: 100%; object-fit: contain; margin-bottom: 20px; }
+.artist-header-content { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.artist-name-large { margin: 0; font-size: 2.5em; }
+.artist-subtitle { opacity: 0.8; }
+.row-mt-20 { margin-top: 20px; }

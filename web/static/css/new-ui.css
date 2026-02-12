@@ -1,0 +1,82 @@
+/* Tile Layout */
+.tile-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 20px;
+}
+
+.tile {
+    display: flex;
+    flex-direction: column;
+    background-color: #282828;
+    border-radius: 8px;
+    padding: 16px;
+    text-decoration: none;
+    color: white;
+    transition: background-color 0.2s ease;
+}
+
+.tile:hover {
+    background-color: #383838;
+}
+
+.tile-cover {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background-color: #333;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid #444;
+    margin-bottom: 12px;
+}
+
+.tile-body {
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+}
+
+.tile-title {
+    font-weight: bold;
+    font-size: 1.1em;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-meta {
+    font-size: 0.9em;
+    color: #aaa;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-summary {
+    font-size: 0.9em;
+    color: #888;
+    margin-top: auto;
+    padding-top: 8px;
+    max-height: 5.4em; /* 3 lines */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tile-genres {
+    font-size: 0.8em;
+    color: #999;
+    margin-top: 4px;
+}
+
+/* Artist specific tile style */
+.tile-artist .tile-cover {
+    border-radius: 50%;
+    object-fit: contain;
+}
+
+.tile-artist .tile-body {
+    text-align: center;
+}

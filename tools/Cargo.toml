@@ -1,0 +1,13 @@
+[package]
+name = "tools"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "import_scan"
+path = "import_scan.rs"
+
+[dependencies]
+library = { path = "../crates/library" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

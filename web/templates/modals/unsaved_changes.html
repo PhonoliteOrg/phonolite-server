@@ -1,0 +1,18 @@
+<div class="modal" id="modal-unsaved">
+  <div class="modal-backdrop" data-close-unsaved></div>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3>Discard changes?</h3>
+      <button class="modal-close" type="button" data-close-unsaved aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <p class="muted">You have unsaved settings changes. Discard them and leave this page?</p>
+    <div class="row">
+      <button class="button ghost" type="button" id="unsaved-stay">Keep editing</button>
+      <button class="button warn" type="button" id="unsaved-discard">Discard changes</button>
+    </div>
+  </div>
+</div>
