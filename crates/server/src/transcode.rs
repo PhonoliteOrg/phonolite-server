@@ -18,6 +18,7 @@ use symphonia::core::units::Time;
 
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_FRAME_MS: u32 = 20;
+const MAX_SEEK_SKIP_MS: u32 = 250;
 
 pub struct BitrateSelector {
     pub mode: TranscodeMode,
@@ -120,7 +121,8 @@ fn transcode_to_opus(
         let seconds = (start_ms / 1000) as u64;
         let frac = (start_ms % 1000) as f64 / 1000.0;
         let time = Time::new(seconds, frac);
-        match format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(track_id) }) {
+        let seek_mode = SeekMode::Coarse;
+        match format.seek(seek_mode, SeekTo::Time { time, track_id: Some(track_id) }) {
             Ok(seeked) => {
                 seek_used = true;
                 if let Some(time_base) = track_time_base {
@@ -130,8 +132,21 @@ fn transcode_to_opus(
                     let actual_secs = actual.seconds as f64 + actual.frac;
                     let delta_secs = required_secs - actual_secs;
                     if delta_secs > 0.0 {
-                        seek_skip_per_channel =
-                            Some((delta_secs * TARGET_SAMPLE_RATE as f64).round() as u64);
+                        let skip = (delta_secs * TARGET_SAMPLE_RATE as f64).round() as u64;
+                        let max_skip = (TARGET_SAMPLE_RATE as u64)
+                            .saturating_mul(MAX_SEEK_SKIP_MS as u64)
+                            / 1000;
+                        if skip > max_skip {
+                            tracing::info!(
+                                "QUIC transcode seek skip capped: requested_skip={} max_skip={} (ms={})",
+                                skip,
+                                max_skip,
+                                MAX_SEEK_SKIP_MS
+                            );
+                            seek_skip_per_channel = None;
+                        } else {
+                            seek_skip_per_channel = Some(skip);
+                        }
                     }
                 }
                 decoder = symphonia::default::get_codecs()
