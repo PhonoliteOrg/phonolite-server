@@ -1,0 +1,45 @@
+<div class="page-title">
+  <div>
+    <h2>Logs</h2>
+    <p class="muted">Live server logs. Showing the most recent {{log_limit}} lines.</p>
+  </div>
+  <div class="row">
+    <span class="tag">limit {{log_limit}}</span>
+    <button class="button ghost small" type="button" id="logs-refresh">Refresh</button>
+  </div>
+</div>
+<div class="row log-tabs" id="log-tabs">
+  <button class="tab-chip active" type="button" data-log="all">All</button>
+  <button class="tab-chip" type="button" data-log="info">Info</button>
+  <button class="tab-chip" type="button" data-log="warnings">Warnings</button>
+  <button class="tab-chip" type="button" data-log="errors">Errors</button>
+  <button class="tab-chip" type="button" data-log="issues">Issues</button>
+  <button class="tab-chip" type="button" data-log="activities">Activities</button>
+  <button class="tab-chip" type="button" data-log="debug">Debug</button>
+</div>
+<div class="card log-card" data-log-limit="{{log_limit}}">
+  <div class="row space-between log-header">
+    <div>
+      <h3>Server log</h3>
+      <p class="muted">Directory: <code>{{log_dir}}</code></p>
+    </div>
+    <div class="row log-controls">
+      <label class="row log-follow">
+        <input type="checkbox" id="logs-follow" checked />
+        Follow
+      </label>
+      <label class="row log-follow">
+        <input type="checkbox" class="toggle" id="logs-debug" {{log_debug_checked}} />
+        Debug logs
+      </label>
+    </div>
+  </div>
+  <div class="log-panel" id="log-panel">
+    <div class="log-view hidden" id="log-view" aria-live="polite"></div>
+    <div class="log-empty hidden" id="log-empty">No logs for this view yet.</div>
+    <div class="log-spinner hidden" id="log-spinner">
+      <div class="spinner"></div>
+      <span>Loading log view...</span>
+    </div>
+  </div>
+</div>

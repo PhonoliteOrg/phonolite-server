@@ -40,6 +40,7 @@ pub struct StatsTrack {
     pub title: String,
     pub artist: String,
     pub minutes: u64,
+    pub plays: u64,
 }
 
 pub async fn get_stats(
@@ -76,9 +77,18 @@ pub async fn get_stats(
         }));
     };
 
-    let top_tracks = top_n(&stats.track_ms, 5)
+    let top_tracks_source = if stats.track_plays.is_empty() {
+        top_n(&stats.track_ms, 5)
+            .into_iter()
+            .map(|(id, _)| (id, 0))
+            .collect::<Vec<_>>()
+    } else {
+        top_n(&stats.track_plays, 5)
+    };
+
+    let top_tracks = top_tracks_source
         .into_iter()
-        .map(|(track_id, ms)| {
+        .map(|(track_id, plays)| {
             let (title, artist_name) = match library.get_track(&track_id) {
                 Ok(Some(track)) => {
                     let artist_name = library
@@ -91,11 +101,17 @@ pub async fn get_stats(
                 }
                 _ => ("Unknown Track".to_string(), "Unknown Artist".to_string()),
             };
+            let minutes = stats
+                .track_ms
+                .get(&track_id)
+                .map(|ms| ms_to_minutes(*ms))
+                .unwrap_or(0);
             StatsTrack {
                 id: track_id,
                 title,
                 artist: artist_name,
-                minutes: ms_to_minutes(ms),
+                minutes,
+                plays,
             }
         })
         .collect();

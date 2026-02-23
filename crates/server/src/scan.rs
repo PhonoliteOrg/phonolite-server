@@ -31,7 +31,7 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
     tokio::spawn(async move {
         let _ = state
             .activity
-            .add_event("index", "Library scan started.");
+            .add_activity("Library rescan started.");
         if force_rescan {
             if let Err(e) = clear_metadata_assets(&state).await {
                 warn!("Failed to clear metadata: {}", e);
@@ -63,13 +63,10 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                     "Library ready: {} artists, {} albums, {} tracks",
                     stats.artists, stats.albums, stats.tracks
                 );
-                let _ = state.activity.add_event(
-                    "index",
-                    format!(
-                        "Library scan finished: {} artists, {} albums, {} tracks.",
-                        stats.artists, stats.albums, stats.tracks
-                    ),
-                );
+                let _ = state.activity.add_activity(format!(
+                    "Library scan finished: {} artists, {} albums, {} tracks.",
+                    stats.artists, stats.albums, stats.tracks
+                ));
                 configure_watcher(&state, &library, root);
                 if scanned {
                     start_enrichment_sweep(state.clone(), library.clone(), true);
@@ -87,7 +84,7 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                 }
                 warn!("Library scan failed: {}", message);
                 let _ = state.activity.add_event(
-                    "index",
+                    "ERROR",
                     format!("Library scan failed: {}", message),
                 );
             }
@@ -100,7 +97,7 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                 }
                 warn!("Library scan join error: {}", message);
                 let _ = state.activity.add_event(
-                    "index",
+                    "ERROR",
                     format!("Library scan failed: {}", message),
                 );
             }
@@ -119,7 +116,7 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
     tokio::spawn(async move {
         let _ = state
             .activity
-            .add_event("index", "Library scan started.");
+            .add_activity("Library scan started.");
         if replace_complete {
             if let Err(e) = clear_metadata_assets(&state).await {
                 warn!("Failed to clear metadata: {}", e);
@@ -134,13 +131,10 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                     "Library rescan complete: {} artists, {} albums, {} tracks",
                     stats.artists, stats.albums, stats.tracks
                 );
-                let _ = state.activity.add_event(
-                    "index",
-                    format!(
-                        "Library scan finished: {} artists, {} albums, {} tracks.",
-                        stats.artists, stats.albums, stats.tracks
-                    ),
-                );
+                let _ = state.activity.add_activity(format!(
+                    "Library scan finished: {} artists, {} albums, {} tracks.",
+                    stats.artists, stats.albums, stats.tracks
+                ));
                 start_enrichment_sweep(state.clone(), library_clone.clone(), replace_complete);
                 start_cover_sweep(state.clone(), library_clone);
             }
@@ -150,7 +144,7 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                 guard.status = LibraryStatus::Error(message.clone());
                 warn!("Library rescan failed: {}", message);
                 let _ = state.activity.add_event(
-                    "index",
+                    "ERROR",
                     format!("Library scan failed: {}", message),
                 );
             }
@@ -160,7 +154,7 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                 guard.status = LibraryStatus::Error(message.clone());
                 warn!("Library rescan join error: {}", message);
                 let _ = state.activity.add_event(
-                    "index",
+                    "ERROR",
                     format!("Library scan failed: {}", message),
                 );
             }
@@ -245,11 +239,18 @@ pub fn start_enrichment_sweep(state: AppState, library: Library, replace_complet
         return;
     }
     let min_interval = Duration::from_secs(config.external_metadata_min_interval_secs.max(60));
+    info!(
+        "External metadata sweep starting: sources={}, max_items={}, min_interval_secs={}, replace_complete={}",
+        fetch_config.sources.len(),
+        max_items,
+        min_interval.as_secs(),
+        replace_complete
+    );
     let client = state.external_client.clone();
     let tag_error_first = config.external_metadata_on_tag_error;
     let metadata_root = resolve_path(&state.config_path, &config.metadata_path);
     let activity = state.activity.clone();
-    let _ = activity.add_event("scan", "Metadata scan started.");
+    let _ = activity.add_activity("Metadata scan started.");
     tokio::spawn(async move {
         run_enrichment_sweep(
             library,
@@ -388,7 +389,7 @@ async fn run_enrichment_sweep(
         "Metadata scan finished. Updated {} artists and {} albums.",
         artist_updates, album_updates
     );
-    let _ = activity.add_event("scan", summary);
+    let _ = activity.add_activity(summary);
 }
 
 async fn run_tag_error_enrichment(
@@ -509,13 +510,23 @@ pub async fn fetch_artist_enrichment(
     activity: Option<&ActivityStore>,
 ) -> FetchResult {
     if !replace && !needs_artist_enrichment(artist) {
+        info!(
+            "External metadata: skipping artist '{}' (already enriched)",
+            artist.name
+        );
         return FetchResult::skipped();
     }
     let key = external_attempt_key("artist", &artist.id);
     if !replace {
         match library.should_attempt_external(&key, min_interval) {
             Ok(true) => {}
-            Ok(false) => return FetchResult::skipped(),
+            Ok(false) => {
+                info!(
+                    "External metadata: skipping artist '{}' (min interval not reached)",
+                    artist.name
+                );
+                return FetchResult::skipped();
+            }
             Err(err) => {
                 warn!("External metadata check failed: {}", err);
                 return FetchResult::skipped();
@@ -526,6 +537,19 @@ pub async fn fetch_artist_enrichment(
     info!("Fetching external artist metadata for '{}'", artist.name);
     match external::fetch_artist(client, config, &artist.name).await {
         Ok(Some(metadata)) => {
+            let summary = metadata
+                .summary
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("<none>");
+            info!(
+                "External artist metadata received for '{}': summary='{}', genres={:?}, logo_url={}, banner_url={}",
+                artist.name,
+                summary,
+                metadata.genres,
+                metadata.logo_url.as_deref().unwrap_or("<none>"),
+                metadata.banner_url.as_deref().unwrap_or("<none>")
+            );
             let (logo_ref, banner_ref) =
                 store_artist_assets(metadata_root, client, config, &artist.id, &metadata).await;
             let _ = library.update_artist_enrichment(
@@ -546,6 +570,10 @@ pub async fn fetch_artist_enrichment(
             FetchResult::attempted(true)
         }
         Ok(None) => {
+            info!(
+                "External artist metadata not found for '{}'",
+                artist.name
+            );
             let _ = library.record_external_attempt(&key, false);
             FetchResult::attempted(false)
         }
@@ -567,13 +595,23 @@ pub async fn fetch_album_enrichment(
     activity: Option<&ActivityStore>,
 ) -> FetchResult {
     if !replace && !needs_album_enrichment(album) {
+        info!(
+            "External metadata: skipping album '{}' (already enriched)",
+            album.title
+        );
         return FetchResult::skipped();
     }
     let key = external_attempt_key("album", &album.id);
     if !replace {
         match library.should_attempt_external(&key, min_interval) {
             Ok(true) => {}
-            Ok(false) => return FetchResult::skipped(),
+            Ok(false) => {
+                info!(
+                    "External metadata: skipping album '{}' (min interval not reached)",
+                    album.title
+                );
+                return FetchResult::skipped();
+            }
             Err(err) => {
                 warn!("External metadata check failed: {}", err);
                 return FetchResult::skipped();
@@ -587,6 +625,18 @@ pub async fn fetch_album_enrichment(
     );
     match external::fetch_album(client, config, artist_name, &album.title).await {
         Ok(Some(metadata)) => {
+            let summary = metadata
+                .summary
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("<none>");
+            info!(
+                "External album metadata received for '{} - {}': summary='{}', genres={:?}",
+                artist_name,
+                album.title,
+                summary,
+                metadata.genres
+            );
             let _ = library.update_album_enrichment(&album.id, metadata.summary, &metadata.genres);
             if let Some(activity) = activity {
                 let _ = activity.add_event(
@@ -602,6 +652,10 @@ pub async fn fetch_album_enrichment(
             FetchResult::attempted(true)
         }
         Ok(None) => {
+            info!(
+                "External album metadata not found for '{} - {}'",
+                artist_name, album.title
+            );
             let _ = library.record_external_attempt(&key, false);
             FetchResult::attempted(false)
         }

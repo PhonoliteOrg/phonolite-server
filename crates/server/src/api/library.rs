@@ -202,6 +202,7 @@ pub async fn shuffle_tracks(
     let custom_artist_ids = split_list_param(params.artist_ids.as_deref());
     let custom_genres = split_list_param(params.genres.as_deref());
 
+    let liked_set = liked_set(&state)?;
     let tracks = match build_shuffle_queue(
         &library,
         mode,
@@ -209,6 +210,7 @@ pub async fn shuffle_tracks(
         params.album_id.as_deref(),
         &custom_artist_ids,
         &custom_genres,
+        &liked_set,
     ) {
         Ok(tracks) => tracks,
         Err(ShuffleError::MissingArtistId) => {
@@ -235,7 +237,6 @@ pub async fn shuffle_tracks(
         return Err(json_error(StatusCode::NOT_FOUND, "no tracks found"));
     }
 
-    let liked_set = liked_set(&state)?;
     let playlist_set = playlist_set(&state)?;
     let mut items = Vec::with_capacity(tracks.len());
     for track in tracks {

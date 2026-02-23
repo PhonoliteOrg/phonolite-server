@@ -97,13 +97,10 @@ body::after {
   width: 44px;
   height: 44px;
   border-radius: 14px;
-  background: linear-gradient(135deg, rgba(214, 179, 106, 0.95), rgba(240, 200, 120, 0.9));
-  color: #ffffff;
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  letter-spacing: 0.6px;
-  box-shadow: inset 0 0 12px rgba(255, 255, 255, 0.18);
+  display: block;
+  object-fit: contain;
+  background: transparent;
+  box-shadow: none;
 }
 
 .brand-title {
@@ -289,9 +286,255 @@ p {
 .tag {
   padding: 6px 12px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.7);
-  border: 1px solid var(--glass-border);
+  background: rgba(20, 32, 40, 0.8);
+  border: 1px solid rgba(90, 200, 240, 0.35);
+  color: #d7f2ff;
   font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+.activity-stream {
+  display: grid;
+  gap: 8px;
+  margin-top: 0;
+  align-content: start;
+  grid-auto-rows: max-content;
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--glass-border);
+  background: rgba(18, 20, 24, 0.6);
+  align-items: start;
+}
+
+.activity-item.active {
+  border-color: rgba(214, 179, 106, 0.45);
+  background: rgba(214, 179, 106, 0.12);
+}
+
+.activity-tag {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-border);
+  background: rgba(18, 20, 24, 0.7);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.activity-tag.activity {
+  color: #f8e7c1;
+  border-color: rgba(214, 179, 106, 0.55);
+  background: rgba(214, 179, 106, 0.22);
+}
+
+.activity-tag.warn {
+  color: #f3e1b7;
+  border-color: rgba(214, 179, 106, 0.55);
+  background: rgba(214, 179, 106, 0.16);
+}
+
+.activity-tag.error {
+  color: #ffd6d6;
+  border-color: rgba(239, 68, 68, 0.6);
+  background: rgba(239, 68, 68, 0.18);
+}
+
+.activity-tag.meta {
+  color: #b6f0dd;
+  border-color: rgba(111, 211, 173, 0.45);
+  background: rgba(111, 211, 173, 0.2);
+}
+
+.activity-tag.index,
+.activity-tag.scan,
+.activity-tag.info {
+  color: #cbd5f5;
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(148, 163, 184, 0.16);
+}
+
+.activity-body {
+  display: grid;
+  gap: 4px;
+}
+
+.activity-message {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.activity-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.log-card {
+  padding: 16px;
+}
+
+.log-header {
+  gap: 16px;
+}
+
+.log-tabs {
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.log-tabs .tab-chip {
+  cursor: pointer;
+}
+
+.log-controls {
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.log-follow {
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.log-view {
+  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-size: 12.5px;
+  background: rgba(12, 13, 16, 0.85);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: 12px;
+  padding: 8px 10px;
+  max-height: 520px;
+  overflow-y: auto;
+  display: block;
+  user-select: text;
+  cursor: text;
+}
+
+.log-panel {
+  position: relative;
+  min-height: 260px;
+  display: grid;
+  align-items: stretch;
+}
+
+.log-panel .log-view {
+  height: 100%;
+}
+
+.log-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: center;
+  border: 1px dashed rgba(214, 179, 106, 0.2);
+  border-radius: 12px;
+  background: rgba(12, 13, 16, 0.6);
+}
+
+.log-spinner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  border-radius: 12px;
+  background: rgba(12, 13, 16, 0.6);
+  border: 1px dashed rgba(214, 179, 106, 0.2);
+}
+
+.log-spinner.hidden {
+  display: none;
+}
+
+.log-empty.hidden,
+.log-view.hidden {
+  display: none;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid rgba(214, 179, 106, 0.3);
+  border-top-color: rgba(214, 179, 106, 0.9);
+  animation: spin 1s linear infinite;
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: minmax(160px, 190px) minmax(84px, 110px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(214, 179, 106, 0.12);
+}
+
+.log-line:last-child {
+  border-bottom: none;
+}
+
+.log-level {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-level.info {
+  color: #e2e8f0;
+}
+
+.log-level.debug {
+  color: #93c5fd;
+}
+
+.log-level.warn {
+  color: #fcd34d;
+}
+
+.log-level.error {
+  color: #fca5a5;
+}
+
+.log-level.issue {
+  color: #fdba74;
+}
+
+.log-level.activity {
+  color: var(--accent-2);
+}
+
+.log-time {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-message {
+  color: #f8f5ed;
+  word-break: break-word;
+  white-space: pre-wrap;
+  min-width: 0;
 }
 
 .grid {
@@ -312,6 +555,16 @@ p {
   display: grid;
   gap: 12px;
   backdrop-filter: blur(20px) saturate(140%);
+}
+
+.activity-card {
+  gap: 10px;
+  padding: 16px 18px;
+  align-content: start;
+}
+
+.activity-grid {
+  align-items: start;
 }
 
 .card.narrow {
@@ -516,6 +769,12 @@ button:disabled,
   box-shadow: 0 10px 20px rgba(15, 15, 15, 0.4);
 }
 
+.button.accent {
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.95), rgba(45, 212, 191, 0.95));
+  color: #0b141a;
+  box-shadow: 0 10px 20px rgba(45, 212, 191, 0.28);
+}
+
 .button.ghost {
   background: transparent;
   border: 1px solid var(--glass-border-strong);
@@ -642,6 +901,7 @@ th {
   background: rgba(18, 20, 24, 0.65);
   font-size: 12px;
   cursor: pointer;
+  color: #ffffff;
 }
 
 .icon-button svg {
@@ -1475,6 +1735,12 @@ code {
   }
 }
 
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (max-width: 720px) {
   body {
     padding: 24px 14px 32px;
@@ -1524,6 +1790,14 @@ code {
   .detail-meta {
     grid-template-columns: 1fr;
     justify-items: start;
+  }
+
+  .activity-item {
+    grid-template-columns: 1fr;
+  }
+
+  .log-line {
+    grid-template-columns: 1fr;
   }
 }
 

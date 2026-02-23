@@ -19,6 +19,10 @@
     <input name="metadata_path" type="text" value="{{metadata_path}}" required />
     <p class="hint">Default metadata location: <code>{{metadata_full_path}}</code></p>
     <div class="divider"></div>
+    <label>Log directory (relative to config file if not absolute)</label>
+    <input name="log_dir" type="text" value="{{log_dir}}" required />
+    <p class="hint">Default log directory: <code>{{log_full_path}}</code>. Restart to apply changes.</p>
+    <div class="divider"></div>
     <div class="stack">
       <p class="muted">
         Scan checks for new files and missing metadata. Reindex clears the index and all downloaded
@@ -80,6 +84,20 @@
     </label>
     <label>Watch debounce (seconds)</label>
     <input name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
+  </div>
+  <div class="card">
+    <h3>Logging</h3>
+    <label class="row">
+      <input
+        name="log_debug_enabled"
+        type="checkbox"
+        id="log-debug-toggle"
+        data-ignore-dirty="true"
+        {{log_debug_checked}}
+      />
+      Enable debug logging (live)
+    </label>
+    <p class="hint">Applies immediately and can be noisy. Stored in the log file.</p>
   </div>
   <div class="card">
     <h3>Listening stats</h3>

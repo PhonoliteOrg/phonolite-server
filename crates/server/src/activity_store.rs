@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 use uuid::Uuid;
 
 const ACTIVITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("activity");
@@ -55,6 +56,12 @@ impl ActivityStore {
         }
         write_txn.commit().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn add_activity(&self, message: impl Into<String>) -> Result<(), String> {
+        let message = message.into();
+        info!(target: "activity", "{}", message);
+        self.add_event("ACTIVITY", message)
     }
 
     pub fn list_events(

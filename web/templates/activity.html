@@ -1,15 +1,18 @@
 <div class="page-title">
   <div>
     <h2>Activity</h2>
-    <p class="muted">Important events and indexing issues.</p>
+    <p class="muted">Live status, recent activity, and indexing issues.</p>
   </div>
   <span class="tag">Status: {{status_label}}</span>
 </div>
 {{status_block}}
-<div class="grid two">
-  <div class="card">
+<div class="grid two activity-grid">
+  <div class="card activity-card">
     <div class="row space-between">
-      <h3>Current events</h3>
+      <div>
+        <h3>Activity stream</h3>
+        <p class="muted">What the server is doing right now.</p>
+      </div>
       <div class="row">
         <span class="tag">{{event_count}} events</span>
         <button
@@ -22,9 +25,11 @@
         </button>
       </div>
     </div>
-    {{events}}
+    <div class="activity-stream">
+      {{events}}
+    </div>
   </div>
-  <div class="card">
+  <div class="card issues-card">
     <div class="row space-between">
       <h3>Indexing issues</h3>
       <span class="tag">{{issue_count}} files</span>

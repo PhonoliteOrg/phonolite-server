@@ -108,6 +108,7 @@
   setupNavMenu();
   setupActivityBadge();
   setupActivityPage();
+  setupLogsPage();
   setupUsers();
   setupMetadataSources();
   setupSettings();
@@ -624,6 +625,7 @@
     if (!form) return;
 
     const saveButton = document.getElementById("save-settings");
+    const debugToggle = document.getElementById("log-debug-toggle");
     const reindexButton = document.getElementById("open-reindex");
     const reindexModal = document.getElementById("modal-reindex");
     const reindexConfirm = document.getElementById("confirm-reindex");
@@ -713,6 +715,19 @@
     }
 
     updateDirty();
+
+    if (debugToggle) {
+      debugToggle.addEventListener("change", () => {
+        const params = new URLSearchParams();
+        if (debugToggle.checked) {
+          params.set("enabled", "true");
+        }
+        fetchJson("/settings/logging/debug", params).catch((err) => {
+          showToast(err.message, true);
+          debugToggle.checked = !debugToggle.checked;
+        });
+      });
+    }
 
     form.addEventListener("input", updateDirty);
     form.addEventListener("change", updateDirty);
@@ -907,8 +922,169 @@
         })
         .catch((err) => {
           showToast(err.message, true);
-        });
+      });
     });
+  }
+
+  function setupLogsPage() {
+    const logView = document.getElementById("log-view");
+    if (!logView) return;
+    const logPanel = document.getElementById("log-panel");
+    const logEmpty = document.getElementById("log-empty");
+    const logCard = document.querySelector(".log-card");
+    const limit = Number(logCard?.dataset.logLimit || 10000);
+    const logTabs = document.getElementById("log-tabs");
+    const followToggle = document.getElementById("logs-follow");
+    const debugToggle = document.getElementById("logs-debug");
+    const refreshButton = document.getElementById("logs-refresh");
+    const spinner = document.getElementById("log-spinner");
+    let lastUpdated = 0;
+    let fetching = false;
+    let currentView = "all";
+
+    function parseLine(line) {
+      const match = line.match(/^(\S+)\s+([A-Z]+)\s+(.*)$/);
+      if (!match) {
+        return { time: "", level: "INFO", message: line };
+      }
+      return { time: match[1], level: match[2], message: match[3] };
+    }
+
+    function levelClass(level) {
+      const key = (level || "").toLowerCase();
+      if (key === "issue") return "issue";
+      if (key === "warn" || key === "warning") return "warn";
+      if (key === "error") return "error";
+      if (key === "debug") return "debug";
+      if (key === "activity") return "activity";
+      return "info";
+    }
+
+    function setLoading(isLoading) {
+      if (!logPanel) return;
+      if (isLoading) {
+        if (logView) logView.classList.add("hidden");
+        if (logEmpty) logEmpty.classList.add("hidden");
+        if (spinner) spinner.classList.remove("hidden");
+      } else {
+        if (spinner) spinner.classList.add("hidden");
+      }
+    }
+
+    function setEmpty(isEmpty) {
+      if (!logView || !logEmpty) return;
+      if (isEmpty) {
+        logView.classList.add("hidden");
+        logEmpty.classList.remove("hidden");
+      } else {
+        logEmpty.classList.add("hidden");
+        logView.classList.remove("hidden");
+      }
+    }
+
+    function render(lines) {
+      const wasAtBottom =
+        logView.scrollTop + logView.clientHeight >= logView.scrollHeight - 20;
+      logView.innerHTML = "";
+      if (!lines.length) {
+        setEmpty(true);
+        return;
+      }
+      setEmpty(false);
+      const frag = document.createDocumentFragment();
+      lines.forEach((line) => {
+        const { time, level, message } = parseLine(line);
+        const row = document.createElement("div");
+        row.className = "log-line";
+        const tag = document.createElement("span");
+        tag.className = `log-level ${levelClass(level)}`;
+        tag.textContent = level;
+        const ts = document.createElement("span");
+        ts.className = "log-time";
+        ts.textContent = time || "--";
+        const msg = document.createElement("span");
+        msg.className = "log-message";
+        msg.textContent = message;
+        row.appendChild(ts);
+        row.appendChild(tag);
+        row.appendChild(msg);
+        frag.appendChild(row);
+      });
+      logView.appendChild(frag);
+      const follow = followToggle ? followToggle.checked : true;
+      if (follow && wasAtBottom) {
+        logView.scrollTop = logView.scrollHeight;
+      }
+    }
+
+    function fetchLogs(force) {
+      if (fetching) return;
+      fetching = true;
+      const showSpinner = force || lastUpdated === 0;
+      if (showSpinner) setLoading(true);
+      fetch(`/logs/tail?lines=${limit}&view=${encodeURIComponent(currentView)}`, {
+        method: "GET",
+        headers: { Accept: "application/json", "X-Requested-With": "fetch" },
+        credentials: "same-origin",
+      })
+        .then(async (resp) => {
+          if (!resp.ok) {
+            throw new Error("log request failed");
+          }
+          return resp.json();
+        })
+        .then((data) => {
+          fetching = false;
+          const updated = Number(data?.updated_at || 0);
+          if (!force && updated && updated === lastUpdated) {
+            if (showSpinner) setLoading(false);
+            return;
+          }
+          lastUpdated = updated;
+          const lines = Array.isArray(data?.lines) ? data.lines : [];
+          render(lines);
+          if (showSpinner) setLoading(false);
+        })
+        .catch(() => {
+          fetching = false;
+          if (showSpinner) setLoading(false);
+        });
+    }
+
+    if (refreshButton) {
+      refreshButton.addEventListener("click", () => fetchLogs(true));
+    }
+
+    if (logTabs) {
+      logTabs.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-log]");
+        if (!button) return;
+        const view = button.dataset.log || "all";
+        if (view === currentView) return;
+        currentView = view;
+        lastUpdated = 0;
+        logTabs.querySelectorAll(".tab-chip").forEach((chip) => {
+          chip.classList.toggle("active", chip === button);
+        });
+        setEmpty(false);
+        fetchLogs(true);
+      });
+    }
+    if (debugToggle) {
+      debugToggle.addEventListener("change", () => {
+        const params = new URLSearchParams();
+        if (debugToggle.checked) {
+          params.set("enabled", "true");
+        }
+        fetchJson("/settings/logging/debug", params).catch((err) => {
+          showToast(err.message, true);
+          debugToggle.checked = !debugToggle.checked;
+        });
+      });
+    }
+
+    fetchLogs(true);
+    setInterval(() => fetchLogs(false), 1000);
   }
 
   function setupLibrary() {

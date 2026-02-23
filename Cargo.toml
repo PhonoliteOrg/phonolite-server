@@ -32,3 +32,7 @@ argon2 = "0.5"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

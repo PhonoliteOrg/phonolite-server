@@ -12,7 +12,8 @@ use crate::config::{resolve_path, save_config, MetadataSourceConfig};
 use crate::external::{self, ExternalSource};
 use crate::scan::{new_source_id, parse_provider, source_fields_from_parts};
 use crate::state::{
-    AppState, MetadataSourceForm, MetadataTestForm, MetadataToggleForm, SettingsForm, SettingsQuery,
+    AppState, DebugLogToggleForm, MetadataSourceForm, MetadataTestForm, MetadataToggleForm,
+    SettingsForm, SettingsQuery,
 };
 use crate::utils::{
     apply_template, escape_html, html_error, html_response, json_error_response, json_ok_response,
@@ -156,6 +157,10 @@ pub async fn admin_update_settings(
     if metadata_path.is_empty() {
         return admin_settings_page(&state, Some("metadata_path is required".to_string()), None);
     }
+    let log_dir = form.log_dir.trim();
+    if log_dir.is_empty() {
+        return admin_settings_page(&state, Some("log_dir is required".to_string()), None);
+    }
     let port = match form.port.trim().parse::<u16>() {
         Ok(value) if value > 0 => value,
         _ => {
@@ -255,6 +260,8 @@ pub async fn admin_update_settings(
     config.music_root = music_root.to_string();
     config.index_path = index_path.to_string();
     config.metadata_path = metadata_path.to_string();
+    config.log_dir = log_dir.to_string();
+    config.log_debug_enabled = form.log_debug_enabled.is_some();
     config.port = port;
     config.quic_port = quic_port;
     config.watch_music = form.watch_music.is_some();
@@ -274,6 +281,9 @@ pub async fn admin_update_settings(
     }
 
     *state.config.write() = config;
+    if let Err(err) = state.log_control.set_debug_enabled(form.log_debug_enabled.is_some()) {
+        warn!("Failed to update debug logging filter: {}", err);
+    }
     let music_root_changed = previous_music_root.trim() != music_root;
     let mut message = "info: Saved.".to_string();
     if music_root_changed {
@@ -474,6 +484,38 @@ pub async fn admin_toggle_metadata_source(
     json_ok_response()
 }
 
+pub async fn admin_toggle_debug_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DebugLogToggleForm>,
+) -> Response {
+    let user = match admin_user_from_headers(&state, &headers) {
+        Ok(Some(user)) => user,
+        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+        Err(err) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("auth error: {}", err),
+            )
+        }
+    };
+    if !is_admin(&user) {
+        return json_error_response(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    let enabled = form.enabled.is_some();
+    let mut config = state.config.read().clone();
+    config.log_debug_enabled = enabled;
+    if let Err(err) = save_config(&state.config_path, &config) {
+        return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
+    }
+    *state.config.write() = config;
+    if let Err(err) = state.log_control.set_debug_enabled(enabled) {
+        warn!("Failed to update debug logging filter: {}", err);
+    }
+    json_ok_response()
+}
+
 pub async fn admin_test_metadata_source(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -554,6 +596,9 @@ fn admin_settings_page(
     let metadata_full_path = resolve_path(&state.config_path, &config.metadata_path)
         .to_string_lossy()
         .to_string();
+    let log_full_path = resolve_path(&state.config_path, &config.log_dir)
+        .to_string_lossy()
+        .to_string();
     let watch_checked = if config.watch_music {
         "checked".to_string()
     } else {
@@ -563,6 +608,11 @@ fn admin_settings_page(
     let sources_enabled = has_enabled_sources(&config.external_metadata_sources);
     let message_html = render_message(message);
     let status_block = super::library::render_status_block_for_library(state);
+    let log_debug_checked = if config.log_debug_enabled {
+        "checked".to_string()
+    } else {
+        String::new()
+    };
     let modals = [
         load_template(state, "templates/modals/metadata_add.html").unwrap_or_default(),
         load_template(state, "templates/modals/metadata_edit.html").unwrap_or_default(),
@@ -582,6 +632,9 @@ fn admin_settings_page(
             ("index_full_path", escape_html(&index_full_path)),
             ("metadata_path", escape_html(&config.metadata_path)),
             ("metadata_full_path", escape_html(&metadata_full_path)),
+            ("log_dir", escape_html(&config.log_dir)),
+            ("log_full_path", escape_html(&log_full_path)),
+            ("log_debug_checked", log_debug_checked),
             ("port", config.port.to_string()),
             ("quic_port", config.quic_port.to_string()),
             ("watch_checked", watch_checked),

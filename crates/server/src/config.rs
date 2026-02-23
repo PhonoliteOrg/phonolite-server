@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::external::Provider;
 
-pub const CONFIG_VERSION: u32 = 5;
+pub const CONFIG_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +37,9 @@ pub struct ServerConfig {
     pub music_root: String,
     pub index_path: String,
     pub metadata_path: String,
+    #[serde(alias = "log_path")]
+    pub log_dir: String,
+    pub log_debug_enabled: bool,
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
@@ -69,6 +72,8 @@ impl Default for ServerConfig {
             music_root: "".to_string(),
             index_path: "library.redb".to_string(),
             metadata_path: "metadata".to_string(),
+            log_dir: "logs".to_string(),
+            log_debug_enabled: false,
             port: 3000,
             bind_addr: None,
             quic_enabled: true,
@@ -162,6 +167,15 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         }
         if config.metadata_path.trim().is_empty() {
             config.metadata_path = "metadata".to_string();
+        }
+        if config.log_dir.trim().is_empty() {
+            config.log_dir = "logs".to_string();
+        }
+        if prev_version < 7 {
+            config.log_debug_enabled = false;
+        }
+        if prev_version < 8 && config.log_dir.trim().is_empty() {
+            config.log_dir = "logs".to_string();
         }
         if config.port == 0 {
             if let Some(bind_addr) = config.bind_addr.as_deref() {

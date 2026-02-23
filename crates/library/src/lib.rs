@@ -792,6 +792,11 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                 Some(rel) => rel,
                 None => continue,
             };
+            info!(
+                "Scanning album folder '{}' ({} audio files)",
+                folder_relpath.as_str(),
+                files.len()
+            );
 
             let folder_name = album_dir
                 .file_name()
@@ -809,6 +814,28 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
             let artist_sidecar = album_dir
                 .parent()
                 .and_then(|parent| load_sidecar_info(&mut artist_sidecar_cache, parent.join("artist.json")));
+            if let Some(info) = &album_sidecar {
+                info!(
+                    "Album sidecar loaded for '{}': summary_present={}, genres={:?}",
+                    folder_relpath.as_str(),
+                    info.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    info.genres
+                );
+            }
+            if let Some(info) = &artist_sidecar {
+                info!(
+                    "Artist sidecar loaded for '{}': summary_present={}, genres={:?}",
+                    fallback_artist.as_str(),
+                    info.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    info.genres
+                );
+            }
 
             let mut album_title: Option<String> = None;
             let mut album_artist: Option<String> = None;
@@ -816,9 +843,9 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
             let mut album_cover: Option<CoverRef> = None;
             let mut album_summary: Option<String> = None;
             let mut album_genres: Vec<String> = Vec::new();
-        let mut track_drafts = Vec::new();
-        let mut album_tag_error = false;
-        let mut tag_error_files: Vec<TagErrorFile> = Vec::new();
+            let mut track_drafts = Vec::new();
+            let mut album_tag_error = false;
+            let mut tag_error_files: Vec<TagErrorFile> = Vec::new();
 
             if let Some(info) = &album_sidecar {
                 if info.summary.as_ref().is_some() {
@@ -832,11 +859,18 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                     Some(rel) => rel,
                     None => continue,
                 };
+                info!("Reading tags for '{}'", relpath.as_str());
 
                 let tag = match read_tags(&file) {
                     Ok(tag) => tag,
                     Err(err) => {
-                        warn!("Failed to read tags for {:?}: {:?}", file, err);
+                        warn!(
+                            target: "issue",
+                            "file={} | folder={} | error={:?}",
+                            relpath.as_str(),
+                            folder_relpath.as_str(),
+                            err
+                        );
                         album_tag_error = true;
                         tag_error_files.push(TagErrorFile {
                             file_relpath: relpath.clone(),
@@ -867,6 +901,23 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                     merge_genres(&mut album_genres, &tag.genres);
                 }
 
+                info!(
+                    "Tag fields for '{}': album={:?}, album_artist={:?}, artist={:?}, year={:?}, title={:?}, track_no={:?}, disc_no={:?}, summary_present={}, genres={:?}",
+                    relpath.as_str(),
+                    tag.album.as_deref(),
+                    tag.album_artist.as_deref(),
+                    tag.artist.as_deref(),
+                    tag.year,
+                    tag.title.as_deref(),
+                    tag.track_no,
+                    tag.disc_no,
+                    tag.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    &tag.genres
+                );
+
                 let title = tag.title.clone().unwrap_or_else(|| file_stem(&file));
                 let duration_ms = tag.duration_ms.unwrap_or(0);
                 let codec = match audio_codec(&file) {
@@ -878,11 +929,46 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                 let disc_no = tag
                     .disc_no
                     .or_else(|| disc_number_from_path(&file, &album_dir));
+                let album_hint = tag
+                    .album
+                    .clone()
+                    .or_else(|| album_title.clone())
+                    .unwrap_or_else(|| folder_title.clone());
+                let artist_hint = tag
+                    .album_artist
+                    .clone()
+                    .or_else(|| tag.artist.clone())
+                    .or_else(|| album_artist.clone())
+                    .unwrap_or_else(|| fallback_artist.clone());
+                let year_hint = tag.year.or(album_year).or(folder_year);
+                info!(
+                    "Indexing track '{}' for album '{}' (artist='{}', year={:?})",
+                    title.as_str(),
+                    album_hint,
+                    artist_hint,
+                    year_hint
+                );
+                info!(
+                    "Track metadata: relpath='{}', track_no={:?}, disc_no={:?}, duration_ms={}, codec={:?}, sample_rate={:?}, channels={:?}, bitrate={:?}, genres={:?}, embedded_cover={}",
+                    relpath.as_str(),
+                    tag.track_no,
+                    disc_no,
+                    duration_ms,
+                    &codec,
+                    tag.sample_rate,
+                    tag.channels,
+                    tag.bitrate,
+                    &tag.genres,
+                    tag.has_embedded_cover
+                );
 
                 if tag.has_embedded_cover && album_cover.is_none() {
                     album_cover = Some(CoverRef::Embedded {
                         track_id: id.clone(),
                     });
+                    info!("Album cover set from embedded art in '{}'", relpath.as_str());
+                } else if tag.has_embedded_cover {
+                    info!("Found embedded art in '{}'", relpath.as_str());
                 }
 
                 embedded_cover_table
@@ -923,10 +1009,27 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                 .to_string();
             let artist_id = stable_id(album_artist.trim());
             let album_id = stable_id(&folder_relpath);
+            info!(
+                "Detected album '{}' (artist='{}', year={:?}) with {} tracks",
+                album_title.as_str(),
+                album_artist.as_str(),
+                album_year,
+                track_drafts.len()
+            );
 
             if album_cover.is_none() {
                 if let Some(cover_rel) = find_folder_cover(root, &album_dir) {
+                    info!(
+                        "Found folder cover for album '{}': {}",
+                        album_title.as_str(),
+                        cover_rel.as_str()
+                    );
                     album_cover = Some(CoverRef::File { relpath: cover_rel });
+                } else {
+                    info!(
+                        "No folder cover detected for album '{}'",
+                        album_title.as_str()
+                    );
                 }
             }
 
@@ -979,7 +1082,7 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
                 year: album_year,
                 folder_relpath,
                 cover_ref: album_cover,
-                genres: album_genres,
+                genres: album_genres.clone(),
                 summary: album_summary,
             };
 
@@ -996,6 +1099,13 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
             artist_albums_table.insert(album_index_key.as_str(), album_id.as_bytes())?;
 
             if album_tag_error {
+                warn!(
+                    target: "issue",
+                    "album={} | folder={} | files={}",
+                    album.title.as_str(),
+                    album.folder_relpath.as_str(),
+                    tag_error_files.len()
+                );
                 let tag_error = TagErrorInfo {
                     album_id: album.id.clone(),
                     artist_id: artist.id.clone(),
@@ -1026,21 +1136,37 @@ fn scan_library(root: &Path, db: &Database) -> Result<LibraryStats, LibraryError
             });
 
             for (order, draft) in track_drafts.into_iter().enumerate() {
+                let TrackDraft {
+                    id,
+                    relpath,
+                    title,
+                    track_no,
+                    disc_no,
+                    duration_ms,
+                    codec,
+                    sample_rate,
+                    channels,
+                    bitrate,
+                    file_size,
+                    genres,
+                } = draft;
+                let mut track_genres = genres;
+                merge_genres(&mut track_genres, &album_genres);
                 let track = Track {
-                    id: draft.id.clone(),
+                    id,
                     album_id: album_id.clone(),
                     artist_id: artist_id.clone(),
-                    title: draft.title,
-                    track_no: draft.track_no,
-                    disc_no: draft.disc_no,
-                    duration_ms: draft.duration_ms,
-                    codec: draft.codec,
-                    sample_rate: draft.sample_rate,
-                    channels: draft.channels,
-                    bitrate: draft.bitrate,
-                    file_relpath: draft.relpath,
-                    file_size: draft.file_size,
-                    genres: draft.genres,
+                    title,
+                    track_no,
+                    disc_no,
+                    duration_ms,
+                    codec,
+                    sample_rate,
+                    channels,
+                    bitrate,
+                    file_relpath: relpath,
+                    file_size,
+                    genres: track_genres,
                 };
 
                 let track_bytes = encode_value(&track)?;
@@ -1119,9 +1245,18 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                 Some(rel) => rel,
                 None => continue,
             };
+            info!(
+                "Scanning album folder '{}' ({} audio files)",
+                folder_relpath.as_str(),
+                files.len()
+            );
 
             let album_id = stable_id(&folder_relpath);
             if albums_table.get(album_id.as_str())?.is_some() {
+                info!(
+                    "Skipping already indexed album folder '{}'",
+                    folder_relpath.as_str()
+                );
                 continue;
             }
 
@@ -1141,6 +1276,28 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
             let artist_sidecar = album_dir
                 .parent()
                 .and_then(|parent| load_sidecar_info(&mut artist_sidecar_cache, parent.join("artist.json")));
+            if let Some(info) = &album_sidecar {
+                info!(
+                    "Album sidecar loaded for '{}': summary_present={}, genres={:?}",
+                    folder_relpath.as_str(),
+                    info.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    info.genres
+                );
+            }
+            if let Some(info) = &artist_sidecar {
+                info!(
+                    "Artist sidecar loaded for '{}': summary_present={}, genres={:?}",
+                    fallback_artist.as_str(),
+                    info.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    info.genres
+                );
+            }
 
             let mut album_title: Option<String> = None;
             let mut album_artist: Option<String> = None;
@@ -1164,11 +1321,18 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                     Some(rel) => rel,
                     None => continue,
                 };
+                info!("Reading tags for '{}'", relpath.as_str());
 
                 let tag = match read_tags(&file) {
                     Ok(tag) => tag,
                     Err(err) => {
-                        warn!("Failed to read tags for {:?}: {:?}", file, err);
+                        warn!(
+                            target: "issue",
+                            "file={} | folder={} | error={:?}",
+                            relpath.as_str(),
+                            folder_relpath.as_str(),
+                            err
+                        );
                         album_tag_error = true;
                         tag_error_files.push(TagErrorFile {
                             file_relpath: relpath.clone(),
@@ -1199,6 +1363,23 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                     merge_genres(&mut album_genres, &tag.genres);
                 }
 
+                info!(
+                    "Tag fields for '{}': album={:?}, album_artist={:?}, artist={:?}, year={:?}, title={:?}, track_no={:?}, disc_no={:?}, summary_present={}, genres={:?}",
+                    relpath.as_str(),
+                    tag.album.as_deref(),
+                    tag.album_artist.as_deref(),
+                    tag.artist.as_deref(),
+                    tag.year,
+                    tag.title.as_deref(),
+                    tag.track_no,
+                    tag.disc_no,
+                    tag.summary
+                        .as_ref()
+                        .map(|summary| !summary.trim().is_empty())
+                        .unwrap_or(false),
+                    &tag.genres
+                );
+
                 let title = tag.title.clone().unwrap_or_else(|| file_stem(&file));
                 let duration_ms = tag.duration_ms.unwrap_or(0);
                 let codec = match audio_codec(&file) {
@@ -1210,11 +1391,46 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                 let disc_no = tag
                     .disc_no
                     .or_else(|| disc_number_from_path(&file, &album_dir));
+                let album_hint = tag
+                    .album
+                    .clone()
+                    .or_else(|| album_title.clone())
+                    .unwrap_or_else(|| folder_title.clone());
+                let artist_hint = tag
+                    .album_artist
+                    .clone()
+                    .or_else(|| tag.artist.clone())
+                    .or_else(|| album_artist.clone())
+                    .unwrap_or_else(|| fallback_artist.clone());
+                let year_hint = tag.year.or(album_year).or(folder_year);
+                info!(
+                    "Indexing track '{}' for album '{}' (artist='{}', year={:?})",
+                    title.as_str(),
+                    album_hint,
+                    artist_hint,
+                    year_hint
+                );
+                info!(
+                    "Track metadata: relpath='{}', track_no={:?}, disc_no={:?}, duration_ms={}, codec={:?}, sample_rate={:?}, channels={:?}, bitrate={:?}, genres={:?}, embedded_cover={}",
+                    relpath.as_str(),
+                    tag.track_no,
+                    disc_no,
+                    duration_ms,
+                    &codec,
+                    tag.sample_rate,
+                    tag.channels,
+                    tag.bitrate,
+                    &tag.genres,
+                    tag.has_embedded_cover
+                );
 
                 if tag.has_embedded_cover && album_cover.is_none() {
                     album_cover = Some(CoverRef::Embedded {
                         track_id: id.clone(),
                     });
+                    info!("Album cover set from embedded art in '{}'", relpath.as_str());
+                } else if tag.has_embedded_cover {
+                    info!("Found embedded art in '{}'", relpath.as_str());
                 }
 
                 embedded_cover_table
@@ -1254,10 +1470,27 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                 .trim()
                 .to_string();
             let artist_id = stable_id(album_artist.trim());
+            info!(
+                "Detected album '{}' (artist='{}', year={:?}) with {} tracks",
+                album_title.as_str(),
+                album_artist.as_str(),
+                album_year,
+                track_drafts.len()
+            );
 
             if album_cover.is_none() {
                 if let Some(cover_rel) = find_folder_cover(root, &album_dir) {
+                    info!(
+                        "Found folder cover for album '{}': {}",
+                        album_title.as_str(),
+                        cover_rel.as_str()
+                    );
                     album_cover = Some(CoverRef::File { relpath: cover_rel });
+                } else {
+                    info!(
+                        "No folder cover detected for album '{}'",
+                        album_title.as_str()
+                    );
                 }
             }
 
@@ -1310,7 +1543,7 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
                 year: album_year,
                 folder_relpath,
                 cover_ref: album_cover,
-                genres: album_genres,
+                genres: album_genres.clone(),
                 summary: album_summary,
             };
 
@@ -1327,6 +1560,13 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
             artist_albums_table.insert(album_index_key.as_str(), album_id.as_bytes())?;
 
             if album_tag_error {
+                warn!(
+                    target: "issue",
+                    "album={} | folder={} | files={}",
+                    album.title.as_str(),
+                    album.folder_relpath.as_str(),
+                    tag_error_files.len()
+                );
                 let tag_error = TagErrorInfo {
                     album_id: album.id.clone(),
                     artist_id: artist.id.clone(),
@@ -1357,21 +1597,37 @@ fn scan_library_incremental(root: &Path, db: &Database) -> Result<LibraryStats, 
             });
 
             for (order, draft) in track_drafts.into_iter().enumerate() {
+                let TrackDraft {
+                    id,
+                    relpath,
+                    title,
+                    track_no,
+                    disc_no,
+                    duration_ms,
+                    codec,
+                    sample_rate,
+                    channels,
+                    bitrate,
+                    file_size,
+                    genres,
+                } = draft;
+                let mut track_genres = genres;
+                merge_genres(&mut track_genres, &album_genres);
                 let track = Track {
-                    id: draft.id.clone(),
+                    id,
                     album_id: album_id.clone(),
                     artist_id: artist_id.clone(),
-                    title: draft.title,
-                    track_no: draft.track_no,
-                    disc_no: draft.disc_no,
-                    duration_ms: draft.duration_ms,
-                    codec: draft.codec,
-                    sample_rate: draft.sample_rate,
-                    channels: draft.channels,
-                    bitrate: draft.bitrate,
-                    file_relpath: draft.relpath,
-                    file_size: draft.file_size,
-                    genres: draft.genres,
+                    title,
+                    track_no,
+                    disc_no,
+                    duration_ms,
+                    codec,
+                    sample_rate,
+                    channels,
+                    bitrate,
+                    file_relpath: relpath,
+                    file_size,
+                    genres: track_genres,
                 };
 
                 let track_bytes = encode_value(&track)?;

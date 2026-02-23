@@ -85,7 +85,7 @@ async fn watch_loop(
                 _ = tokio::time::sleep(debounce) => {
                     let _ = state
                         .activity
-                        .add_event("index", "Library auto-scan started.");
+                        .add_activity("Library auto-scan started.");
                     let library = library.clone();
                     let rescan_library = library.clone();
                     match tokio::task::spawn_blocking(move || rescan_library.incremental_scan()).await {
@@ -94,13 +94,10 @@ async fn watch_loop(
                                 "Auto-scan complete: {} artists, {} albums, {} tracks",
                                 stats.artists, stats.albums, stats.tracks
                             );
-                            let _ = state.activity.add_event(
-                                "index",
-                                format!(
-                                    "Library auto-scan finished: {} artists, {} albums, {} tracks.",
-                                    stats.artists, stats.albums, stats.tracks
-                                ),
-                            );
+                            let _ = state.activity.add_activity(format!(
+                                "Library auto-scan finished: {} artists, {} albums, {} tracks.",
+                                stats.artists, stats.albums, stats.tracks
+                            ));
                             start_enrichment_sweep(state.clone(), library.clone(), false);
                             start_cover_sweep(state.clone(), library.clone());
                         }

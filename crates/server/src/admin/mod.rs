@@ -2,6 +2,7 @@
 pub mod assets;
 pub mod auth;
 pub mod activity;
+pub mod logs;
 pub mod library;
 pub mod settings;
 pub mod users;
@@ -44,6 +45,8 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/activity", get(activity::admin_activity))
         .route("/activity/clear", post(activity::admin_activity_clear))
         .route("/status/activity", get(activity::admin_activity_status))
+        .route("/logs", get(logs::admin_logs))
+        .route("/logs/tail", get(logs::admin_logs_tail))
         .route("/status/library", get(library::admin_library_status))
         .route(
             "/settings/metadata/add",
@@ -64,6 +67,10 @@ pub fn admin_router(state: AppState) -> Router {
         .route(
             "/settings/metadata/test",
             post(settings::admin_test_metadata_source),
+        )
+        .route(
+            "/settings/logging/debug",
+            post(settings::admin_toggle_debug_logs),
         )
         .route("/settings/reindex", post(library::admin_reindex))
         .route("/settings/scan", post(library::admin_scan))

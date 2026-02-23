@@ -35,6 +35,11 @@ enum ControlCommand {
         frame_ms: u32,
         queue: Vec<String>,
     },
+    Playback {
+        track_id: String,
+        position_ms: u32,
+        playing: bool,
+    },
     Buffer {
         buffer_ms: u32,
         target_ms: Option<u32>,
@@ -58,6 +63,12 @@ enum ClientMessage<'a> {
     },
     #[serde(rename = "buffer")]
     Buffer { buffer_ms: u32, target_ms: Option<u32> },
+    #[serde(rename = "playback")]
+    Playback {
+        track_id: &'a str,
+        position_ms: u32,
+        playing: bool,
+    },
     #[serde(rename = "advance")]
     Advance,
     #[serde(rename = "ping")]
@@ -209,6 +220,36 @@ pub extern "C" fn phonolite_quic_send_buffer(
         .is_err()
     {
         return -2;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn phonolite_quic_send_playback(
+    handle: *mut QuicHandle,
+    track_id: *const c_char,
+    position_ms: u32,
+    playing: c_int,
+) -> c_int {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return -1;
+    };
+    let track_id = unsafe { cstr_to_string(track_id) };
+    if track_id.is_empty() {
+        return -2;
+    }
+    let playing = playing != 0;
+    if handle
+        .inner
+        .tx
+        .send(ControlCommand::Playback {
+            track_id,
+            position_ms,
+            playing,
+        })
+        .is_err()
+    {
+        return -3;
     }
     0
 }
@@ -422,6 +463,20 @@ fn run_client(
                         state.active_stream = Some(stream_id);
                         flush_prefetch_to_output(&mut state, &track_id, &tx_bytes);
                     }
+                }
+                ControlCommand::Playback {
+                    track_id,
+                    position_ms,
+                    playing,
+                } => {
+                    enqueue_control(
+                        &mut state,
+                        ClientMessage::Playback {
+                            track_id: &track_id,
+                            position_ms,
+                            playing,
+                        },
+                    );
                 }
                 ControlCommand::Buffer { buffer_ms, target_ms } => {
                     enqueue_control(

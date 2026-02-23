@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use common::Track;
 use library::{Library, LibraryError};
@@ -10,6 +10,7 @@ pub enum ShuffleMode {
     Artist,
     Album,
     Custom,
+    Liked,
 }
 
 impl ShuffleMode {
@@ -19,6 +20,7 @@ impl ShuffleMode {
             "artist" => Some(Self::Artist),
             "album" => Some(Self::Album),
             "custom" => Some(Self::Custom),
+            "liked" | "likes" => Some(Self::Liked),
             _ => None,
         }
     }
@@ -44,6 +46,7 @@ pub fn build_shuffle_queue(
     album_id: Option<&str>,
     custom_artist_ids: &[String],
     custom_genres: &[String],
+    liked_set: &HashSet<String>,
 ) -> Result<Vec<Track>, ShuffleError> {
     let mut tracks = match mode {
         ShuffleMode::All => {
@@ -80,29 +83,113 @@ pub fn build_shuffle_queue(
             if !filter_artists && !filter_genres {
                 tracks
             } else {
-                tracks
-                    .into_iter()
-                    .filter(|track| {
-                        let matches_artist = filter_artists
-                            && artist_filter.contains(track.artist_id.as_str());
-                        let matches_genre = filter_genres
-                            && track.genres.iter().any(|genre| {
-                                genre_filter.contains(&genre.trim().to_ascii_lowercase())
-                            });
+                let mut album_genres_cache: HashMap<String, Vec<String>> = HashMap::new();
+                let mut artist_genres_cache: HashMap<String, Vec<String>> = HashMap::new();
+                let mut filtered = Vec::new();
 
-                        match (filter_artists, filter_genres) {
-                            (true, true) => matches_artist || matches_genre,
-                            (true, false) => matches_artist,
-                            (false, true) => matches_genre,
-                            (false, false) => true,
+                for track in tracks {
+                    let matches_artist =
+                        filter_artists && artist_filter.contains(track.artist_id.as_str());
+                    let matches_genre = if filter_genres {
+                        if matches_genres_raw(&track.genres, &genre_filter) {
+                            true
+                        } else {
+                            let album_genres = cached_album_genres(
+                                library,
+                                &track.album_id,
+                                &mut album_genres_cache,
+                            )?;
+                            if matches_genres_normalized(&album_genres, &genre_filter) {
+                                true
+                            } else {
+                                let artist_genres = cached_artist_genres(
+                                    library,
+                                    &track.artist_id,
+                                    &mut artist_genres_cache,
+                                )?;
+                                matches_genres_normalized(&artist_genres, &genre_filter)
+                            }
                         }
-                    })
-                    .collect()
+                    } else {
+                        false
+                    };
+
+                    let include = match (filter_artists, filter_genres) {
+                        (true, true) => matches_artist || matches_genre,
+                        (true, false) => matches_artist,
+                        (false, true) => matches_genre,
+                        (false, false) => true,
+                    };
+
+                    if include {
+                        filtered.push(track);
+                    }
+                }
+
+                filtered
             }
+        }
+        ShuffleMode::Liked => {
+            let (tracks, _) = library.list_tracks(None, usize::MAX, 0)?;
+            tracks
+                .into_iter()
+                .filter(|track| liked_set.contains(&track.id))
+                .collect()
         }
     };
 
     let mut rng = rand::rng();
     tracks.shuffle(&mut rng);
     Ok(tracks)
+}
+
+fn normalize_genres(genres: &[String]) -> Vec<String> {
+    genres
+        .iter()
+        .map(|genre| genre.trim().to_ascii_lowercase())
+        .filter(|genre| !genre.is_empty())
+        .collect()
+}
+
+fn matches_genres_raw(genres: &[String], filter: &HashSet<String>) -> bool {
+    genres.iter().any(|genre| {
+        let normalized = genre.trim().to_ascii_lowercase();
+        !normalized.is_empty() && filter.contains(&normalized)
+    })
+}
+
+fn matches_genres_normalized(genres: &[String], filter: &HashSet<String>) -> bool {
+    genres.iter().any(|genre| filter.contains(genre))
+}
+
+fn cached_album_genres(
+    library: &Library,
+    album_id: &str,
+    cache: &mut HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, ShuffleError> {
+    if let Some(genres) = cache.get(album_id) {
+        return Ok(genres.clone());
+    }
+    let genres = match library.get_album(album_id)? {
+        Some(album) => normalize_genres(&album.genres),
+        None => Vec::new(),
+    };
+    cache.insert(album_id.to_string(), genres.clone());
+    Ok(genres)
+}
+
+fn cached_artist_genres(
+    library: &Library,
+    artist_id: &str,
+    cache: &mut HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, ShuffleError> {
+    if let Some(genres) = cache.get(artist_id) {
+        return Ok(genres.clone());
+    }
+    let genres = match library.get_artist(artist_id)? {
+        Some(artist) => normalize_genres(&artist.genres),
+        None => Vec::new(),
+    };
+    cache.insert(artist_id.to_string(), genres.clone());
+    Ok(genres)
 }

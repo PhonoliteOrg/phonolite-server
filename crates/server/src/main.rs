@@ -5,6 +5,7 @@ mod assets;
 mod auth;
 mod config;
 mod external;
+mod logging;
 mod quic;
 mod range;
 mod scan;
@@ -44,12 +45,10 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-
     let config_path = config_path_from_env();
     let (config, created) = load_or_create_config(&config_path)?;
+    let (log_dir, log_control) = logging::init_logging(&config_path, &config)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     let config_store = Arc::new(RwLock::new(config.clone()));
 
     if created {
@@ -57,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Loaded config from {:?}", config_path);
     }
+    info!("Logging to {}", log_dir.display());
 
     let index_path_value = config.index_path.trim();
     let index_path_value = if index_path_value.is_empty() {
@@ -132,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_data,
         stats,
         activity,
+        log_control,
         watcher,
         external_client,
         stream_sessions: stream_sessions::StreamSessions::new(),

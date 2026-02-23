@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{AuthStore, AuthUser};
 use crate::activity_store::ActivityStore;
 use crate::config::ServerConfig;
+use crate::logging::LogControl;
 use crate::stats_store::StatsStore;
 use crate::user_data::UserDataStore;
 use crate::stream_sessions::StreamSessions;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub user_data: UserDataStore,
     pub stats: StatsStore,
     pub activity: ActivityStore,
+    pub log_control: LogControl,
     pub watcher: Arc<RwLock<Option<RecommendedWatcher>>>,
     pub external_client: Client,
     pub stream_sessions: StreamSessions,
@@ -193,6 +195,7 @@ pub struct SettingsForm {
     pub music_root: String,
     pub index_path: String,
     pub metadata_path: String,
+    pub log_dir: String,
     pub port: String,
     pub quic_port: String,
     pub watch_music: Option<String>,
@@ -205,6 +208,7 @@ pub struct SettingsForm {
     pub external_metadata_enrich_on_scan: Option<String>,
     pub external_metadata_scan_limit: String,
     pub external_metadata_on_tag_error: Option<String>,
+    pub log_debug_enabled: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +247,11 @@ pub struct MetadataTestForm {
 
 #[derive(Deserialize)]
 pub struct MetadataToggleForm {
+    pub enabled: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DebugLogToggleForm {
     pub enabled: Option<String>,
 }
 

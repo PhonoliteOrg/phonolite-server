@@ -24,6 +24,8 @@ const MAX_QUIC_DATAGRAM: usize = 1350;
 const CONTROL_STREAM_MAX_LINE: usize = 64 * 1024;
 const MAX_STREAM_BUFFER_BYTES: usize = 6 * 1024 * 1024;
 const SEEK_RESET_MARKER: u16 = 0xFFFF;
+const STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const STATS_MAX_PLAYBACK_DELTA_MS: u64 = 15_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -46,6 +48,12 @@ enum ControlMessage {
     Buffer { buffer_ms: u32, target_ms: Option<u32> },
     #[serde(rename = "seek")]
     Seek { track_id: String, position_ms: u32 },
+    #[serde(rename = "playback")]
+    Playback {
+        track_id: String,
+        position_ms: u32,
+        playing: Option<bool>,
+    },
     #[serde(rename = "ping")]
     Ping { ts: Option<i64> },
 }
@@ -223,6 +231,14 @@ struct SessionState {
     buffer_target_ms: u32,
     client_buffer_ms: u32,
     last_debug: Instant,
+    stats_pending_ms: u64,
+    stats_pending_plays: u64,
+    stats_track_id: Option<String>,
+    stats_artist_id: Option<String>,
+    stats_genres: Vec<String>,
+    stats_track_duration_ms: Option<u64>,
+    stats_play_counted: bool,
+    stats_last_position_ms: Option<u64>,
 }
 
 impl SessionState {
@@ -241,6 +257,14 @@ impl SessionState {
             buffer_target_ms: 8000,
             client_buffer_ms: 0,
             last_debug: Instant::now(),
+            stats_pending_ms: 0,
+            stats_pending_plays: 0,
+            stats_track_id: None,
+            stats_artist_id: None,
+            stats_genres: Vec::new(),
+            stats_track_duration_ms: None,
+            stats_play_counted: false,
+            stats_last_position_ms: None,
         }
     }
 
@@ -397,6 +421,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                         if client.conn.is_timed_out() {
                             tracing::warn!("QUIC closed: idle timeout");
                         }
+                        finalize_listen_stats(&state, &mut client.session);
                         closed.push(id.clone());
                         continue;
                     }
@@ -754,6 +779,22 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 tracing::warn!("QUIC seek failed: {}", err);
                 send_control(client, ControlResponse::Error { message: &err });
             }
+        }
+        ControlMessage::Playback {
+            track_id,
+            position_ms,
+            playing,
+        } => {
+            if !client.session.authed {
+                return;
+            }
+            update_listen_stats_from_playback(
+                state,
+                &mut client.session,
+                &track_id,
+                position_ms,
+                playing.unwrap_or(true),
+            );
         }
         ControlMessage::Ping { ts } => {
             send_control(client, ControlResponse::Pong { ts });
@@ -1173,6 +1214,131 @@ fn maybe_log_streams(session: &mut SessionState, conn: &quiche::Connection) {
             conn.stats().recv_bytes,
             path,
         );
+    }
+}
+
+fn finalize_listen_stats(state: &AppState, session: &mut SessionState) {
+    if !state.config.read().stats_collection_enabled {
+        return;
+    }
+    let user_id = match session.user_id.clone() {
+        Some(value) => value,
+        None => return,
+    };
+    flush_pending_stats(state, session, &user_id);
+}
+
+fn flush_pending_stats(state: &AppState, session: &mut SessionState, user_id: &str) {
+    if session.stats_pending_ms == 0 && session.stats_pending_plays == 0 {
+        return;
+    }
+    let Some(track_id) = session.stats_track_id.as_deref() else {
+        session.stats_pending_ms = 0;
+        session.stats_pending_plays = 0;
+        return;
+    };
+    let Some(artist_id) = session.stats_artist_id.as_deref() else {
+        session.stats_pending_ms = 0;
+        session.stats_pending_plays = 0;
+        return;
+    };
+    if let Err(err) = state.stats.record_listen(
+        user_id,
+        track_id,
+        artist_id,
+        &session.stats_genres,
+        session.stats_pending_ms,
+        session.stats_pending_plays,
+    ) {
+        tracing::warn!("QUIC stats record failed: {}", err);
+    }
+    session.stats_pending_ms = 0;
+    session.stats_pending_plays = 0;
+}
+
+fn clear_stats_track(session: &mut SessionState) {
+    session.stats_track_id = None;
+    session.stats_artist_id = None;
+    session.stats_genres.clear();
+    session.stats_track_duration_ms = None;
+    session.stats_play_counted = false;
+    session.stats_last_position_ms = None;
+}
+
+fn load_stats_metadata(state: &AppState, session: &mut SessionState, track_id: &str) -> bool {
+    let library_guard = state.library_state.read();
+    let Some(library) = library_guard.library.clone() else {
+        return false;
+    };
+    let track = match library.get_track(track_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::warn!("QUIC stats track lookup failed: {}", err);
+            return false;
+        }
+    };
+    session.stats_track_id = Some(track.id);
+    session.stats_artist_id = Some(track.artist_id);
+    session.stats_genres = track.genres;
+    session.stats_track_duration_ms = Some(track.duration_ms as u64);
+    session.stats_play_counted = false;
+    session.stats_last_position_ms = None;
+    true
+}
+
+fn update_listen_stats_from_playback(
+    state: &AppState,
+    session: &mut SessionState,
+    track_id: &str,
+    position_ms: u32,
+    playing: bool,
+) {
+    if !state.config.read().stats_collection_enabled {
+        session.stats_pending_ms = 0;
+        clear_stats_track(session);
+        return;
+    }
+
+    let user_id = match session.user_id.clone() {
+        Some(value) => value,
+        None => return,
+    };
+
+    if session.stats_track_id.as_deref() != Some(track_id) {
+        flush_pending_stats(state, session, &user_id);
+        if !load_stats_metadata(state, session, track_id) {
+            return;
+        }
+    }
+
+    let position_ms = position_ms as u64;
+    if let Some(last_pos) = session.stats_last_position_ms {
+        if playing {
+            let delta = position_ms.saturating_sub(last_pos);
+            if delta > 0 && delta <= STATS_MAX_PLAYBACK_DELTA_MS {
+                session.stats_pending_ms = session.stats_pending_ms.saturating_add(delta);
+            }
+        }
+    }
+    session.stats_last_position_ms = Some(position_ms);
+
+    if playing && !session.stats_play_counted {
+        if let Some(duration_ms) = session.stats_track_duration_ms {
+            if duration_ms > 0 && position_ms >= duration_ms / 2 {
+                session.stats_pending_plays = session.stats_pending_plays.saturating_add(1);
+                session.stats_play_counted = true;
+            }
+        }
+    }
+
+    if !playing {
+        flush_pending_stats(state, session, &user_id);
+        return;
+    }
+
+    if session.stats_pending_ms >= STATS_FLUSH_INTERVAL.as_millis() as u64 {
+        flush_pending_stats(state, session, &user_id);
     }
 }
 

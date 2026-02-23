@@ -106,6 +106,7 @@ fn transcode_to_opus(
     let mut channels: Option<u8> = None;
     let mut resampler: Option<LinearResampler> = None;
     let mut pcm_buffer: Vec<i16> = Vec::new();
+    let mut pcm_offset: usize = 0;
     let mut total_samples = 0u64;
     let mut ogg = OggWriter::new(serial_from_path(path));
     let mut encoder: Option<OpusEncoderWrapper> = None;
@@ -253,17 +254,22 @@ fn transcode_to_opus(
 
         pcm_buffer.extend_from_slice(&output_samples);
         if skip_samples > 0 {
-            let drop = std::cmp::min(skip_samples as usize, pcm_buffer.len());
+            let available = pcm_buffer.len().saturating_sub(pcm_offset);
+            let drop = std::cmp::min(skip_samples as usize, available);
             if drop > 0 {
-                pcm_buffer.drain(..drop);
+                pcm_offset = pcm_offset.saturating_add(drop);
                 skip_samples = skip_samples.saturating_sub(drop as u64);
             }
             if skip_samples > 0 {
+                if pcm_offset > 0 {
+                    pcm_buffer.drain(..pcm_offset);
+                    pcm_offset = 0;
+                }
                 continue;
             }
         }
 
-        while pcm_buffer.len() >= frame_size * channels as usize {
+        while pcm_buffer.len().saturating_sub(pcm_offset) >= frame_size * channels as usize {
             if selector.mode == TranscodeMode::Auto {
                 let desired = selector
                     .adaptive_bitrate_bps
@@ -279,7 +285,8 @@ fn transcode_to_opus(
                 }
             }
 
-            let frame = &pcm_buffer[..frame_size * channels as usize];
+            let end = pcm_offset + frame_size * channels as usize;
+            let frame = &pcm_buffer[pcm_offset..end];
             let encoded = encoder
                 .as_mut()
                 .ok_or_else(|| "encoder not initialized".to_string())?
@@ -295,8 +302,13 @@ fn transcode_to_opus(
                     send_raw_frame(&encoded, tx)?;
                 }
             }
-            pcm_buffer.drain(..frame_size * channels as usize);
+            pcm_offset = end;
             packet_counter = packet_counter.wrapping_add(1);
+        }
+
+        if pcm_offset > 0 {
+            pcm_buffer.drain(..pcm_offset);
+            pcm_offset = 0;
         }
     }
 

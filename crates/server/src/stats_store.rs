@@ -4,14 +4,20 @@ use std::sync::Arc;
 use redb::{CommitError, Database, ReadableTable, StorageError, TableDefinition, TableError, TransactionError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tracing::warn;
 
 const STATS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("stats");
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UserPeriodStats {
     pub total_ms: u64,
+    #[serde(default)]
+    pub track_plays: HashMap<String, u64>,
+    #[serde(default)]
     pub track_ms: HashMap<String, u64>,
+    #[serde(default)]
     pub artist_ms: HashMap<String, u64>,
+    #[serde(default)]
     pub genre_ms: HashMap<String, u64>,
 }
 
@@ -41,8 +47,9 @@ impl StatsStore {
         artist_id: &str,
         genres: &[String],
         duration_ms: u64,
+        play_count: u64,
     ) -> Result<(), StatsError> {
-        if duration_ms == 0 {
+        if duration_ms == 0 && play_count == 0 {
             return Ok(());
         }
         let (year, month) = current_year_month();
@@ -58,6 +65,7 @@ impl StatsStore {
                 artist_id,
                 genres,
                 duration_ms,
+                play_count,
             )?;
             update_period(
                 &mut table,
@@ -68,6 +76,7 @@ impl StatsStore {
                 artist_id,
                 genres,
                 duration_ms,
+                play_count,
             )?;
         }
         write_txn.commit()?;
@@ -87,11 +96,39 @@ impl StatsStore {
             Err(err) => return Err(err.into()),
         };
         let key = stats_key(user_id, year, month);
-        let Some(value) = table.get(key.as_str())? else {
-            return Ok(None);
+        let mut should_clear = false;
+        let stats = {
+            let Some(value) = table.get(key.as_str())? else {
+                return Ok(None);
+            };
+            match bincode::deserialize::<UserPeriodStats>(value.value()) {
+                Ok(stats) => Some(stats),
+                Err(err) => {
+                    warn!(
+                        "stats decode failed for key {}: {}; clearing entry",
+                        key, err
+                    );
+                    should_clear = true;
+                    None
+                }
+            }
         };
-        let stats: UserPeriodStats = bincode::deserialize(value.value())?;
-        Ok(Some(stats))
+        drop(table);
+        drop(read_txn);
+        if should_clear {
+            let _ = self.clear_entry(&key);
+        }
+        Ok(stats)
+    }
+
+    fn clear_entry(&self, key: &str) -> Result<(), StatsError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(STATS_TABLE)?;
+            let _ = table.remove(key)?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 }
 
@@ -104,21 +141,33 @@ fn update_period(
     artist_id: &str,
     genres: &[String],
     duration_ms: u64,
+    play_count: u64,
 ) -> Result<(), StatsError> {
     let key = stats_key(user_id, year, month);
     let mut stats = match table.get(key.as_str())? {
-        Some(value) => bincode::deserialize(value.value())?,
+        Some(value) => match bincode::deserialize(value.value()) {
+            Ok(stats) => stats,
+            Err(err) => {
+                warn!("stats decode failed for key {}: {}; resetting", key, err);
+                UserPeriodStats::default()
+            }
+        },
         None => UserPeriodStats::default(),
     };
-    stats.total_ms = stats.total_ms.saturating_add(duration_ms);
-    *stats.track_ms.entry(track_id.to_string()).or_insert(0) += duration_ms;
-    *stats.artist_ms.entry(artist_id.to_string()).or_insert(0) += duration_ms;
-    for genre in genres {
-        let trimmed = genre.trim();
-        if trimmed.is_empty() {
-            continue;
+    if duration_ms > 0 {
+        stats.total_ms = stats.total_ms.saturating_add(duration_ms);
+        *stats.track_ms.entry(track_id.to_string()).or_insert(0) += duration_ms;
+        *stats.artist_ms.entry(artist_id.to_string()).or_insert(0) += duration_ms;
+        for genre in genres {
+            let trimmed = genre.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            *stats.genre_ms.entry(trimmed.to_string()).or_insert(0) += duration_ms;
         }
-        *stats.genre_ms.entry(trimmed.to_string()).or_insert(0) += duration_ms;
+    }
+    if play_count > 0 {
+        *stats.track_plays.entry(track_id.to_string()).or_insert(0) += play_count;
     }
     let bytes = bincode::serialize(&stats)?;
     table.insert(key.as_str(), bytes.as_slice())?;
