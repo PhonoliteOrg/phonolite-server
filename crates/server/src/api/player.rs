@@ -21,12 +21,11 @@ pub async fn get_playback_settings(
     State(state): State<AppState>,
     Extension(_ctx): Extension<AuthContext>,
 ) -> JsonResult<PlaybackSettingsResponse> {
-    let settings = state
-        .user_data
-        .get_playback_settings()
-        .map_err(|err: crate::user_data::UserDataError| {
+    let settings = state.user_data.get_playback_settings().map_err(
+        |err: crate::user_data::UserDataError| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-        })?;
+        },
+    )?;
     let repeat_mode = settings
         .map(|s| s.repeat_mode)
         .unwrap_or_else(|| DEFAULT_REPEAT_MODE.to_string());

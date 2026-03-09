@@ -1,0 +1,19 @@
+<div class="modal" id="modal-music-root-edit">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3>Edit music folder</h3>
+    </div>
+    <form class="stack" id="form-music-root-edit">
+      <input type="hidden" name="root_id" />
+      <label>Folder path</label>
+      <input name="path" type="text" placeholder="Music/Library or D:/Music" />
+      <p class="hint">Paths are relative to the config file if not absolute.</p>
+      <div class="inline-error" id="music-root-edit-error"></div>
+      <div class="row">
+        <button class="button ghost" type="button" data-close>Cancel</button>
+        <button class="button" type="submit">Save changes</button>
+      </div>
+    </form>
+  </div>
+</div>

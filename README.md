@@ -11,22 +11,25 @@ Indexing uses a local `redb` database (no external services).
 1. Install Rust (stable) and ensure `cargo` is on `PATH`.
 2. Initialize submodules (required for `vendor/opus`):
 
-```powershell
+```bash
 git submodule update --init --recursive
 ```
 
-3. On Windows, install NASM and ensure `nasm.exe` is on `PATH` (see Build Dependencies).
+3. Install platform build prerequisites for the QUIC dependency:
+   - Windows: install NASM and ensure `nasm.exe` is on `PATH`
+   - Linux: install a working C/C++ toolchain for `quiche`/BoringSSL
+   - If `config.yaml` lives outside the binary directory, set `PHONOLITE_WEB_ROOT` to the `web` folder location
 
-From `server/`:
+From `phonolite-server/`:
 
-```powershell
+```bash
 cargo run -p server --release
 ```
 
 From the repo root:
 
-```powershell
-cargo run --manifest-path server\Cargo.toml -p server --release
+```bash
+cargo run --manifest-path phonolite-server/Cargo.toml -p server --release
 ```
 
 On first run the server creates `config.yaml` next to the server binary. Open the admin console
@@ -38,6 +41,11 @@ Optional override for config path:
 
 ```powershell
 $env:PHONOLITE_CONFIG="C:\path\to\config.yaml"
+```
+
+```bash
+export PHONOLITE_CONFIG=/path/to/config.yaml
+export PHONOLITE_WEB_ROOT=/path/to/phonolite-server/web
 ```
 
 The server watches `music_root` by default and will debounce file events before rescanning.

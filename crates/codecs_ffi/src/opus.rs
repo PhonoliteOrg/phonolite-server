@@ -131,8 +131,9 @@ impl OpusEncoderWrapper {
     }
 
     pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), OpusEncodeError> {
-        let ctl_err =
-            unsafe { opus_encoder_ctl(self.encoder, OPUS_SET_BITRATE_REQUEST, bitrate_bps as c_int) };
+        let ctl_err = unsafe {
+            opus_encoder_ctl(self.encoder, OPUS_SET_BITRATE_REQUEST, bitrate_bps as c_int)
+        };
         if ctl_err != OPUS_OK {
             return Err(OpusEncodeError::EncodeFailed);
         }

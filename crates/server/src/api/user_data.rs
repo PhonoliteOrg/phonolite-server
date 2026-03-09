@@ -4,9 +4,7 @@ use axum::{
     Json,
 };
 
-use crate::state::{
-    AppState, CreatePlaylistRequest, JsonResult, Playlist, UpdatePlaylistRequest,
-};
+use crate::state::{AppState, CreatePlaylistRequest, JsonResult, Playlist, UpdatePlaylistRequest};
 use crate::utils::json_error;
 
 pub async fn list_playlists(State(state): State<AppState>) -> JsonResult<Vec<Playlist>> {
@@ -45,7 +43,10 @@ pub async fn update_playlist(
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
     match updated {
         Some(playlist) => Ok(Json(playlist)),
-        None => Err(json_error(StatusCode::NOT_FOUND, "playlist not found".to_string())),
+        None => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "playlist not found".to_string(),
+        )),
     }
 }
 
@@ -60,7 +61,10 @@ pub async fn delete_playlist(
     if deleted {
         Ok(Json(()))
     } else {
-        Err(json_error(StatusCode::NOT_FOUND, "playlist not found".to_string()))
+        Err(json_error(
+            StatusCode::NOT_FOUND,
+            "playlist not found".to_string(),
+        ))
     }
 }
 

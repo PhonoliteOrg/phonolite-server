@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::resolve_path;
 use crate::logging::{
-    LOG_ACTIVITY_FILE, LOG_ALL_FILE, LOG_DEBUG_FILE, LOG_ERROR_FILE, LOG_INFO_FILE,
-    LOG_ISSUE_FILE, LOG_MAX_LINES, LOG_WARN_FILE,
+    LOG_ACTIVITY_FILE, LOG_ALL_FILE, LOG_DEBUG_FILE, LOG_ERROR_FILE, LOG_INFO_FILE, LOG_ISSUE_FILE,
+    LOG_MAX_LINES, LOG_WARN_FILE,
 };
 use crate::state::AppState;
-use crate::utils::{apply_template, escape_html, html_error, html_response, load_template, render_admin_page, PageLayout};
+use crate::utils::{
+    apply_template, escape_html, html_error, html_response, json_error_response, json_ok_response,
+    load_template, redirect_to, render_admin_page, wants_json, PageLayout,
+};
 
 use super::{admin_user_from_headers, is_admin};
 
@@ -78,11 +81,14 @@ pub async fn admin_logs(State(state): State<AppState>, headers: HeaderMap) -> Re
     } else {
         String::new()
     };
-    let body = apply_template(template, &[
-        ("log_dir", escape_html(&log_dir.to_string_lossy())),
-        ("log_limit", LOG_MAX_LINES.to_string()),
-        ("log_debug_checked", log_debug_checked),
-    ]);
+    let body = apply_template(
+        template,
+        &[
+            ("log_dir", escape_html(&log_dir.to_string_lossy())),
+            ("log_limit", LOG_MAX_LINES.to_string()),
+            ("log_debug_checked", log_debug_checked),
+        ],
+    );
 
     html_response(
         StatusCode::OK,
@@ -96,39 +102,51 @@ pub async fn admin_logs_tail(
     Query(query): Query<LogTailQuery>,
 ) -> Response {
     if !state.auth.has_admin().unwrap_or(false) {
-        return (StatusCode::UNAUTHORIZED, Json(LogTailResponse {
-            lines: Vec::new(),
-            total: 0,
-            updated_at: 0,
-        }))
-        .into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LogTailResponse {
+                lines: Vec::new(),
+                total: 0,
+                updated_at: 0,
+            }),
+        )
+            .into_response();
     }
     let user = match admin_user_from_headers(&state, &headers) {
         Ok(Some(user)) => user,
         Ok(None) => {
-            return (StatusCode::UNAUTHORIZED, Json(LogTailResponse {
-                lines: Vec::new(),
-                total: 0,
-                updated_at: 0,
-            }))
-            .into_response()
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LogTailResponse {
+                    lines: Vec::new(),
+                    total: 0,
+                    updated_at: 0,
+                }),
+            )
+                .into_response()
         }
         Err(_err) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(LogTailResponse {
-                lines: Vec::new(),
-                total: 0,
-                updated_at: 0,
-            }))
-            .into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(LogTailResponse {
+                    lines: Vec::new(),
+                    total: 0,
+                    updated_at: 0,
+                }),
+            )
+                .into_response()
         }
     };
     if !is_admin(&user) {
-        return (StatusCode::FORBIDDEN, Json(LogTailResponse {
-            lines: Vec::new(),
-            total: 0,
-            updated_at: 0,
-        }))
-        .into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(LogTailResponse {
+                lines: Vec::new(),
+                total: 0,
+                updated_at: 0,
+            }),
+        )
+            .into_response();
     }
 
     let log_dir = resolve_path(&state.config_path, &state.config.read().log_dir);
@@ -136,9 +154,15 @@ pub async fn admin_logs_tail(
     let view = query.view.as_deref().unwrap_or("all");
     let log_path = log_file_for_view(&log_dir, view);
     match read_log_tail(&log_path, limit) {
-        Ok((lines, total, updated_at)) => {
-            (StatusCode::OK, Json(LogTailResponse { lines, total, updated_at })).into_response()
-        }
+        Ok((lines, total, updated_at)) => (
+            StatusCode::OK,
+            Json(LogTailResponse {
+                lines,
+                total,
+                updated_at,
+            }),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(LogTailResponse {
@@ -148,6 +172,38 @@ pub async fn admin_logs_tail(
             }),
         )
             .into_response(),
+    }
+}
+
+pub async fn admin_logs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.has_admin().unwrap_or(false) {
+        return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let user = match admin_user_from_headers(&state, &headers) {
+        Ok(Some(user)) => user,
+        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+        Err(err) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("auth error: {}", err),
+            )
+        }
+    };
+    if !is_admin(&user) {
+        return json_error_response(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    if let Err(err) = state.log_control.clear_all() {
+        return json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to clear logs: {}", err),
+        );
+    }
+
+    if wants_json(&headers) {
+        json_ok_response()
+    } else {
+        redirect_to("/logs")
     }
 }
 

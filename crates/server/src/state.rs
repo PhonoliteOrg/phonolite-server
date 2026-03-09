@@ -10,13 +10,14 @@ use redb::Database;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthStore, AuthUser};
 use crate::activity_store::ActivityStore;
+use crate::auth::{AuthStore, AuthUser};
 use crate::config::ServerConfig;
 use crate::logging::LogControl;
 use crate::stats_store::StatsStore;
-use crate::user_data::UserDataStore;
+use crate::stream_cache::StreamCache;
 use crate::stream_sessions::StreamSessions;
+use crate::user_data::UserDataStore;
 use library::{Library, LibraryStats};
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ pub struct AppState {
     pub watcher: Arc<RwLock<Option<RecommendedWatcher>>>,
     pub external_client: Client,
     pub stream_sessions: StreamSessions,
+    pub stream_cache: StreamCache,
 }
 
 #[derive(Clone)]
@@ -121,7 +123,6 @@ pub struct Playlist {
     pub track_ids: Vec<String>,
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct CreatePlaylistRequest {
     pub name: String,
@@ -192,7 +193,6 @@ pub struct PasswordForm {
 
 #[derive(Deserialize)]
 pub struct SettingsForm {
-    pub music_root: String,
     pub index_path: String,
     pub metadata_path: String,
     pub log_dir: String,
@@ -213,7 +213,6 @@ pub struct SettingsForm {
 
 #[derive(Deserialize)]
 pub struct SettingsQuery {
-    pub music_root: Option<String>,
     pub message: Option<String>,
 }
 
@@ -236,6 +235,16 @@ pub struct MetadataSourceForm {
     pub provider: String,
     pub api_key: Option<String>,
     pub user_agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MusicRootForm {
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct MusicRootUpdateForm {
+    pub path: String,
 }
 
 #[derive(Deserialize)]

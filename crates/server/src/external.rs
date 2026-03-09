@@ -3,6 +3,8 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::musicbrainz_rate_limit;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
@@ -120,7 +122,9 @@ pub async fn test_source(client: &Client, source: &ExternalSource) -> Result<(),
             if user_agent.trim().is_empty() {
                 return Err("user_agent is required".to_string());
             }
-            let url = "https://musicbrainz.org/ws/2/artist/?query=artist:radiohead&fmt=json&limit=1";
+            let url =
+                "https://musicbrainz.org/ws/2/artist/?query=artist:radiohead&fmt=json&limit=1";
+            musicbrainz_rate_limit::wait_for_slot().await;
             let response = client
                 .get(url)
                 .timeout(source.timeout)
@@ -325,20 +329,8 @@ async fn fetch_musicbrainz_artist(
         "https://musicbrainz.org/ws/2/artist/?query=artist:{}&fmt=json&limit=1&inc=tags",
         url_escape(artist_name)
     );
-    let response = client
-        .get(&url)
-        .timeout(source.timeout)
-        .header("User-Agent", user_agent)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("http {}", response.status()));
-    }
-    let payload = response
-        .json::<MusicBrainzArtistResponse>()
-        .await
-        .map_err(|err| err.to_string())?;
+    let payload: MusicBrainzArtistResponse =
+        fetch_musicbrainz_json(client, source, &url, user_agent).await?;
     let artist = match payload.artists.and_then(|mut items| items.pop()) {
         Some(artist) => artist,
         None => return Ok(None),
@@ -363,29 +355,13 @@ async fn fetch_musicbrainz_album(
     if user_agent.is_empty() {
         return Ok(None);
     }
-    let query = format!(
-        "artist:{} releasegroup:{}",
-        artist_name,
-        album_title
-    );
+    let query = format!("artist:{} releasegroup:{}", artist_name, album_title);
     let url = format!(
         "https://musicbrainz.org/ws/2/release-group/?query={}&fmt=json&limit=1&inc=tags",
         url_escape(&query)
     );
-    let response = client
-        .get(&url)
-        .timeout(source.timeout)
-        .header("User-Agent", user_agent)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("http {}", response.status()));
-    }
-    let payload = response
-        .json::<MusicBrainzReleaseGroupResponse>()
-        .await
-        .map_err(|err| err.to_string())?;
+    let payload: MusicBrainzReleaseGroupResponse =
+        fetch_musicbrainz_json(client, source, &url, user_agent).await?;
     let album = match payload.release_groups.and_then(|mut items| items.pop()) {
         Some(album) => album,
         None => return Ok(None),
@@ -397,6 +373,78 @@ async fn fetch_musicbrainz_album(
         logo_url: None,
         banner_url: None,
     }))
+}
+
+async fn fetch_musicbrainz_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    source: &ExternalSource,
+    url: &str,
+    user_agent: &str,
+) -> Result<T, String> {
+    let tries = 6usize;
+    let mut last_error = String::from("request failed");
+
+    for attempt in 0..tries {
+        musicbrainz_rate_limit::wait_for_slot().await;
+        let response = client
+            .get(url)
+            .timeout(source.timeout)
+            .header("User-Agent", user_agent)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    match response.bytes().await {
+                        Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
+                            Ok(payload) => return Ok(payload),
+                            Err(err) => {
+                                last_error = format_musicbrainz_decode_error(err, &bytes);
+                            }
+                        },
+                        Err(err) => {
+                            last_error = err.to_string();
+                        }
+                    }
+                    if attempt + 1 == tries {
+                        return Err(last_error);
+                    }
+                } else {
+                    last_error = format!("http {status}");
+                    if !(status.as_u16() == 429 || status.is_server_error()) || attempt + 1 == tries
+                    {
+                        return Err(last_error);
+                    }
+                }
+            }
+            Err(err) => {
+                last_error = err.to_string();
+                if attempt + 1 == tries {
+                    return Err(last_error);
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1000 + (attempt as u64 * 500))).await;
+    }
+
+    Err(last_error)
+}
+
+fn format_musicbrainz_decode_error(err: serde_json::Error, body: &[u8]) -> String {
+    let snippet = String::from_utf8_lossy(body);
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        return format!("error decoding response body: {}", err);
+    }
+    let snippet = if snippet.len() > 240 {
+        format!("{}...", &snippet[..240])
+    } else {
+        snippet.to_string()
+    };
+    format!("error decoding response body: {} | body={}", err, snippet)
 }
 
 fn collect_genres(values: &[Option<String>]) -> Vec<String> {
@@ -489,13 +537,9 @@ fn url_escape(input: &str) -> String {
     let mut out = String::new();
     for byte in input.as_bytes() {
         match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => out.push(*byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
             b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{:02X}", byte)),
         }

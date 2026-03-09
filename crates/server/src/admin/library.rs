@@ -1,16 +1,16 @@
 // crates/server/src/admin/library.rs
 use std::collections::HashMap;
 
+use crate::state::LibraryStatus;
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
 use common::{Album, Artist, Track};
 pub use library::{Library, LibraryStats};
-use crate::state::LibraryStatus;
+use serde_json::json;
 use tracing::warn;
 
 use crate::assets::{
@@ -24,8 +24,8 @@ use crate::state::{
 };
 use crate::utils::{
     apply_template, escape_html, format_duration_ms, format_track_position, html_error,
-    html_response, json_error_response, load_template, redirect_to, render_admin_page, truncate_text,
-    url_escape, wants_json, PageLayout,
+    html_response, json_error_response, load_template, redirect_to, render_admin_page,
+    truncate_text, url_escape, wants_json, PageLayout,
 };
 
 use super::auth::{admin_login_page, admin_setup_page};
@@ -70,7 +70,9 @@ pub async fn admin_library_status(State(state): State<AppState>, headers: Header
         LibraryStatus::Scanning { started } => {
             let since = started
                 .elapsed()
-                .map(|elapsed: std::time::Duration| format!("library scan in progress ({}s)", elapsed.as_secs()))
+                .map(|elapsed: std::time::Duration| {
+                    format!("library scan in progress ({}s)", elapsed.as_secs())
+                })
                 .unwrap_or_else(|_| "library scan in progress".to_string());
             ("scanning".to_string(), Some(since), None, None, None)
         }
@@ -81,13 +83,9 @@ pub async fn admin_library_status(State(state): State<AppState>, headers: Header
             Some(stats.albums),
             Some(stats.tracks),
         ),
-        LibraryStatus::Error(message) => (
-            "error".to_string(),
-            Some(message.clone()),
-            None,
-            None,
-            None,
-        ),
+        LibraryStatus::Error(message) => {
+            ("error".to_string(), Some(message.clone()), None, None, None)
+        }
     };
 
     Json(LibraryStatusResponse {
@@ -129,7 +127,11 @@ pub async fn admin_reindex(State(state): State<AppState>, headers: HeaderMap) ->
 
     if wants_json(&headers) {
         if message.starts_with("info:") {
-            (StatusCode::ACCEPTED, Json(HealthResponse { status: "indexing" })).into_response()
+            (
+                StatusCode::ACCEPTED,
+                Json(HealthResponse { status: "indexing" }),
+            )
+                .into_response()
         } else {
             json_error_response(StatusCode::SERVICE_UNAVAILABLE, message)
         }
@@ -289,7 +291,10 @@ fn admin_library_page(
         }
     };
 
-    let is_fragment = headers.get("X-Fragment").map(|v| v == "true").unwrap_or(false);
+    let is_fragment = headers
+        .get("X-Fragment")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let status_block = render_status_block_for_library(state);
     let search = query.search.clone().unwrap_or_default();
@@ -352,7 +357,8 @@ fn admin_library_page(
             "pagination": pagination,
             "message": render_message(message),
             "search_block": search_block,
-        })).into_response();
+        }))
+        .into_response();
     }
 
     // Initial load - empty content to be fetched by JS
@@ -413,7 +419,11 @@ pub async fn admin_scan(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     if wants_json(&headers) {
         if message.starts_with("info:") {
-            (StatusCode::ACCEPTED, Json(HealthResponse { status: "indexing" })).into_response()
+            (
+                StatusCode::ACCEPTED,
+                Json(HealthResponse { status: "indexing" }),
+            )
+                .into_response()
         } else {
             json_error_response(StatusCode::SERVICE_UNAVAILABLE, message)
         }
@@ -456,17 +466,24 @@ fn render_library_search_block(state: &AppState, search: &str, filter: SearchFil
     let clear_icon = r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>"#;
 
     let clear_button = if !value.is_empty() {
-        format!(r#"<a href="/library" class="icon-button" title="Clear search" style="opacity: 0.6; margin-right: 4px;">{}</a>"#, clear_icon)
+        format!(
+            r#"<a href="/library" class="icon-button" title="Clear search" style="opacity: 0.6; margin-right: 4px;">{}</a>"#,
+            clear_icon
+        )
     } else {
         String::new()
     };
 
-    let template = load_template(state, "templates/partials/library_search.html").unwrap_or_default();
-    apply_template(template, &[
-        ("value", value),
-        ("clear_button", clear_button),
-        ("hidden_filter", hidden_filter),
-    ])
+    let template =
+        load_template(state, "templates/partials/library_search.html").unwrap_or_default();
+    apply_template(
+        template,
+        &[
+            ("value", value),
+            ("clear_button", clear_button),
+            ("hidden_filter", hidden_filter),
+        ],
+    )
 }
 
 fn render_library_tabs(search: &str, filter: SearchFilter) -> String {
@@ -540,7 +557,10 @@ fn render_artist_tiles_section(
         Ok(result) => result,
         Err(err) => {
             *message = Some(format!("library error: {}", err));
-            return ("<p class=\"muted\">Failed to load artists.</p>".to_string(), 0);
+            return (
+                "<p class=\"muted\">Failed to load artists.</p>".to_string(),
+                0,
+            );
         }
     };
 
@@ -567,7 +587,10 @@ fn render_album_tiles_section(
         Ok(result) => result,
         Err(err) => {
             *message = Some(format!("library error: {}", err));
-            return ("<p class=\"muted\">Failed to load albums.</p>".to_string(), 0);
+            return (
+                "<p class=\"muted\">Failed to load albums.</p>".to_string(),
+                0,
+            );
         }
     };
 
@@ -594,7 +617,10 @@ fn render_track_tiles_section(
         Ok(result) => result,
         Err(err) => {
             *message = Some(format!("library error: {}", err));
-            return ("<p class=\"muted\">Failed to load tracks.</p>".to_string(), 0);
+            return (
+                "<p class=\"muted\">Failed to load tracks.</p>".to_string(),
+                0,
+            );
         }
     };
 
@@ -611,18 +637,25 @@ fn render_artist_tiles(state: &AppState, library: &Library, artists: &[Artist]) 
     for artist in artists {
         let logo_url = artist_cover_url(library, &artist.id);
         let cover_html = if let Some(url) = &logo_url {
-            format!("<img class=\"tile-cover artist-cover-img\" src=\"{}\" alt=\"{}\" />", escape_html(url), escape_html(&artist.name))
+            format!(
+                "<img class=\"tile-cover artist-cover-img\" src=\"{}\" alt=\"{}\" />",
+                escape_html(url),
+                escape_html(&artist.name)
+            )
         } else {
             "<div class=\"tile-cover artist-cover-placeholder\"></div>".to_string()
         };
         let link = format!("/library?artist_id={}", url_escape(&artist.id));
         let genres = format_genres_html(&artist.genres);
-        tiles.push_str(&apply_template(template.clone(), &[
-            ("link", escape_html(&link)),
-            ("cover_html", cover_html),
-            ("name", escape_html(&artist.name)),
-            ("genres", genres),
-        ]));
+        tiles.push_str(&apply_template(
+            template.clone(),
+            &[
+                ("link", escape_html(&link)),
+                ("cover_html", cover_html),
+                ("name", escape_html(&artist.name)),
+                ("genres", genres),
+            ],
+        ));
     }
     format!("<div class=\"tile-grid\">{}</div>", tiles)
 }
@@ -642,38 +675,25 @@ fn render_album_tiles(state: &AppState, library: &Library, albums: &[Album]) -> 
             None
         };
         let cover = render_tile_cover(cover_url.as_deref());
-        let artist = artist_cache
-            .get(&album.artist_id)
-            .cloned()
-            .or_else(|| {
-                library
-                    .get_artist(&album.artist_id)
-                    .ok()
-                    .flatten()
-                    .map(|artist| {
-                        artist_cache.insert(album.artist_id.clone(), artist.clone());
-                        artist
-                    })
-            });
-        let artist_name = artist
-            .as_ref()
-            .map(|artist| artist.name.clone())
-            .unwrap_or_else(|| "Unknown Artist".to_string());
+        let artist_name = album_artist_name(library, &mut artist_cache, album);
         let year = album
             .year
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string());
         let summary = render_tile_summary(album.summary.as_deref());
         let genres = format_genres_html(&album.genres);
-        tiles.push_str(&apply_template(template.clone(), &[
-            ("link", escape_html(&link)),
-            ("cover", cover),
-            ("title", escape_html(&album.title)),
-            ("artist", escape_html(&artist_name)),
-            ("year", escape_html(&year)),
-            ("genres", genres),
-            ("summary", summary),
-        ]));
+        tiles.push_str(&apply_template(
+            template.clone(),
+            &[
+                ("link", escape_html(&link)),
+                ("cover", cover),
+                ("title", escape_html(&album.title)),
+                ("artist", escape_html(&artist_name)),
+                ("year", escape_html(&year)),
+                ("genres", genres),
+                ("summary", summary),
+            ],
+        ));
     }
     format!("<div class=\"tile-grid\">{}</div>", tiles)
 }
@@ -688,36 +708,30 @@ fn render_track_tiles(state: &AppState, library: &Library, tracks: &[Track]) -> 
     let mut tiles = String::new();
     for track in tracks {
         let album_link = format!("/library?album_id={}", url_escape(&track.album_id));
-        let album = album_cache
-            .get(&track.album_id)
-            .cloned()
-            .or_else(|| {
-                library
-                    .get_album(&track.album_id)
-                    .ok()
-                    .flatten()
-                    .map(|album| {
-                        album_cache.insert(track.album_id.clone(), album.clone());
-                        album
-                    })
-            });
+        let album = album_cache.get(&track.album_id).cloned().or_else(|| {
+            library
+                .get_album(&track.album_id)
+                .ok()
+                .flatten()
+                .map(|album| {
+                    album_cache.insert(track.album_id.clone(), album.clone());
+                    album
+                })
+        });
         let album_title = album
             .as_ref()
             .map(|album| album.title.clone())
             .unwrap_or_else(|| "Unknown Album".to_string());
-        let artist = artist_cache
-            .get(&track.artist_id)
-            .cloned()
-            .or_else(|| {
-                library
-                    .get_artist(&track.artist_id)
-                    .ok()
-                    .flatten()
-                    .map(|artist| {
-                        artist_cache.insert(track.artist_id.clone(), artist.clone());
-                        artist
-                    })
-            });
+        let artist = artist_cache.get(&track.artist_id).cloned().or_else(|| {
+            library
+                .get_artist(&track.artist_id)
+                .ok()
+                .flatten()
+                .map(|artist| {
+                    artist_cache.insert(track.artist_id.clone(), artist.clone());
+                    artist
+                })
+        });
         let artist_name = artist
             .as_ref()
             .map(|artist| artist.name.clone())
@@ -735,17 +749,20 @@ fn render_track_tiles(state: &AppState, library: &Library, tracks: &[Track]) -> 
         let duration = format_duration_ms(track.duration_ms);
         let position = format_track_position(track.disc_no, track.track_no);
         let genres = format_genres_html(&track.genres);
-        tiles.push_str(&apply_template(template.clone(), &[
-            ("link", escape_html(&album_link)),
-            ("cover", cover),
-            ("title", escape_html(&track.title)),
-            ("position", escape_html(&position)),
-            ("duration", escape_html(&duration)),
-            ("artist", escape_html(&artist_name)),
-            ("album", escape_html(&album_title)),
-            ("genres", genres),
-            ("summary", summary),
-        ]));
+        tiles.push_str(&apply_template(
+            template.clone(),
+            &[
+                ("link", escape_html(&album_link)),
+                ("cover", cover),
+                ("title", escape_html(&track.title)),
+                ("position", escape_html(&position)),
+                ("duration", escape_html(&duration)),
+                ("artist", escape_html(&artist_name)),
+                ("album", escape_html(&album_title)),
+                ("genres", genres),
+                ("summary", summary),
+            ],
+        ));
     }
     format!("<div class=\"tile-grid\">{}</div>", tiles)
 }
@@ -769,7 +786,37 @@ fn render_tile_summary(summary: Option<&str>) -> String {
         None => return String::new(),
     };
     let truncated = truncate_text(summary, 160);
-    format!("<div class=\"tile-summary\">{}</div>", escape_html(&truncated))
+    format!(
+        "<div class=\"tile-summary\">{}</div>",
+        escape_html(&truncated)
+    )
+}
+
+fn album_artist_name(
+    library: &Library,
+    artist_cache: &mut HashMap<String, Artist>,
+    album: &Album,
+) -> String {
+    let display = album.artist_display_name();
+    if !display.trim().is_empty() {
+        return display;
+    }
+
+    artist_cache
+        .get(&album.artist_id)
+        .cloned()
+        .or_else(|| {
+            library
+                .get_artist(&album.artist_id)
+                .ok()
+                .flatten()
+                .map(|artist| {
+                    artist_cache.insert(album.artist_id.clone(), artist.clone());
+                    artist
+                })
+        })
+        .map(|artist| artist.name)
+        .unwrap_or_else(|| "Unknown Artist".to_string())
 }
 
 fn artist_cover_url(library: &Library, artist_id: &str) -> Option<String> {
@@ -840,30 +887,43 @@ fn render_artist_detail(
     };
 
     let (header_style, header_class) = if let Some(banner) = banner_url {
-        (format!("background-image: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), url('{}');", banner), "artist-header-dynamic")
+        (
+            format!(
+                "background-image: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), url('{}');",
+                banner
+            ),
+            "artist-header-dynamic",
+        )
     } else {
         (String::new(), "artist-header-default")
     };
 
     let logo_img = if let Some(logo) = logo_url {
-        format!("<img src=\"{}\" class=\"artist-logo\" alt=\"logo\" />", logo)
+        format!(
+            "<img src=\"{}\" class=\"artist-logo\" alt=\"logo\" />",
+            logo
+        )
     } else {
         String::new()
     };
 
     let albums_html = render_album_tiles(state, library, &albums);
 
-    let template = load_template(state, "templates/partials/artist_detail.html").unwrap_or_default();
-    apply_template(template, &[
-        ("header_style", header_style),
-        ("header_class", header_class.to_string()),
-        ("logo_img", logo_img),
-        ("name", escape_html(&artist.name)),
-        ("genres", genres),
-        ("back_link", escape_html(&back)),
-        ("summary", escape_html(&summary)),
-        ("albums_html", albums_html),
-    ])
+    let template =
+        load_template(state, "templates/partials/artist_detail.html").unwrap_or_default();
+    apply_template(
+        template,
+        &[
+            ("header_style", header_style),
+            ("header_class", header_class.to_string()),
+            ("logo_img", logo_img),
+            ("name", escape_html(&artist.name)),
+            ("genres", genres),
+            ("back_link", escape_html(&back)),
+            ("summary", escape_html(&summary)),
+            ("albums_html", albums_html),
+        ],
+    )
 }
 
 fn render_album_detail(
@@ -881,11 +941,8 @@ fn render_album_detail(
         }
     };
 
-    let artist_name = library
-        .get_artist(&album.artist_id)
-        .ok()
-        .and_then(|artist| artist.map(|value| value.name))
-        .unwrap_or_else(|| "Unknown Artist".to_string());
+    let mut artist_cache = HashMap::new();
+    let artist_name = album_artist_name(library, &mut artist_cache, &album);
     let artist_link = format!("/library?artist_id={}", url_escape(&album.artist_id));
     let cover = if album.cover_ref.is_some() {
         let cover_url = format!("/covers/albums/{}", url_escape(&album.id));
@@ -938,20 +995,33 @@ fn render_album_detail(
     );
 
     let template = load_template(state, "templates/partials/album_detail.html").unwrap_or_default();
-    apply_template(template, &[
-        ("title", escape_html(&album.title)),
-        ("artist_link", escape_html(&artist_link)),
-        ("artist_name", escape_html(&artist_name)),
-        ("cover", cover),
-        ("year", escape_html(&year)),
-        ("genres", genres),
-        ("folder", escape_html(&album.folder_relpath)),
-        ("summary", escape_html(&summary)),
-        ("track_table", track_table),
-    ])
+    let folder_path = library
+        .resolve_relpath(&album.folder_relpath)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| album.folder_relpath.clone());
+    apply_template(
+        template,
+        &[
+            ("title", escape_html(&album.title)),
+            ("artist_link", escape_html(&artist_link)),
+            ("artist_name", escape_html(&artist_name)),
+            ("cover", cover),
+            ("year", escape_html(&year)),
+            ("genres", genres),
+            ("folder", escape_html(&folder_path)),
+            ("summary", escape_html(&summary)),
+            ("track_table", track_table),
+        ],
+    )
 }
 
-fn render_pagination(state: &AppState, base: &str, offset: usize, limit: usize, total: usize) -> String {
+fn render_pagination(
+    state: &AppState,
+    base: &str,
+    offset: usize,
+    limit: usize,
+    total: usize,
+) -> String {
     if total <= limit {
         return String::new();
     }
@@ -995,12 +1065,15 @@ fn render_pagination(state: &AppState, base: &str, offset: usize, limit: usize, 
         ));
     }
     let template = load_template(state, "templates/partials/pagination.html").unwrap_or_default();
-    apply_template(template, &[
-        ("start", start.to_string()),
-        ("end", end.to_string()),
-        ("total", total.to_string()),
-        ("controls", controls),
-    ])
+    apply_template(
+        template,
+        &[
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("total", total.to_string()),
+            ("controls", controls),
+        ],
+    )
 }
 
 fn format_genres_html(genres: &[String]) -> String {
@@ -1017,7 +1090,8 @@ pub fn render_status_block_for_library(state: &AppState) -> String {
 }
 
 fn render_status_notice(state: &AppState, status: &LibraryStatus) -> Option<String> {
-    let template = load_template(state, "templates/partials/status_notice.html").unwrap_or_default();
+    let template =
+        load_template(state, "templates/partials/status_notice.html").unwrap_or_default();
     match status {
         LibraryStatus::Unconfigured => Some(apply_template(template, &[
             ("class", "warn".to_string()),
@@ -1055,12 +1129,16 @@ fn render_library_snapshot(
     search: &str,
     filter: SearchFilter,
 ) -> String {
-    let template = load_template(state, "templates/partials/library_snapshot.html").unwrap_or_default();
+    let template =
+        load_template(state, "templates/partials/library_snapshot.html").unwrap_or_default();
     let tabs_html = render_library_tabs(search, filter);
-    apply_template(template, &[
-        ("artists", stats.artists.to_string()),
-        ("albums", stats.albums.to_string()),
-        ("tracks", stats.tracks.to_string()),
-        ("tabs_html", tabs_html),
-    ])
+    apply_template(
+        template,
+        &[
+            ("artists", stats.artists.to_string()),
+            ("albums", stats.albums.to_string()),
+            ("tracks", stats.tracks.to_string()),
+            ("tabs_html", tabs_html),
+        ],
+    )
 }

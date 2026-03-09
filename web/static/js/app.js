@@ -110,6 +110,7 @@
   setupActivityPage();
   setupLogsPage();
   setupUsers();
+  setupMusicRoots();
   setupMetadataSources();
   setupSettings();
   setupLibraryStatusPolling();
@@ -396,6 +397,153 @@
     });
   }
 
+  function setupMusicRoots() {
+    const list = document.getElementById("music-roots");
+    const openAdd = document.getElementById("open-music-root-add");
+    const modalAdd = document.getElementById("modal-music-root-add");
+    const modalEdit = document.getElementById("modal-music-root-edit");
+    const addForm = document.getElementById("form-music-root-add");
+    const editForm = document.getElementById("form-music-root-edit");
+    const addError = document.getElementById("music-root-add-error");
+    const editError = document.getElementById("music-root-edit-error");
+    if (!list || !openAdd || !modalAdd || !modalEdit) {
+      return;
+    }
+
+    function openModal(modal) {
+      if (!modal) return;
+      modal.classList.add("open");
+    }
+
+    function closeModal(modal) {
+      if (!modal) return;
+      modal.classList.remove("open");
+    }
+
+    function closeAllModals() {
+      [modalAdd, modalEdit].forEach(closeModal);
+    }
+
+    function clearInlineError(el) {
+      if (!el) return;
+      el.textContent = "";
+      el.classList.remove("visible");
+    }
+
+    function showInlineError(el, message) {
+      if (!el) return;
+      el.textContent = message;
+      el.classList.add("visible");
+    }
+
+    openAdd.addEventListener("click", () => {
+      clearInlineError(addError);
+      if (addForm) addForm.reset();
+      openModal(modalAdd);
+    });
+
+    list.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const row = button.closest(".source-row");
+      if (!row) return;
+      const rootId = row.dataset.rootId || "";
+      const path = row.dataset.path || "";
+
+      if (button.dataset.action === "edit-root") {
+        const rootIdInput = editForm?.querySelector("input[name=\"root_id\"]");
+        const pathInput = editForm?.querySelector("input[name=\"path\"]");
+        if (rootIdInput) rootIdInput.value = rootId;
+        if (pathInput) pathInput.value = path;
+        clearInlineError(editError);
+        openModal(modalEdit);
+        return;
+      }
+
+      if (button.dataset.action === "delete-root") {
+        if (!confirm("Remove this music folder? This will reindex the library.")) {
+          return;
+        }
+        fetchJson(`/settings/music-roots/${rootId}/delete`, new URLSearchParams())
+          .then(() => {
+            row.remove();
+            const placeholder = document.getElementById("no-music-roots");
+            const remaining = list.querySelectorAll(".source-row").length;
+            if (placeholder && remaining === 0) {
+              placeholder.classList.remove("hidden");
+            }
+            showToast("Library scan started.", false);
+          })
+          .catch((err) => {
+            showToast(err.message, true);
+          });
+      }
+    });
+
+    if (addForm) {
+      addForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        clearInlineError(addError);
+        fetch("/settings/music-roots/add", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "fetch",
+          },
+          body: toParams(addForm),
+          credentials: "same-origin",
+        })
+          .then(async (resp) => {
+            if (!resp.ok) {
+              const data = await resp.json().catch(() => ({}));
+              throw new Error(data.error || "Request failed");
+            }
+            return resp.text();
+          })
+          .then((html) => {
+            closeModal(modalAdd);
+            const placeholder = document.getElementById("no-music-roots");
+            if (placeholder) {
+              placeholder.classList.add("hidden");
+            }
+            list.insertAdjacentHTML("beforeend", html);
+            showToast("Library scan started.", false);
+          })
+          .catch((err) => {
+            showInlineError(addError, err.message);
+          });
+      });
+    }
+
+    if (editForm) {
+      editForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        clearInlineError(editError);
+        const rootId = editForm.querySelector("input[name=\"root_id\"]")?.value || "";
+        fetchJson(`/settings/music-roots/${rootId}/update`, toParams(editForm))
+          .then(() => {
+            closeModal(modalEdit);
+            refreshAfterSuccess();
+          })
+          .catch((err) => {
+            showInlineError(editError, err.message);
+          });
+      });
+    }
+
+    document.addEventListener("click", (event) => {
+      if (event.target.matches("[data-close]")) {
+        closeAllModals();
+      }
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeAllModals();
+      }
+    });
+  }
+
   function setupMetadataSources() {
     const metadataCard = document.getElementById("metadata-card");
     const sourcesList = document.getElementById("metadata-sources");
@@ -645,6 +793,7 @@
       Array.from(target.elements).forEach((el) => {
         if (!el.name || el.disabled) return;
         if (el.closest && el.closest("#metadata-sources")) return;
+        if (el.closest && el.closest("#music-roots")) return;
         if (el.dataset && el.dataset.ignoreDirty === "true") return;
         const type = (el.type || "").toLowerCase();
         if (type === "checkbox" || type === "radio") {
@@ -937,10 +1086,12 @@
     const followToggle = document.getElementById("logs-follow");
     const debugToggle = document.getElementById("logs-debug");
     const refreshButton = document.getElementById("logs-refresh");
+    const clearButton = document.getElementById("logs-clear");
     const spinner = document.getElementById("log-spinner");
     let lastUpdated = 0;
     let fetching = false;
     let currentView = "all";
+    let pendingForceRefresh = false;
 
     function parseLine(line) {
       const match = line.match(/^(\S+)\s+([A-Z]+)\s+(.*)$/);
@@ -1018,7 +1169,10 @@
     }
 
     function fetchLogs(force) {
-      if (fetching) return;
+      if (fetching) {
+        pendingForceRefresh = pendingForceRefresh || force;
+        return;
+      }
       fetching = true;
       const showSpinner = force || lastUpdated === 0;
       if (showSpinner) setLoading(true);
@@ -1038,21 +1192,65 @@
           const updated = Number(data?.updated_at || 0);
           if (!force && updated && updated === lastUpdated) {
             if (showSpinner) setLoading(false);
+            if (pendingForceRefresh) {
+              const shouldForce = pendingForceRefresh;
+              pendingForceRefresh = false;
+              fetchLogs(shouldForce);
+            }
             return;
           }
           lastUpdated = updated;
           const lines = Array.isArray(data?.lines) ? data.lines : [];
           render(lines);
           if (showSpinner) setLoading(false);
+          if (pendingForceRefresh) {
+            const shouldForce = pendingForceRefresh;
+            pendingForceRefresh = false;
+            fetchLogs(shouldForce);
+          }
         })
         .catch(() => {
           fetching = false;
           if (showSpinner) setLoading(false);
+          if (pendingForceRefresh) {
+            const shouldForce = pendingForceRefresh;
+            pendingForceRefresh = false;
+            fetchLogs(shouldForce);
+          }
         });
     }
 
     if (refreshButton) {
       refreshButton.addEventListener("click", () => fetchLogs(true));
+    }
+
+    if (clearButton) {
+      clearButton.addEventListener("click", () => {
+        clearButton.disabled = true;
+        fetch("/logs/clear", {
+          method: "POST",
+          headers: { Accept: "application/json", "X-Requested-With": "fetch" },
+          credentials: "same-origin",
+        })
+          .then(async (resp) => {
+            if (!resp.ok) {
+              const data = await resp.json().catch(() => ({}));
+              throw new Error(data.error || "request failed");
+            }
+          })
+          .then(() => {
+            lastUpdated = 0;
+            render([]);
+            fetchLogs(true);
+            showToast("Logs cleared");
+          })
+          .catch((err) => {
+            showToast(err.message, true);
+          })
+          .finally(() => {
+            clearButton.disabled = false;
+          });
+      });
     }
 
     if (logTabs) {

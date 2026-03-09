@@ -74,9 +74,7 @@ pub async fn admin_login_submit(
 
     let user = match state.auth.authenticate(&form.username, &form.password) {
         Ok(Some(user)) if is_admin(&user) => user,
-        Ok(Some(_)) => {
-            return admin_login_page(&state, Some("admin access required".to_string()))
-        }
+        Ok(Some(_)) => return admin_login_page(&state, Some("admin access required".to_string())),
         Ok(None) => return admin_login_page(&state, Some("invalid credentials".to_string())),
         Err(err) => {
             return html_error(

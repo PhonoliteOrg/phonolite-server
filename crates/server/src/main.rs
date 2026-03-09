@@ -1,19 +1,22 @@
-mod admin;
 mod activity_store;
+mod admin;
 mod api;
 mod assets;
 mod auth;
 mod config;
 mod external;
 mod logging;
+mod musicbrainz_album_artists;
+mod musicbrainz_rate_limit;
 mod quic;
 mod range;
 mod scan;
 mod shuffle;
-mod streaming;
-mod stats_store;
 mod state;
+mod stats_store;
+mod stream_cache;
 mod stream_sessions;
+mod streaming;
 mod transcode;
 mod user_data;
 mod utils;
@@ -22,26 +25,25 @@ mod watch;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    Router,
-};
+use activity_store::ActivityStore;
 use admin::admin_router;
 use api::api_router;
-use activity_store::ActivityStore;
 use auth::AuthStore;
+use axum::Router;
 use config::{
-    config_path_from_env, load_or_create_config, resolve_music_root, resolve_path,
+    bind_target, config_path_from_env, load_or_create_config, resolve_music_roots, resolve_path,
 };
 use library::Library;
 use parking_lot::RwLock;
 use reqwest::Client;
 use scan::{set_library_missing, start_index};
-use stats_store::StatsStore;
 use state::{AppState, LibraryState, LibraryStatus};
-use user_data::{open_or_create_db as open_user_db, UserDataStore};
+use stats_store::StatsStore;
+use stream_cache::StreamCache;
 use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use user_data::{open_or_create_db as open_user_db, UserDataStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index_path_value
     };
     let port = if config.port == 0 { 3000 } else { config.port };
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = bind_target(config.bind_addr.as_deref(), port);
     let session_ttl_secs = if config.session_ttl_secs == 0 {
         60 * 60 * 24 * 7
     } else {
@@ -115,9 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = stats.init_tables() {
         warn!("Failed to create stats tables: {:?}", err);
     }
-    let external_client = Client::builder()
-        .user_agent("phonolite/0.1")
-        .build()?;
+    let external_client = Client::builder().user_agent("phonolite/0.1").build()?;
+    let stream_cache_dir = resolve_path(&config_path, &config.stream_cache_dir);
+    let stream_cache = StreamCache::new(stream_cache_dir, config.stream_cache_enabled);
     let library_state = Arc::new(RwLock::new(LibraryState {
         library: None,
         status: LibraryStatus::Unconfigured,
@@ -136,15 +138,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watcher,
         external_client,
         stream_sessions: stream_sessions::StreamSessions::new(),
+        stream_cache,
     };
-    if let Some(music_root) = resolve_music_root(&state.config_path, &config.music_root) {
-        if music_root.exists() {
-            start_index(state.clone(), music_root, false);
-        } else {
-            set_library_missing(&state, music_root);
-        }
-    } else {
+    let roots = resolve_music_roots(&state.config_path, &config.music_roots);
+    if roots.is_empty() {
         info!("Music directory not configured yet; open the admin settings to select one.");
+    } else if let Some(missing) = roots.iter().find(|root| !root.path.exists()) {
+        set_library_missing(&state, missing.path.clone());
+    } else {
+        start_index(state.clone(), roots, false);
     }
 
     if let Ok(delay_ms) = std::env::var("PHONOLITE_START_DELAY_MS") {

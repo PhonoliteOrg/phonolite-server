@@ -109,12 +109,7 @@ pub async fn search(
         }
     };
     for album in albums {
-        let artist_name = library
-            .get_artist(&album.artist_id)
-            .ok()
-            .flatten()
-            .map(|artist| artist.name)
-            .unwrap_or_else(|| "Unknown Artist".to_string());
+        let artist_name = album_artist_name(&library, &album);
         let combined = format!("{} {}", album.title, artist_name);
         let score = score_match(&normalized, &combined);
         if score > 0 {
@@ -246,6 +241,20 @@ pub async fn shuffle_tracks(
     }
 
     Ok(Json(items))
+}
+
+fn album_artist_name(library: &library::Library, album: &Album) -> String {
+    let display = album.artist_display_name();
+    if !display.trim().is_empty() {
+        display
+    } else {
+        library
+            .get_artist(&album.artist_id)
+            .ok()
+            .flatten()
+            .map(|artist| artist.name)
+            .unwrap_or_else(|| "Unknown Artist".to_string())
+    }
 }
 
 fn split_list_param(value: Option<&str>) -> Vec<String> {
@@ -396,11 +405,7 @@ fn score_match(query: &str, candidate: &str) -> u32 {
     }
 
     let query_tokens: Vec<&str> = query.split_whitespace().collect();
-    if !query_tokens.is_empty()
-        && query_tokens
-            .iter()
-            .all(|token| target.contains(token))
-    {
+    if !query_tokens.is_empty() && query_tokens.iter().all(|token| target.contains(token)) {
         return 70;
     }
 
@@ -546,4 +551,3 @@ pub async fn get_album_cover(
         Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
     }
 }
-

@@ -6,6 +6,8 @@ pub mod server;
 pub mod stats;
 pub mod user_data;
 
+use crate::state::LibraryStatus;
+use ::library::Library;
 use axum::{
     body::Body,
     extract::State,
@@ -15,8 +17,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ::library::Library;
-use crate::state::LibraryStatus;
 
 use crate::admin::extract_token;
 use crate::state::{AppState, AuthContext, HealthResponse};
@@ -33,8 +33,14 @@ pub fn api_router(state: AppState) -> Router {
         .route("/library/albums/:album_id", get(library::get_album))
         .route("/library/playlists", get(user_data::list_playlists))
         .route("/library/playlists", post(user_data::create_playlist))
-        .route("/library/playlists/:playlist_id", post(user_data::update_playlist))
-        .route("/library/playlists/:playlist_id", axum::routing::delete(user_data::delete_playlist))
+        .route(
+            "/library/playlists/:playlist_id",
+            post(user_data::update_playlist),
+        )
+        .route(
+            "/library/playlists/:playlist_id",
+            axum::routing::delete(user_data::delete_playlist),
+        )
         .route("/library/likes/:track_id", post(user_data::add_like))
         .route(
             "/library/likes/:track_id",
@@ -42,16 +48,28 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/browse/artists", get(browse::list_artists))
         .route("/browse/artists/:artist_id", get(browse::get_artist))
-        .route("/browse/artists/:artist_id/albums", get(browse::list_artist_albums))
-        .route("/browse/albums/:album_id/tracks", get(browse::list_album_tracks))
+        .route(
+            "/browse/artists/:artist_id/albums",
+            get(browse::list_artist_albums),
+        )
+        .route(
+            "/browse/albums/:album_id/tracks",
+            get(browse::list_album_tracks),
+        )
         .route("/browse/tracks/:track_id", get(browse::get_track))
         .route(
             "/browse/playlists/:playlist_id/tracks",
             get(browse::list_playlist_tracks),
         )
         .route("/browse/likes", get(browse::list_liked_tracks))
-        .route("/library/artists/:artist_id/cover", get(library::get_artist_cover))
-        .route("/library/albums/:album_id/cover", get(library::get_album_cover))
+        .route(
+            "/library/artists/:artist_id/cover",
+            get(library::get_artist_cover),
+        )
+        .route(
+            "/library/albums/:album_id/cover",
+            get(library::get_album_cover),
+        )
         .route("/stats", get(stats::get_stats))
         .route("/player/settings", get(player::get_playback_settings))
         .route("/player/settings", post(player::update_playback_settings))

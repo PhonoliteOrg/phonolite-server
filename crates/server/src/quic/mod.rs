@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -8,14 +8,14 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 
-use crate::config::{resolve_path, ServerConfig};
+use crate::config::{bind_target, resolve_path, ServerConfig};
 use crate::state::AppState;
+use crate::stream_cache::{CacheGuard, CacheKey};
 use crate::streaming::{
     build_raw_opus_meta, parse_frame_ms, parse_transcode_mode, parse_transcode_quality,
     transcode_mode_label, transcode_quality_label,
 };
-use crate::transcode::{BitrateSelector, TranscodeMode, TranscodeQuality};
-use common::join_relpath;
+use crate::transcode::{BitrateSelector, TranscodeCommand, TranscodeMode, TranscodeQuality};
 
 const ALPN_QUIC: &[&[u8]] = &[b"phonolite-quic"];
 const SERVER_CONN_ID_LEN: usize = 16;
@@ -45,7 +45,10 @@ enum ControlMessage {
     #[serde(rename = "advance")]
     Advance,
     #[serde(rename = "buffer")]
-    Buffer { buffer_ms: u32, target_ms: Option<u32> },
+    Buffer {
+        buffer_ms: u32,
+        target_ms: Option<u32>,
+    },
     #[serde(rename = "seek")]
     Seek { track_id: String, position_ms: u32 },
     #[serde(rename = "playback")]
@@ -150,6 +153,8 @@ struct OutgoingStream {
     mode: TranscodeMode,
     quality: TranscodeQuality,
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    cmd_tx: Option<mpsc::Sender<TranscodeCommand>>,
+    cache_guard: Option<CacheGuard>,
     pending: VecDeque<Bytes>,
     offset: usize,
     finished: bool,
@@ -170,6 +175,8 @@ impl OutgoingStream {
         mode: TranscodeMode,
         quality: TranscodeQuality,
         rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+        cmd_tx: Option<mpsc::Sender<TranscodeCommand>>,
+        cache_guard: Option<CacheGuard>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -180,6 +187,8 @@ impl OutgoingStream {
             mode,
             quality,
             rx,
+            cmd_tx,
+            cache_guard,
             pending: VecDeque::new(),
             offset: 0,
             finished: false,
@@ -189,6 +198,12 @@ impl OutgoingStream {
             last_drain: now,
             last_send_log: now,
             last_send_err: None,
+        }
+    }
+
+    fn stop_worker(&self) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(TranscodeCommand::Stop);
         }
     }
 
@@ -462,19 +477,14 @@ fn refresh_conn_ids(
     }
 }
 
-fn resolve_quic_bind_addr(config: &ServerConfig) -> Result<SocketAddr, String> {
-    let host = config
-        .bind_addr
-        .as_deref()
-        .and_then(|value| value.split(':').next())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("0.0.0.0");
-    let addr = format!("{}:{}", host, config.quic_port);
-    addr.parse::<SocketAddr>()
-        .map_err(|err| format!("invalid quic bind addr: {}", err))
+fn resolve_quic_bind_addr(config: &ServerConfig) -> Result<String, String> {
+    Ok(bind_target(config.bind_addr.as_deref(), config.quic_port))
 }
 
-fn ensure_quic_certs(state: &AppState, config: &ServerConfig) -> Result<(PathBuf, PathBuf), String> {
+fn ensure_quic_certs(
+    state: &AppState,
+    config: &ServerConfig,
+) -> Result<(PathBuf, PathBuf), String> {
     let cert_path = resolve_path(&state.config_path, &config.quic_cert_path);
     let key_path = resolve_path(&state.config_path, &config.quic_key_path);
 
@@ -498,20 +508,23 @@ fn ensure_quic_certs(state: &AppState, config: &ServerConfig) -> Result<(PathBuf
 
     if let Some(parent) = cert_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("cert dir error: {}", err))?;
+            std::fs::create_dir_all(parent).map_err(|err| format!("cert dir error: {}", err))?;
         }
     }
     if let Some(parent) = key_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("key dir error: {}", err))?;
+            std::fs::create_dir_all(parent).map_err(|err| format!("key dir error: {}", err))?;
         }
     }
-    std::fs::write(&cert_path, cert_pem)
-        .map_err(|err| format!("cert write error: {}", err))?;
-    std::fs::write(&key_path, key_pem)
-        .map_err(|err| format!("key write error: {}", err))?;
+    std::fs::write(&cert_path, cert_pem).map_err(|err| format!("cert write error: {}", err))?;
+    std::fs::write(&key_path, key_pem).map_err(|err| format!("key write error: {}", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&key_path, permissions)
+            .map_err(|err| format!("key permission error: {}", err))?;
+    }
 
     Ok((cert_path, key_path))
 }
@@ -685,12 +698,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     quality.as_deref(),
                 ) {
                     tracing::warn!("QUIC open failed: {}", err);
-                    send_control(
-                        client,
-                        ControlResponse::Error {
-                            message: &err,
-                        },
-                    );
+                    send_control(client, ControlResponse::Error { message: &err });
                     return;
                 }
             }
@@ -726,13 +734,19 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 prebuffer_next_two(state, client, None, None, frame_ms);
             }
         }
-        ControlMessage::Buffer { buffer_ms, target_ms } => {
+        ControlMessage::Buffer {
+            buffer_ms,
+            target_ms,
+        } => {
             client.session.client_buffer_ms = buffer_ms;
             if let Some(target) = target_ms {
                 client.session.buffer_target_ms = target;
             }
         }
-        ControlMessage::Seek { track_id, position_ms } => {
+        ControlMessage::Seek {
+            track_id,
+            position_ms,
+        } => {
             tracing::info!("QUIC seek track={} position_ms={}", track_id, position_ms);
             if !client.session.authed {
                 tracing::warn!("QUIC seek rejected: unauthorized");
@@ -749,35 +763,46 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             let mut frame_ms = active_frame_ms(&client.session);
             let mut mode_label: Option<&str> = None;
             let mut quality_label: Option<&str> = None;
+            let mut reused = false;
             if let Some(stream_id) = client.session.track_streams.get(&track_id).cloned() {
-                if let Some(outgoing) = client.session.outgoing.get(&stream_id) {
+                if let Some(outgoing) = client.session.outgoing.get_mut(&stream_id) {
                     frame_ms = outgoing.frame_ms;
                     mode_label = Some(transcode_mode_label(outgoing.mode));
                     quality_label = Some(transcode_quality_label(outgoing.quality));
+                    outgoing.role = StreamRole::Active;
+                    match seek_track_stream(state, outgoing, &track_id, position_ms) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "QUIC seek reusing stream track={} stream_id={}",
+                                track_id,
+                                stream_id
+                            );
+                            reused = true;
+                        }
+                        Err(err) => {
+                            tracing::warn!("QUIC seek reuse failed: {}", err);
+                            send_control(client, ControlResponse::Error { message: &err });
+                            return;
+                        }
+                    }
+                } else {
+                    client.session.track_streams.remove(&track_id);
                 }
-                tracing::info!(
-                    "QUIC seek switching streams track={} stream_id={}",
-                    track_id,
-                    stream_id
-                );
-                client.session.track_streams.remove(&track_id);
-                client.session.outgoing.remove(&stream_id);
-                let _ = client
-                    .conn
-                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
             }
-            if let Err(err) = start_track_stream(
-                state,
-                client,
-                track_id,
-                StreamRole::Active,
-                frame_ms,
-                position_ms,
-                mode_label,
-                quality_label,
-            ) {
-                tracing::warn!("QUIC seek failed: {}", err);
-                send_control(client, ControlResponse::Error { message: &err });
+            if !reused {
+                if let Err(err) = start_track_stream(
+                    state,
+                    client,
+                    track_id,
+                    StreamRole::Active,
+                    frame_ms,
+                    position_ms,
+                    mode_label,
+                    quality_label,
+                ) {
+                    tracing::warn!("QUIC seek failed: {}", err);
+                    send_control(client, ControlResponse::Error { message: &err });
+                }
             }
         }
         ControlMessage::Playback {
@@ -828,7 +853,9 @@ fn active_frame_ms(session: &SessionState) -> u32 {
 }
 
 fn ensure_active_in_queue(session: &mut SessionState) {
-    let Some(active) = session.active_track.as_ref() else { return };
+    let Some(active) = session.active_track.as_ref() else {
+        return;
+    };
     if session.queue.iter().any(|id| id == active) {
         return;
     }
@@ -859,7 +886,9 @@ fn prune_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     }
     for (stream_id, track_id) in remove_ids {
         let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
-        session.outgoing.remove(&stream_id);
+        if let Some(outgoing) = session.outgoing.remove(&stream_id) {
+            outgoing.stop_worker();
+        }
         session.track_streams.remove(&track_id);
     }
 }
@@ -910,7 +939,14 @@ fn spawn_track_transcode(
     mode: TranscodeMode,
     quality: TranscodeQuality,
     start_ms: u32,
-) -> Result<tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>, String> {
+) -> Result<
+    (
+        tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+        Option<mpsc::Sender<TranscodeCommand>>,
+        Option<CacheGuard>,
+    ),
+    String,
+> {
     let library_guard = state.library_state.read();
     let library = library_guard
         .library
@@ -920,8 +956,9 @@ fn spawn_track_transcode(
         .get_track(track_id)
         .map_err(|err| format!("library error: {}", err))?
         .ok_or_else(|| "track not found".to_string())?;
-    let root = library.root().to_path_buf();
-    let path = join_relpath(&root, &track.file_relpath);
+    let path = library
+        .resolve_relpath(&track.file_relpath)
+        .ok_or_else(|| "music root not configured".to_string())?;
     if !path.exists() {
         tracing::warn!("QUIC track file missing: {}", path.display());
         return Err("file not found".to_string());
@@ -937,31 +974,67 @@ fn spawn_track_transcode(
         mode,
         quality,
         fixed_bitrate_bps,
-        adaptive_bitrate_bps: session.as_ref().map(|s| std::sync::Arc::clone(&s.target_bitrate_bps)),
+        adaptive_bitrate_bps: session
+            .as_ref()
+            .map(|s| std::sync::Arc::clone(&s.target_bitrate_bps)),
     };
 
     let meta = build_raw_opus_meta(&library, &track);
     let start_ms = start_ms.min(meta.duration_ms);
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(256);
-    let path_clone = path.clone();
-    let track_id_clone = track_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let result = crate::transcode::transcode_to_raw_opus(
-            &path_clone,
-            selector,
-            frame_ms,
-            meta,
-            start_ms,
-            &tx,
-        );
-        if let Err(err) = result {
-            tracing::warn!("QUIC transcode failed track={} err={}", track_id_clone, err);
-            let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)));
+    let cacheable = mode == TranscodeMode::Fixed;
+    let cache_key = CacheKey::new(track_id, frame_ms, mode, quality);
+    let mut cache_guard = None;
+    if cacheable {
+        if let Ok(Some(writer)) = state.stream_cache.writer(cache_key.clone()) {
+            cache_guard = Some(writer.guard());
+            let path_clone = path.clone();
+            let meta_clone = meta.clone();
+            let selector_clone = BitrateSelector {
+                mode: TranscodeMode::Fixed,
+                quality,
+                fixed_bitrate_bps: selector.fixed_bitrate_bps,
+                adaptive_bitrate_bps: None,
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(err) = crate::transcode::transcode_to_raw_opus_cache(
+                    &path_clone,
+                    selector_clone,
+                    frame_ms,
+                    meta_clone,
+                    writer,
+                ) {
+                    tracing::info!("Memory cache fill stopped: {}", err);
+                }
+            });
         }
-    });
-
-    Ok(rx)
+        if let Ok(Some(reader)) = state.stream_cache.reader(&cache_key) {
+            if cache_guard.is_none() {
+                cache_guard = Some(reader.guard());
+            }
+            if reader.can_start(start_ms) {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = reader.stream_to(start_ms, &tx) {
+                        let _ = tx.blocking_send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            err,
+                        )));
+                    }
+                });
+                return Ok((rx, None, cache_guard));
+            }
+        }
+    }
+    let cache_writer = None;
+    let (rx, cmd_tx) = crate::transcode::spawn_raw_opus_worker(
+        path.clone(),
+        selector,
+        frame_ms,
+        meta,
+        start_ms,
+        cache_writer,
+    )?;
+    Ok((rx, Some(cmd_tx), cache_guard))
 }
 
 fn start_track_stream(
@@ -989,7 +1062,8 @@ fn start_track_stream(
     let mode = parse_transcode_mode(mode).unwrap_or(TranscodeMode::Auto);
     let quality = parse_transcode_quality(quality).unwrap_or(TranscodeQuality::High);
     let frame_ms = parse_frame_ms(Some(frame_ms)).unwrap_or(20);
-    let rx = spawn_track_transcode(state, &track_id, frame_ms, mode, quality, start_ms)?;
+    let (rx, cmd_tx, cache_guard) =
+        spawn_track_transcode(state, &track_id, frame_ms, mode, quality, start_ms)?;
 
     let stream_id = client.session.next_server_uni_stream();
     client
@@ -998,7 +1072,17 @@ fn start_track_stream(
         .insert(track_id.clone(), stream_id);
     client.session.outgoing.insert(
         stream_id,
-        OutgoingStream::new(stream_id, track_id.clone(), role, frame_ms, mode, quality, rx),
+        OutgoingStream::new(
+            stream_id,
+            track_id.clone(),
+            role,
+            frame_ms,
+            mode,
+            quality,
+            rx,
+            cmd_tx,
+            cache_guard,
+        ),
     );
 
     let role_label = match role {
@@ -1027,9 +1111,67 @@ fn seek_track_stream(
     let frame_ms = outgoing.frame_ms;
     let mode = outgoing.mode;
     let quality = outgoing.quality;
-    let rx = spawn_track_transcode(state, track_id, frame_ms, mode, quality, position_ms)?;
+    if mode == TranscodeMode::Fixed {
+        let cache_key = CacheKey::new(track_id, frame_ms, mode, quality);
+        if let Ok(Some(reader)) = state.stream_cache.reader(&cache_key) {
+            if reader.can_start(position_ms) {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = reader.stream_to(position_ms, &tx) {
+                        let _ = tx.blocking_send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            err,
+                        )));
+                    }
+                });
+                if outgoing.cmd_tx.is_some() {
+                    outgoing.stop_worker();
+                }
+                outgoing.cmd_tx = None;
+                outgoing.rx = rx;
+                outgoing.pending.clear();
+                outgoing.offset = 0;
+                outgoing.finished = false;
+                outgoing.buffered_bytes = 0;
+                outgoing.sent_bytes = 0;
+                let now = Instant::now();
+                outgoing.last_send = now;
+                outgoing.last_drain = now;
+                outgoing.last_send_log = now;
+                outgoing.last_send_err = None;
 
-    outgoing.rx = rx;
+                let marker = SEEK_RESET_MARKER.to_le_bytes().to_vec();
+                outgoing.pending.push_back(Bytes::from(marker));
+                outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_add(2);
+                return Ok(());
+            }
+        }
+    }
+    let mut reused = false;
+    if let Some(cmd_tx) = outgoing.cmd_tx.as_ref() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        if cmd_tx
+            .send(TranscodeCommand::Seek {
+                start_ms: position_ms,
+                tx,
+            })
+            .is_ok()
+        {
+            outgoing.rx = rx;
+            reused = true;
+        } else {
+            outgoing.cmd_tx = None;
+        }
+    }
+
+    if !reused {
+        let (rx, cmd_tx, cache_guard) =
+            spawn_track_transcode(state, track_id, frame_ms, mode, quality, position_ms)?;
+        outgoing.rx = rx;
+        outgoing.cmd_tx = cmd_tx;
+        outgoing.cache_guard = cache_guard;
+    }
+
     outgoing.pending.clear();
     outgoing.offset = 0;
     outgoing.finished = false;
@@ -1064,7 +1206,9 @@ fn flush_control(session: &mut SessionState, conn: &mut quiche::Connection) {
         None => return,
     };
     loop {
-        let Some(front) = session.control_outbox.pending.front() else { break };
+        let Some(front) = session.control_outbox.pending.front() else {
+            break;
+        };
         let data = &front[session.control_outbox.offset..];
         match conn.stream_send(stream_id, data, false) {
             Ok(sent) => {
@@ -1072,7 +1216,8 @@ fn flush_control(session: &mut SessionState, conn: &mut quiche::Connection) {
                     session.control_outbox.pending.pop_front();
                     session.control_outbox.offset = 0;
                 } else {
-                    session.control_outbox.offset = session.control_outbox.offset.saturating_add(sent);
+                    session.control_outbox.offset =
+                        session.control_outbox.offset.saturating_add(sent);
                     break;
                 }
             }
@@ -1097,7 +1242,9 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
         }
     }
     for stream_id in active_ids.into_iter().chain(prefetch_ids.into_iter()) {
-        let Some(outgoing) = session.outgoing.get_mut(&stream_id) else { continue };
+        let Some(outgoing) = session.outgoing.get_mut(&stream_id) else {
+            continue;
+        };
         let force_send = outgoing
             .pending
             .front()
@@ -1124,8 +1271,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
                     if sent == data_len {
                         outgoing.pending.pop_front();
                         outgoing.offset = 0;
-                        outgoing.buffered_bytes =
-                            outgoing.buffered_bytes.saturating_sub(data_len);
+                        outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_sub(data_len);
                     } else {
                         outgoing.offset = outgoing.offset.saturating_add(sent);
                         break;
@@ -1173,6 +1319,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
                 // Keep the current active stream open so seeks reuse it.
                 continue;
             }
+            outgoing.stop_worker();
             let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
             finished.push((stream_id, outgoing.track_id.clone()));
         }
@@ -1342,11 +1489,7 @@ fn update_listen_stats_from_playback(
     }
 }
 
-fn flush_conn(
-    conn: &mut quiche::Connection,
-    socket: &UdpSocket,
-    out: &mut [u8],
-) {
+fn flush_conn(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]) {
     loop {
         match conn.send(out) {
             Ok((len, send_info)) => {

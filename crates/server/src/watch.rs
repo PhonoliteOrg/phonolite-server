@@ -2,17 +2,30 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use library::Library;
-use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
 use crate::scan::{start_cover_sweep, start_enrichment_sweep};
 use crate::state::AppState;
 
-pub fn configure_watcher(state: &AppState, library: &Library, root: PathBuf) {
+pub fn configure_watcher(state: &AppState, library: &Library) {
     let config = state.config.read().clone();
     if !config.watch_music {
         info!("Watcher disabled (watch_music=false)");
+        *state.watcher.write() = None;
+        return;
+    }
+
+    let roots: Vec<PathBuf> = library
+        .roots()
+        .iter()
+        .map(|root| root.path.clone())
+        .collect();
+    if roots.is_empty() {
+        info!("Watcher disabled (no music roots configured)");
         *state.watcher.write() = None;
         return;
     }
@@ -24,11 +37,21 @@ pub fn configure_watcher(state: &AppState, library: &Library, root: PathBuf) {
     };
     let watch_debounce = Duration::from_secs(watch_debounce_secs);
 
-    match setup_watcher(state.clone(), library.clone(), root.clone(), watch_debounce) {
+    match setup_watcher(
+        state.clone(),
+        library.clone(),
+        roots.clone(),
+        watch_debounce,
+    ) {
         Ok(watcher) => {
+            let root_list = roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             info!(
                 "Watching {} for changes (debounce {}s)",
-                root.display(),
+                root_list,
                 watch_debounce.as_secs()
             );
             *state.watcher.write() = Some(watcher);
@@ -43,7 +66,7 @@ pub fn configure_watcher(state: &AppState, library: &Library, root: PathBuf) {
 fn setup_watcher(
     state: AppState,
     library: Library,
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     debounce: Duration,
 ) -> Result<RecommendedWatcher, Box<dyn std::error::Error>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -56,7 +79,9 @@ fn setup_watcher(
         NotifyConfig::default(),
     )?;
 
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    for root in roots {
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+    }
 
     tokio::spawn(async move {
         watch_loop(state, library, rx, debounce).await;

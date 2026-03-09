@@ -1,14 +1,15 @@
 // crates/server/src/admin/mod.rs
+pub mod activity;
 pub mod assets;
 pub mod auth;
-pub mod activity;
-pub mod logs;
 pub mod library;
+pub mod logs;
 pub mod settings;
 pub mod users;
 
 use std::time::Duration;
 
+use crate::state::LibraryStatus;
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -17,7 +18,6 @@ use axum::{
     Router,
 };
 use library::Library;
-use crate::state::LibraryStatus;
 
 use crate::auth::{AuthError, AuthUser, SessionToken, UserRole};
 use crate::state::AppState;
@@ -46,6 +46,7 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/activity/clear", post(activity::admin_activity_clear))
         .route("/status/activity", get(activity::admin_activity_status))
         .route("/logs", get(logs::admin_logs))
+        .route("/logs/clear", post(logs::admin_logs_clear))
         .route("/logs/tail", get(logs::admin_logs_tail))
         .route("/status/library", get(library::admin_library_status))
         .route(
@@ -69,16 +70,25 @@ pub fn admin_router(state: AppState) -> Router {
             post(settings::admin_test_metadata_source),
         )
         .route(
+            "/settings/music-roots/add",
+            post(settings::admin_add_music_root),
+        )
+        .route(
+            "/settings/music-roots/:root_id/update",
+            post(settings::admin_update_music_root),
+        )
+        .route(
+            "/settings/music-roots/:root_id/delete",
+            post(settings::admin_delete_music_root),
+        )
+        .route(
             "/settings/logging/debug",
             post(settings::admin_toggle_debug_logs),
         )
         .route("/settings/reindex", post(library::admin_reindex))
         .route("/settings/scan", post(library::admin_scan))
         .route("/library", get(library::admin_library))
-        .route(
-            "/covers/albums/:album_id",
-            get(library::admin_album_cover),
-        )
+        .route("/covers/albums/:album_id", get(library::admin_album_cover))
         .route(
             "/covers/artists/:artist_id",
             get(library::admin_artist_cover),

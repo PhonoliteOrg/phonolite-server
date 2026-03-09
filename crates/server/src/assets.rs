@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use axum::body::Body;
 use axum::http::{header, HeaderValue};
 use axum::response::Response;
-use common::{join_relpath, CoverRef};
+use common::CoverRef;
 use library::Library;
 
 use crate::config::resolve_path;
@@ -58,11 +58,15 @@ pub fn resolve_cover_source(
                 .get_track(track_id)
                 .map_err(|e| e.to_string())?
                 .ok_or("track not found")?;
-            let path = join_relpath(library.root(), &track.file_relpath);
+            let path = library
+                .resolve_relpath(&track.file_relpath)
+                .ok_or("music root not configured")?;
             Ok(Some(CoverSource::Embedded(path)))
         }
         CoverRef::File { relpath } => {
-            let path = join_relpath(library.root(), relpath);
+            let path = library
+                .resolve_relpath(relpath)
+                .ok_or("music root not configured")?;
             Ok(Some(CoverSource::File(path)))
         }
     }
@@ -188,7 +192,11 @@ pub async fn fetch_cover(source: CoverSource) -> Result<(Vec<u8>, String), Strin
             match metadata::read_cover(&path)
                 .map_err(|e| format!("failed to read embedded cover: {:?}", e))?
             {
-                Some(art) => Ok((art.data, art.mime.unwrap_or_else(|| "application/octet-stream".to_string()))),
+                Some(art) => Ok((
+                    art.data,
+                    art.mime
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                )),
                 None => Err("no embedded cover found".to_string()),
             }
         }

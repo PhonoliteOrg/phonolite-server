@@ -1,12 +1,51 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::external::Provider;
 
 pub const CONFIG_VERSION: u32 = 8;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(default)]
+pub struct MusicRootConfig {
+    pub id: String,
+    pub path: String,
+}
+
+impl Default for MusicRootConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: String::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MusicRootConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Path(String),
+            Full { id: Option<String>, path: String },
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        let (id, path) = match repr {
+            Repr::Path(path) => (String::new(), path),
+            Repr::Full { id, path } => (id.unwrap_or_default(), path),
+        };
+        Ok(Self { id, path })
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +74,8 @@ impl Default for MetadataSourceConfig {
 pub struct ServerConfig {
     pub version: u32,
     pub music_root: String,
+    #[serde(default)]
+    pub music_roots: Vec<MusicRootConfig>,
     pub index_path: String,
     pub metadata_path: String,
     #[serde(alias = "log_path")]
@@ -63,6 +104,8 @@ pub struct ServerConfig {
     pub external_metadata_enrich_on_scan: bool,
     pub external_metadata_scan_limit: usize,
     pub external_metadata_on_tag_error: bool,
+    pub stream_cache_enabled: bool,
+    pub stream_cache_dir: String,
 }
 
 impl Default for ServerConfig {
@@ -70,6 +113,7 @@ impl Default for ServerConfig {
         Self {
             version: CONFIG_VERSION,
             music_root: "".to_string(),
+            music_roots: Vec::new(),
             index_path: "library.redb".to_string(),
             metadata_path: "metadata".to_string(),
             log_dir: "logs".to_string(),
@@ -94,6 +138,8 @@ impl Default for ServerConfig {
             external_metadata_enrich_on_scan: false,
             external_metadata_scan_limit: 50,
             external_metadata_on_tag_error: true,
+            stream_cache_enabled: true,
+            stream_cache_dir: "stream_cache".to_string(),
         }
     }
 }
@@ -148,6 +194,7 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
     if path.exists() {
         let contents = fs::read_to_string(path)?;
         let mut config: ServerConfig = serde_yaml::from_str(&contents)?;
+        let legacy_bind_addr = config.bind_addr.clone();
         if config.external_metadata_sources.is_empty() {
             let provider = config.external_metadata_provider.trim();
             let api_key = config.external_metadata_api_key.trim();
@@ -171,6 +218,9 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         if config.log_dir.trim().is_empty() {
             config.log_dir = "logs".to_string();
         }
+        if config.stream_cache_dir.trim().is_empty() {
+            config.stream_cache_dir = "stream_cache".to_string();
+        }
         if prev_version < 7 {
             config.log_debug_enabled = false;
         }
@@ -178,7 +228,7 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
             config.log_dir = "logs".to_string();
         }
         if config.port == 0 {
-            if let Some(bind_addr) = config.bind_addr.as_deref() {
+            if let Some(bind_addr) = legacy_bind_addr.as_deref() {
                 if let Some(port) = parse_port(bind_addr) {
                     config.port = port;
                 }
@@ -209,7 +259,8 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         if config.quic_key_path.trim().is_empty() {
             config.quic_key_path = "quic_key.pem".to_string();
         }
-        config.bind_addr = None;
+        normalize_music_roots(&mut config);
+        config.bind_addr = normalize_bind_addr(legacy_bind_addr);
         return Ok((config, false));
     }
 
@@ -229,6 +280,62 @@ pub fn save_config(path: &Path, config: &ServerConfig) -> Result<(), ConfigError
     Ok(())
 }
 
+pub(crate) fn normalize_music_roots(config: &mut ServerConfig) {
+    let legacy = config.music_root.trim().to_string();
+    let mut roots = Vec::new();
+    for root in std::mem::take(&mut config.music_roots) {
+        let path = root.path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        roots.push(MusicRootConfig {
+            id: root.id.trim().to_string(),
+            path: path.to_string(),
+        });
+    }
+
+    if roots.is_empty() && !legacy.is_empty() {
+        roots.push(MusicRootConfig {
+            id: String::new(),
+            path: legacy.clone(),
+        });
+    }
+
+    let mut seen = HashSet::new();
+    let mut default_used = false;
+    for root in roots.iter_mut() {
+        let id = root.id.trim().to_string();
+        if id.is_empty() {
+            if default_used {
+                root.id = new_music_root_id();
+            } else {
+                root.id.clear();
+                default_used = true;
+            }
+        } else if seen.contains(&id) {
+            root.id = new_music_root_id();
+        } else {
+            root.id = id;
+        }
+        if !root.id.is_empty() {
+            seen.insert(root.id.clone());
+        }
+    }
+
+    config.music_roots = roots;
+    config.music_root = config
+        .music_roots
+        .iter()
+        .find(|root| root.id.is_empty())
+        .or_else(|| config.music_roots.first())
+        .map(|root| root.path.clone())
+        .unwrap_or_default();
+}
+
+pub(crate) fn new_music_root_id() -> String {
+    format!("root-{}", source_id_suffix())
+}
+
 pub fn resolve_path(config_path: &Path, value: &str) -> PathBuf {
     let raw = PathBuf::from(value);
     if raw.is_absolute() {
@@ -241,6 +348,22 @@ pub fn resolve_path(config_path: &Path, value: &str) -> PathBuf {
     base.join(raw)
 }
 
+pub fn resolve_music_roots(
+    config_path: &Path,
+    roots: &[MusicRootConfig],
+) -> Vec<library::LibraryRoot> {
+    let mut out = Vec::new();
+    for root in roots {
+        let trimmed = root.path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resolved = resolve_path(config_path, trimmed);
+        out.push(library::LibraryRoot::new(root.id.clone(), resolved));
+    }
+    out
+}
+
 pub fn resolve_music_root(config_path: &Path, value: &str) -> Option<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -251,8 +374,7 @@ pub fn resolve_music_root(config_path: &Path, value: &str) -> Option<PathBuf> {
 }
 
 fn parse_port(value: &str) -> Option<u16> {
-    let port = value.rsplit(':').next()?.trim();
-    port.parse::<u16>().ok()
+    split_bind_addr(value).1
 }
 
 fn source_id_suffix() -> u128 {
@@ -260,4 +382,87 @@ fn source_id_suffix() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or(0)
+}
+
+pub fn bind_target(bind_addr: Option<&str>, port: u16) -> String {
+    let host = bind_addr
+        .and_then(normalize_bind_addr_str)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    format_bind_target(&host, port)
+}
+
+fn normalize_bind_addr(value: Option<String>) -> Option<String> {
+    value.and_then(|value| normalize_bind_addr_str(&value))
+}
+
+fn normalize_bind_addr_str(value: &str) -> Option<String> {
+    split_bind_addr(value).0
+}
+
+fn split_bind_addr(value: &str) -> (Option<String>, Option<u16>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return (Some(addr.ip().to_string()), Some(addr.port()));
+    }
+    if let Some(host) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map(str::trim)
+    {
+        if host.is_empty() {
+            return (None, None);
+        }
+        return (Some(host.to_string()), None);
+    }
+    if trimmed.matches(':').count() > 1 {
+        return (Some(trimmed.to_string()), None);
+    }
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if let Ok(port) = port.trim().parse::<u16>() {
+            let host = host.trim();
+            if host.is_empty() {
+                return (None, Some(port));
+            }
+            return (Some(host.to_string()), Some(port));
+        }
+    }
+    (Some(trimmed.to_string()), None)
+}
+
+fn format_bind_target(host: &str, port: u16) -> String {
+    if host.starts_with('[') && host.ends_with(']') {
+        format!("{}:{}", host, port)
+    } else if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_target, parse_port, split_bind_addr};
+
+    #[test]
+    fn parse_legacy_ipv4_bind_addr() {
+        assert_eq!(parse_port("127.0.0.1:9000"), Some(9000));
+        assert_eq!(
+            split_bind_addr("127.0.0.1:9000").0.as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn parse_legacy_ipv6_bind_addr() {
+        assert_eq!(parse_port("[::1]:9000"), Some(9000));
+        assert_eq!(split_bind_addr("[::1]:9000").0.as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn format_ipv6_bind_target() {
+        assert_eq!(bind_target(Some("::"), 3000), "[::]:3000");
+    }
 }

@@ -66,4 +66,3 @@ pub async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> R
 
     Json(HealthResponse { status: "ok" }).into_response()
 }
-

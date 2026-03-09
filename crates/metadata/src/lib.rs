@@ -62,19 +62,18 @@ pub fn read_tags(path: &Path) -> Result<TagInfo, MetadataError> {
     info.channels = properties.channels();
     info.bitrate = properties.audio_bitrate().or(properties.overall_bitrate());
 
-    if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    if let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         info.title = tag.get_string(&ItemKey::TrackTitle).map(|v| v.to_string());
         info.album = tag.get_string(&ItemKey::AlbumTitle).map(|v| v.to_string());
         let album_artist = tag.get_string(&ItemKey::AlbumArtist).map(|v| v.to_string());
         let track_artist = tag.get_string(&ItemKey::TrackArtist).map(|v| v.to_string());
         info.artist = track_artist.or_else(|| album_artist.clone());
         info.album_artist = album_artist;
-        info.track_no = tag
-            .get_string(&ItemKey::TrackNumber)
-            .and_then(parse_u16);
-        info.disc_no = tag
-            .get_string(&ItemKey::DiscNumber)
-            .and_then(parse_u16);
+        info.track_no = tag.get_string(&ItemKey::TrackNumber).and_then(parse_u16);
+        info.disc_no = tag.get_string(&ItemKey::DiscNumber).and_then(parse_u16);
         info.year = tag.get_string(&ItemKey::Year).and_then(parse_year);
         if let Some(value) = tag.get_string(&ItemKey::Genre) {
             info.genres = parse_genres(value);
@@ -88,7 +87,10 @@ pub fn read_tags(path: &Path) -> Result<TagInfo, MetadataError> {
 
 pub fn read_cover(path: &Path) -> Result<Option<CoverArt>, MetadataError> {
     let tagged_file = lofty::read_from_path(path)?;
-    let tag = match tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    let tag = match tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         Some(tag) => tag,
         None => return Ok(None),
     };

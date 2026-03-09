@@ -19,6 +19,10 @@ pub struct Artist {
 pub struct Album {
     pub id: String,
     pub artist_id: String,
+    #[serde(default)]
+    pub artist_ids: Vec<String>,
+    #[serde(default)]
+    pub artist_names: Vec<String>,
     pub title: String,
     pub year: Option<i32>,
     pub folder_relpath: String,
@@ -27,6 +31,28 @@ pub struct Album {
     pub genres: Vec<String>,
     #[serde(default)]
     pub summary: Option<String>,
+}
+
+impl Album {
+    pub fn all_artist_ids(&self) -> &[String] {
+        if self.artist_ids.is_empty() {
+            std::slice::from_ref(&self.artist_id)
+        } else {
+            &self.artist_ids
+        }
+    }
+
+    pub fn all_artist_names(&self) -> &[String] {
+        &self.artist_names
+    }
+
+    pub fn artist_display_name(&self) -> String {
+        if self.artist_names.is_empty() {
+            String::new()
+        } else {
+            self.artist_names.join(", ")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

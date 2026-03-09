@@ -6,19 +6,20 @@ use bytes::Bytes;
 use reqwest::Client;
 use tracing::{info, warn};
 
+use crate::activity_store::ActivityStore;
 use crate::assets::{
     clear_metadata_assets, image_ext_from_mime, image_ext_from_url, metadata_root_path,
     resolve_cover_source, warm_cover_cache, CoverCacheKey,
 };
-use crate::config::{resolve_path, ServerConfig};
+use crate::config::{resolve_music_roots, resolve_path, MusicRootConfig, ServerConfig};
 use crate::external::{self, ExternalConfig, ExternalSource, Provider};
-use crate::activity_store::ActivityStore;
+use crate::musicbrainz_album_artists::{MusicBrainzAlbumArtistResolver, ResolveOptions};
 use crate::state::{AppState, LibraryStatus};
 use crate::watch::configure_watcher;
 use common::{Album, Artist};
-use library::{Library, LibraryStats};
+use library::{Library, LibraryRoot, LibraryStats};
 
-pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
+pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool) {
     {
         let mut guard = state.library_state.write();
         guard.library = None;
@@ -29,9 +30,7 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
     *state.watcher.write() = None;
 
     tokio::spawn(async move {
-        let _ = state
-            .activity
-            .add_activity("Library rescan started.");
+        let _ = state.activity.add_activity("Library rescan started.");
         if force_rescan {
             if let Err(e) = clear_metadata_assets(&state).await {
                 warn!("Failed to clear metadata: {}", e);
@@ -39,9 +38,9 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
         }
 
         let db = Arc::clone(&state.db);
-        let root_clone = root.clone();
+        let roots_clone = roots.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (library, mut scanned) = Library::load_or_scan_with_db(root_clone, db)?;
+            let (library, mut scanned) = Library::load_or_scan_with_db(roots_clone, db)?;
             let stats = if force_rescan {
                 scanned = true;
                 library.rescan()?
@@ -67,7 +66,7 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                     "Library scan finished: {} artists, {} albums, {} tracks.",
                     stats.artists, stats.albums, stats.tracks
                 ));
-                configure_watcher(&state, &library, root);
+                configure_watcher(&state, &library);
                 if scanned {
                     start_enrichment_sweep(state.clone(), library.clone(), true);
                 } else {
@@ -83,10 +82,9 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                     guard.status = LibraryStatus::Error(message.clone());
                 }
                 warn!("Library scan failed: {}", message);
-                let _ = state.activity.add_event(
-                    "ERROR",
-                    format!("Library scan failed: {}", message),
-                );
+                let _ = state
+                    .activity
+                    .add_event("ERROR", format!("Library scan failed: {}", message));
             }
             Err(err) => {
                 let message = err.to_string();
@@ -96,10 +94,9 @@ pub fn start_index(state: AppState, root: PathBuf, force_rescan: bool) {
                     guard.status = LibraryStatus::Error(message.clone());
                 }
                 warn!("Library scan join error: {}", message);
-                let _ = state.activity.add_event(
-                    "ERROR",
-                    format!("Library scan failed: {}", message),
-                );
+                let _ = state
+                    .activity
+                    .add_event("ERROR", format!("Library scan failed: {}", message));
             }
         }
     });
@@ -114,9 +111,7 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
     }
     let library_clone = library.clone();
     tokio::spawn(async move {
-        let _ = state
-            .activity
-            .add_activity("Library scan started.");
+        let _ = state.activity.add_activity("Library scan started.");
         if replace_complete {
             if let Err(e) = clear_metadata_assets(&state).await {
                 warn!("Failed to clear metadata: {}", e);
@@ -143,20 +138,18 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                 let mut guard = state.library_state.write();
                 guard.status = LibraryStatus::Error(message.clone());
                 warn!("Library rescan failed: {}", message);
-                let _ = state.activity.add_event(
-                    "ERROR",
-                    format!("Library scan failed: {}", message),
-                );
+                let _ = state
+                    .activity
+                    .add_event("ERROR", format!("Library scan failed: {}", message));
             }
             Err(err) => {
                 let message = err.to_string();
                 let mut guard = state.library_state.write();
                 guard.status = LibraryStatus::Error(message.clone());
                 warn!("Library rescan join error: {}", message);
-                let _ = state.activity.add_event(
-                    "ERROR",
-                    format!("Library scan failed: {}", message),
-                );
+                let _ = state
+                    .activity
+                    .add_event("ERROR", format!("Library scan failed: {}", message));
             }
         }
     });
@@ -166,15 +159,27 @@ pub fn set_library_missing(state: &AppState, path: PathBuf) {
     let mut guard = state.library_state.write();
     guard.library = None;
     guard.status = LibraryStatus::Missing(path);
+    *state.watcher.write() = None;
 }
 
-pub fn apply_music_root_update(state: AppState, new_root: &str, force: bool) -> String {
-    let path = resolve_path(&state.config_path, new_root);
-    if !path.exists() {
-        set_library_missing(&state, path);
-        return "Music directory not found.".to_string();
+pub fn set_library_unconfigured(state: &AppState) {
+    let mut guard = state.library_state.write();
+    guard.library = None;
+    guard.status = LibraryStatus::Unconfigured;
+    *state.watcher.write() = None;
+}
+
+pub fn apply_music_roots_update(state: AppState, roots: &[MusicRootConfig], force: bool) -> String {
+    let resolved = resolve_music_roots(&state.config_path, roots);
+    if resolved.is_empty() {
+        set_library_unconfigured(&state);
+        return "Music directory not configured.".to_string();
     }
-    start_index(state, path, force);
+    if let Some(missing) = resolved.iter().find(|root| !root.path.exists()) {
+        set_library_missing(&state, missing.path.clone());
+        return format!("Music directory not found: {}", missing.path.display());
+    }
+    start_index(state, resolved, force);
     "Scanning started.".to_string()
 }
 
@@ -281,7 +286,35 @@ async fn run_enrichment_sweep(
     let mut remaining = max_items;
     let mut artist_updates = 0usize;
     let mut album_updates = 0usize;
+    let mut album_artist_updates = 0usize;
     if remaining == 0 {
+        return;
+    }
+    let album_artist_limit = if replace_complete {
+        usize::MAX
+    } else {
+        remaining
+    };
+    let album_artist_remaining = run_musicbrainz_album_artist_sweep(
+        &library,
+        &client,
+        &config,
+        min_interval,
+        album_artist_limit,
+        replace_complete,
+        &activity,
+        &mut album_artist_updates,
+    )
+    .await;
+    if !replace_complete {
+        remaining = album_artist_remaining;
+    }
+    if remaining == 0 {
+        let summary = format!(
+            "Metadata scan finished. Updated {} artists, {} albums, and {} collaborative album links.",
+            artist_updates, album_updates, album_artist_updates
+        );
+        let _ = activity.add_activity(summary);
         return;
     }
     if tag_error_first {
@@ -299,6 +332,11 @@ async fn run_enrichment_sweep(
         )
         .await;
         if remaining == 0 {
+            let summary = format!(
+                "Metadata scan finished. Updated {} artists, {} albums, and {} collaborative album links.",
+                artist_updates, album_updates, album_artist_updates
+            );
+            let _ = activity.add_activity(summary);
             return;
         }
     }
@@ -341,6 +379,11 @@ async fn run_enrichment_sweep(
     }
 
     if remaining == 0 {
+        let summary = format!(
+            "Metadata scan finished. Updated {} artists, {} albums, and {} collaborative album links.",
+            artist_updates, album_updates, album_artist_updates
+        );
+        let _ = activity.add_activity(summary);
         return;
     }
     let mut offset = 0usize;
@@ -386,10 +429,222 @@ async fn run_enrichment_sweep(
     }
 
     let summary = format!(
-        "Metadata scan finished. Updated {} artists and {} albums.",
-        artist_updates, album_updates
+        "Metadata scan finished. Updated {} artists, {} albums, and {} collaborative album links.",
+        artist_updates, album_updates, album_artist_updates
     );
     let _ = activity.add_activity(summary);
+}
+
+async fn run_musicbrainz_album_artist_sweep(
+    library: &Library,
+    client: &Client,
+    config: &ExternalConfig,
+    min_interval: Duration,
+    mut remaining: usize,
+    replace_complete: bool,
+    activity: &ActivityStore,
+    album_artist_updates: &mut usize,
+) -> usize {
+    let Some(source) = musicbrainz_source(config) else {
+        return remaining;
+    };
+
+    let resolver = MusicBrainzAlbumArtistResolver::new(
+        client,
+        source.user_agent.as_deref().unwrap_or(""),
+        source.timeout,
+        ResolveOptions::default(),
+    );
+    let mut known_artists = match load_all_artists(library) {
+        Ok(items) => items,
+        Err(err) => {
+            warn!(
+                "MusicBrainz album-artist sweep failed to load artists: {}",
+                err
+            );
+            return remaining;
+        }
+    };
+
+    let page_size = 100usize;
+    let mut offset = 0usize;
+    let mut seen_albums = 0usize;
+    let mut skipped_albums = 0usize;
+    let mut matched_albums = 0usize;
+    let mut unmatched_albums = 0usize;
+    let mut failed_albums = 0usize;
+    let mut updated_albums = 0usize;
+    let mut total_albums = None;
+    loop {
+        let (albums, total) = match library.list_albums(None, page_size, offset) {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("MusicBrainz album-artist sweep failed: {}", err);
+                return remaining;
+            }
+        };
+        if total_albums.is_none() {
+            total_albums = Some(total);
+            info!(
+                "MusicBrainz album-artist sweep starting: total_albums={}, replace_complete={}, limit={}",
+                total,
+                replace_complete,
+                if remaining == usize::MAX {
+                    "unlimited".to_string()
+                } else {
+                    remaining.to_string()
+                }
+            );
+        }
+
+        for album in albums {
+            if remaining == 0 {
+                break;
+            }
+            seen_albums = seen_albums.saturating_add(1);
+            let total = total_albums.unwrap_or(seen_albums);
+            let progress = format!("[{}/{}]", seen_albums, total);
+            let artist_name = album.artist_display_name();
+            let artist_name = if artist_name.trim().is_empty() {
+                "Unknown Artist"
+            } else {
+                artist_name.as_str()
+            };
+
+            let key = external_attempt_key("album_artists", &album.id);
+            if !replace_complete {
+                match library.should_attempt_external(&key, min_interval) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        skipped_albums = skipped_albums.saturating_add(1);
+                        info!(
+                            "MusicBrainz album-artist sweep {} skipping '{}' (artist='{}', min interval not reached)",
+                            progress,
+                            album.title,
+                            artist_name
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        failed_albums = failed_albums.saturating_add(1);
+                        warn!("MusicBrainz album-artist check failed: {}", err);
+                        continue;
+                    }
+                }
+            }
+
+            let tracks = match library.get_album_tracks(&album.id) {
+                Ok(tracks) if !tracks.is_empty() => tracks,
+                Ok(_) => continue,
+                Err(err) => {
+                    failed_albums = failed_albums.saturating_add(1);
+                    warn!(
+                        "MusicBrainz album-artist sweep {} failed to load tracks for '{}' (artist='{}'): {}",
+                        progress,
+                        album.title,
+                        artist_name,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            info!(
+                "MusicBrainz album-artist sweep {} resolving '{}' (artist='{}', tracks={})",
+                progress,
+                album.title,
+                artist_name,
+                tracks.len()
+            );
+            let _ = library.record_external_attempt(&key, false);
+            match resolver
+                .resolve_album_artists(library, &album, &tracks, &known_artists)
+                .await
+            {
+                Ok(Some(resolved_artists)) => {
+                    matched_albums = matched_albums.saturating_add(1);
+                    match library.merge_album_artists(&album.id, &resolved_artists) {
+                        Ok(updated) => {
+                            remaining = remaining.saturating_sub(1);
+                            let _ = library.record_external_attempt(&key, true);
+                            let associated_artists = resolved_artists
+                                .iter()
+                                .map(|artist| artist.name.clone())
+                                .collect::<Vec<_>>();
+                            let artist_names = associated_artists.join(", ");
+                            if updated {
+                                *album_artist_updates = album_artist_updates.saturating_add(1);
+                                updated_albums = updated_albums.saturating_add(1);
+                                merge_known_artists(&mut known_artists, &resolved_artists);
+                                let _ = activity.add_event(
+                                    "metadata",
+                                    format!(
+                                        "Resolved album artists for '{}' to {}.",
+                                        album.title, artist_names
+                                    ),
+                                );
+                            }
+                            info!(
+                                "MusicBrainz album-artist sweep {} resolved '{}' associated_artists={:?} (updated={})",
+                                progress,
+                                album.title,
+                                associated_artists,
+                                updated
+                            );
+                        }
+                        Err(err) => {
+                            failed_albums = failed_albums.saturating_add(1);
+                            warn!(
+                                "MusicBrainz album-artist sweep {} merge failed for '{}' (artist='{}'): {}",
+                                progress,
+                                album.title,
+                                artist_name,
+                                err
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    unmatched_albums = unmatched_albums.saturating_add(1);
+                    remaining = remaining.saturating_sub(1);
+                    let _ = library.record_external_attempt(&key, false);
+                    info!(
+                        "MusicBrainz album-artist sweep {} found no usable match for '{}' (artist='{}')",
+                        progress,
+                        album.title,
+                        artist_name
+                    );
+                }
+                Err(err) => {
+                    failed_albums = failed_albums.saturating_add(1);
+                    warn!(
+                        "MusicBrainz album-artist sweep {} resolution failed for '{}' (artist='{}'): {}",
+                        progress,
+                        album.title,
+                        artist_name,
+                        err
+                    );
+                }
+            }
+        }
+
+        if remaining == 0 || offset + page_size >= total {
+            break;
+        }
+        offset += page_size;
+    }
+
+    info!(
+        "MusicBrainz album-artist sweep finished: seen={}, skipped={}, matched={}, unmatched={}, failed={}, updated={}",
+        seen_albums,
+        skipped_albums,
+        matched_albums,
+        unmatched_albums,
+        failed_albums,
+        updated_albums
+    );
+
+    remaining
 }
 
 async fn run_tag_error_enrichment(
@@ -475,6 +730,38 @@ async fn run_tag_error_enrichment(
         offset += page_size;
     }
     remaining
+}
+
+fn musicbrainz_source(config: &ExternalConfig) -> Option<ExternalSource> {
+    config
+        .sources
+        .iter()
+        .find(|source| matches!(source.provider, Provider::MusicBrainz))
+        .cloned()
+}
+
+fn load_all_artists(library: &Library) -> Result<Vec<Artist>, library::LibraryError> {
+    let mut items = Vec::new();
+    let mut offset = 0usize;
+    let limit = 200usize;
+    loop {
+        let (mut batch, total) = library.list_artists(None, limit, offset)?;
+        items.append(&mut batch);
+        if items.len() >= total {
+            break;
+        }
+        offset = items.len();
+    }
+    Ok(items)
+}
+
+fn merge_known_artists(target: &mut Vec<Artist>, incoming: &[Artist]) {
+    for artist in incoming {
+        if target.iter().any(|existing| existing.id == artist.id) {
+            continue;
+        }
+        target.push(artist.clone());
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -570,10 +857,7 @@ pub async fn fetch_artist_enrichment(
             FetchResult::attempted(true)
         }
         Ok(None) => {
-            info!(
-                "External artist metadata not found for '{}'",
-                artist.name
-            );
+            info!("External artist metadata not found for '{}'", artist.name);
             let _ = library.record_external_attempt(&key, false);
             FetchResult::attempted(false)
         }
@@ -632,10 +916,7 @@ pub async fn fetch_album_enrichment(
                 .unwrap_or("<none>");
             info!(
                 "External album metadata received for '{} - {}': summary='{}', genres={:?}",
-                artist_name,
-                album.title,
-                summary,
-                metadata.genres
+                artist_name, album.title, summary, metadata.genres
             );
             let _ = library.update_album_enrichment(&album.id, metadata.summary, &metadata.genres);
             if let Some(activity) = activity {
@@ -763,12 +1044,12 @@ async fn store_artist_assets(
     let mut banner_ref = None;
 
     if let Some(url) = metadata.logo_url.as_deref() {
-        logo_ref = fetch_and_store_asset(metadata_root, client, config, artist_id, "logo", url)
-            .await;
+        logo_ref =
+            fetch_and_store_asset(metadata_root, client, config, artist_id, "logo", url).await;
     }
     if let Some(url) = metadata.banner_url.as_deref() {
-        banner_ref = fetch_and_store_asset(metadata_root, client, config, artist_id, "banner", url)
-            .await;
+        banner_ref =
+            fetch_and_store_asset(metadata_root, client, config, artist_id, "banner", url).await;
     }
 
     (logo_ref, banner_ref)
@@ -916,8 +1197,8 @@ fn external_config_from_settings(config: &ServerConfig) -> Option<ExternalConfig
 }
 
 pub fn parse_provider(value: &str) -> Result<Provider, String> {
-    let provider = external::provider_from_str(value)
-        .ok_or_else(|| "unsupported provider".to_string())?;
+    let provider =
+        external::provider_from_str(value).ok_or_else(|| "unsupported provider".to_string())?;
     Ok(provider)
 }
 

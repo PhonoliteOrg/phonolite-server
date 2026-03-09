@@ -1,20 +1,19 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tracing::{Event, Level, Metadata};
 use tracing_subscriber::fmt::{
     format::{FormatEvent, FormatFields, Writer},
     time::{FormatTime, SystemTime},
-    FmtContext,
-    MakeWriter,
+    FmtContext, MakeWriter,
 };
-use tracing_subscriber::reload;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
@@ -35,6 +34,7 @@ pub const LOG_DEBUG_FILE: &str = "debug.log";
 pub struct LogControl {
     reload: Arc<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>,
     debug_enabled: Arc<AtomicBool>,
+    clear_all: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 impl LogControl {
@@ -45,6 +45,10 @@ impl LogControl {
     pub fn set_debug_enabled(&self, enabled: bool) -> Result<(), String> {
         self.debug_enabled.store(enabled, Ordering::Relaxed);
         (self.reload)(make_filter(enabled))
+    }
+
+    pub fn clear_all(&self) -> Result<(), String> {
+        (self.clear_all)()
     }
 }
 
@@ -66,18 +70,12 @@ impl LogWriter {
                 fs::create_dir_all(parent)?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = open_log_file(&path)?;
         let mut line_count = count_lines(&path).unwrap_or(0);
         if line_count > LOG_MAX_LINES {
             let _ = trim_log_file(&path, LOG_TRIM_TO);
             line_count = count_lines(&path).unwrap_or(LOG_TRIM_TO);
-            let reopened = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
+            let reopened = open_log_file(&path)?;
             return Ok(Self {
                 inner: Arc::new(Mutex::new(LogFileState {
                     path,
@@ -94,6 +92,14 @@ impl LogWriter {
             })),
         })
     }
+
+    fn clear(&self) -> io::Result<()> {
+        let mut guard = self.inner.lock();
+        guard.file.flush()?;
+        guard.file = truncate_log_file(&guard.path)?;
+        guard.line_count = 0;
+        Ok(())
+    }
 }
 
 impl Write for LogWriter {
@@ -106,10 +112,7 @@ impl Write for LogWriter {
             if guard.line_count > LOG_MAX_LINES {
                 trim_log_file(guard.path.as_path(), LOG_TRIM_TO)?;
                 guard.line_count = count_lines(guard.path.as_path()).unwrap_or(LOG_TRIM_TO);
-                guard.file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&guard.path)?;
+                guard.file = open_log_file(&guard.path)?;
             }
         }
         Ok(buf.len())
@@ -143,6 +146,17 @@ impl LogOutputs {
             activities: LogWriter::new(log_dir.join(LOG_ACTIVITY_FILE))?,
             debug: LogWriter::new(log_dir.join(LOG_DEBUG_FILE))?,
         })
+    }
+
+    fn clear_all(&self) -> io::Result<()> {
+        self.all.clear()?;
+        self.info.clear()?;
+        self.warnings.clear()?;
+        self.errors.clear()?;
+        self.issues.clear()?;
+        self.activities.clear()?;
+        self.debug.clear()?;
+        Ok(())
     }
 
     fn writer_for(&self, meta: &Metadata<'_>) -> MultiWriter {
@@ -220,13 +234,16 @@ pub fn init_logging(
     let debug_enabled = config.log_debug_enabled;
     let filter = make_filter(debug_enabled);
     let (filter_layer, handle) = reload::Layer::new(filter);
+    let clear_outputs = outputs.clone();
 
     let file_layer = tracing_subscriber::fmt::layer()
         .event_format(LogFormatter::new())
         .with_writer(outputs.clone())
         .with_ansi(false);
 
-    let subscriber = tracing_subscriber::registry().with(file_layer).with(filter_layer);
+    let subscriber = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(filter_layer);
     #[cfg(debug_assertions)]
     {
         let console_layer = tracing_subscriber::fmt::layer()
@@ -244,6 +261,7 @@ pub fn init_logging(
         LogControl {
             reload: Arc::new(move |filter| handle.reload(filter).map_err(|err| err.to_string())),
             debug_enabled: Arc::new(AtomicBool::new(debug_enabled)),
+            clear_all: Arc::new(move || clear_outputs.clear_all().map_err(|err| err.to_string())),
         },
     ))
 }
@@ -321,6 +339,23 @@ impl tracing::field::Visit for LogFieldVisitor {
 fn count_lines(path: &Path) -> io::Result<usize> {
     let contents = fs::read_to_string(path)?;
     Ok(contents.lines().count())
+}
+
+fn open_log_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .write(true)
+        .open(path)
+}
+
+fn truncate_log_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    open_log_file(path)
 }
 
 fn trim_log_file(path: &Path, keep_lines: usize) -> io::Result<()> {

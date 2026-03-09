@@ -36,7 +36,9 @@ fn main() {
             .unwrap_or(true);
         collect_c_files(root, &mut files, skip_arm, allow_x86);
         if files.is_empty() {
-            println!("cargo:warning=ffi-opus enabled but no libopus C sources found under vendor/opus");
+            println!(
+                "cargo:warning=ffi-opus enabled but no libopus C sources found under vendor/opus"
+            );
             build.file("src/opus_stub.c");
             build.compile("rustyfin_opus_stub");
             return;

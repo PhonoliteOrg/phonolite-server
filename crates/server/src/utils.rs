@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,7 +27,7 @@ pub fn json_error_response(status: StatusCode, message: impl Into<String>) -> Re
             error: message.into(),
         }),
     )
-    .into_response()
+        .into_response()
 }
 
 pub fn json_ok_response() -> Response {
@@ -69,10 +70,13 @@ pub fn html_error(state: &AppState, status: StatusCode, message: String) -> Resp
     let template = load_template(state, "templates/partials/error.html").unwrap_or_else(|_| {
         "<div class=\"error-page\"><h2>Error {{status}}</h2><p>{{message}}</p></div>".to_string()
     });
-    let body = apply_template(template, &[
-        ("status", status.as_u16().to_string()),
-        ("message", escape_html(&message)),
-    ]);
+    let body = apply_template(
+        template,
+        &[
+            ("status", status.as_u16().to_string()),
+            ("message", escape_html(&message)),
+        ],
+    );
     let html = render_admin_page(state, "Error", &body, PageLayout::centered());
     html_response(status, html)
 }
@@ -172,50 +176,76 @@ pub fn load_template(state: &AppState, name: &str) -> Result<String, String> {
 }
 
 pub fn web_root(state: &AppState) -> PathBuf {
-    let base = state
+    if let Ok(value) = std::env::var("PHONOLITE_WEB_ROOT") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let candidate = PathBuf::from(trimmed);
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(base) = state
         .config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let primary = base.join("web");
-    if primary.exists() {
-        return primary;
+    {
+        candidates.push(base.join("web"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(base) = exe.parent().filter(|p| !p.as_os_str().is_empty()) {
+            candidates.push(base.join("web"));
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("web");
-        if candidate.exists() {
-            return candidate;
-        }
-        let candidate = cwd.join("server").join("web");
-        if candidate.exists() {
-            return candidate;
+        candidates.push(cwd.join("web"));
+        candidates.push(cwd.join("server").join("web"));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("web"),
+    );
+
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            return candidate.clone();
         }
     }
-    primary
+
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("web"))
 }
 
 pub fn spawn_restart() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    Command::new(exe)
-        .env("PHONOLITE_START_DELAY_MS", "1000")
-        .args(args)
-        .spawn()
-        .map_err(|err| err.to_string())?;
-    Ok(())
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut command = Command::new(exe);
+    command.env("PHONOLITE_START_DELAY_MS", "1000").args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        return Err(command.exec().to_string());
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn().map_err(|err| err.to_string())?;
+        Ok(())
+    }
 }
 
 pub fn url_escape(input: &str) -> String {
     let mut out = String::new();
     for byte in input.as_bytes() {
         match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => out.push(*byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
             b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{:02X}", byte)),
         }

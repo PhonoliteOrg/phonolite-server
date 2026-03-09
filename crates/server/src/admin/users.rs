@@ -174,7 +174,11 @@ pub async fn admin_set_password(
                     format!("password update failed: {}", err),
                 )
             } else {
-                admin_users_page(&state, &user, Some(format!("password update failed: {}", err)))
+                admin_users_page(
+                    &state,
+                    &user,
+                    Some(format!("password update failed: {}", err)),
+                )
             }
         }
     }
@@ -473,19 +477,36 @@ pub(crate) fn admin_users_page(
             )
         };
 
-        user_rows.push_str(&apply_template(row_template.clone(), &[
-            ("id", escape_html(&user.id)),
-            ("username_raw", escape_html(&user.username)),
-            ("role", escape_html(role)),
-            ("disabled", if user.disabled { "1".to_string() } else { "0".to_string() }),
-            ("protected", if is_superadmin { "1".to_string() } else { "0".to_string() }),
-            ("checkbox", checkbox),
-            ("username", username),
-            ("role_label", role_label),
-            ("status", status.to_string()),
-            ("edit_button", edit_button),
-            ("delete_button", delete_button),
-        ]));
+        user_rows.push_str(&apply_template(
+            row_template.clone(),
+            &[
+                ("id", escape_html(&user.id)),
+                ("username_raw", escape_html(&user.username)),
+                ("role", escape_html(role)),
+                (
+                    "disabled",
+                    if user.disabled {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    },
+                ),
+                (
+                    "protected",
+                    if is_superadmin {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    },
+                ),
+                ("checkbox", checkbox),
+                ("username", username),
+                ("role_label", role_label),
+                ("status", status.to_string()),
+                ("edit_button", edit_button),
+                ("delete_button", delete_button),
+            ],
+        ));
     }
 
     if user_rows.is_empty() {
@@ -497,11 +518,14 @@ pub(crate) fn admin_users_page(
         &[
             ("message", message_html),
             ("current_user_id", escape_html(&current_user.id)),
-            ("current_user_role", escape_html(match current_user.role {
-                UserRole::SuperAdmin => "superadmin",
-                UserRole::Admin => "admin",
-                UserRole::User => "user",
-            })),
+            (
+                "current_user_role",
+                escape_html(match current_user.role {
+                    UserRole::SuperAdmin => "superadmin",
+                    UserRole::Admin => "admin",
+                    UserRole::User => "user",
+                }),
+            ),
             ("user_rows", user_rows),
             ("modals", modals),
         ],

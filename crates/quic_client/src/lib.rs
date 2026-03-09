@@ -62,7 +62,10 @@ enum ClientMessage<'a> {
         queue: Option<&'a [String]>,
     },
     #[serde(rename = "buffer")]
-    Buffer { buffer_ms: u32, target_ms: Option<u32> },
+    Buffer {
+        buffer_ms: u32,
+        target_ms: Option<u32>,
+    },
     #[serde(rename = "playback")]
     Playback {
         track_id: &'a str,
@@ -212,11 +215,18 @@ pub extern "C" fn phonolite_quic_send_buffer(
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let target = if target_ms == 0 { None } else { Some(target_ms) };
+    let target = if target_ms == 0 {
+        None
+    } else {
+        Some(target_ms)
+    };
     if handle
         .inner
         .tx
-        .send(ControlCommand::Buffer { buffer_ms, target_ms: target })
+        .send(ControlCommand::Buffer {
+            buffer_ms,
+            target_ms: target,
+        })
         .is_err()
     {
         return -2;
@@ -448,7 +458,11 @@ fn run_client(
                     state.prefetch_bytes.clear();
                     state.pending_streams.clear();
                     state.pending_stream_bytes.clear();
-                    let queue_opt = if queue.is_empty() { None } else { Some(queue.as_slice()) };
+                    let queue_opt = if queue.is_empty() {
+                        None
+                    } else {
+                        Some(queue.as_slice())
+                    };
                     enqueue_control(
                         &mut state,
                         ClientMessage::Open {
@@ -478,7 +492,10 @@ fn run_client(
                         },
                     );
                 }
-                ControlCommand::Buffer { buffer_ms, target_ms } => {
+                ControlCommand::Buffer {
+                    buffer_ms,
+                    target_ms,
+                } => {
                     enqueue_control(
                         &mut state,
                         ClientMessage::Buffer {
@@ -516,7 +533,10 @@ fn run_client(
         loop {
             match socket.recv_from(&mut recv_buf) {
                 Ok((len, from)) => {
-                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let recv_info = quiche::RecvInfo {
+                        from,
+                        to: local_addr,
+                    };
                     if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info) {
                         if err != quiche::Error::Done {
                             set_last_error_if_empty(
@@ -578,7 +598,9 @@ fn enqueue_control(state: &mut ClientState, message: ClientMessage<'_>) {
 
 fn flush_control(state: &mut ClientState, conn: &mut quiche::Connection) {
     loop {
-        let Some(front) = state.pending_control.front() else { break };
+        let Some(front) = state.pending_control.front() else {
+            break;
+        };
         let data = &front[state.control_offset..];
         match conn.stream_send(state.control_stream_id, data, false) {
             Ok(sent) => {
@@ -639,7 +661,10 @@ fn handle_readable(
                 }
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
-                    set_last_error_if_empty(last_error, format!("QUIC stream recv error: {:?}", err));
+                    set_last_error_if_empty(
+                        last_error,
+                        format!("QUIC stream recv error: {:?}", err),
+                    );
                     break;
                 }
             }
@@ -707,11 +732,13 @@ fn handle_stream_bytes(
         return;
     }
 
-    let track_id = match state
-        .track_streams
-        .iter()
-        .find_map(|(k, v)| if *v == stream_id { Some(k.clone()) } else { None })
-    {
+    let track_id = match state.track_streams.iter().find_map(|(k, v)| {
+        if *v == stream_id {
+            Some(k.clone())
+        } else {
+            None
+        }
+    }) {
         Some(value) => value,
         None => {
             buffer_pending_stream(state, stream_id, data);
@@ -766,7 +793,10 @@ fn flush_pending_stream(
         .prefetch_buffers
         .entry(track_id.to_string())
         .or_insert_with(VecDeque::new);
-    let size = state.prefetch_bytes.entry(track_id.to_string()).or_insert(0);
+    let size = state
+        .prefetch_bytes
+        .entry(track_id.to_string())
+        .or_insert(0);
     while let Some(chunk) = buffer.pop_front() {
         if *size > MAX_PREFETCH_BYTES {
             break;
@@ -776,11 +806,7 @@ fn flush_pending_stream(
     }
 }
 
-fn flush_prefetch_to_output(
-    state: &mut ClientState,
-    track_id: &str,
-    tx: &mpsc::Sender<Vec<u8>>,
-) {
+fn flush_prefetch_to_output(state: &mut ClientState, track_id: &str, tx: &mpsc::Sender<Vec<u8>>) {
     if let Some(mut buffer) = state.prefetch_buffers.remove(track_id) {
         while let Some(chunk) = buffer.pop_front() {
             let _ = tx.send(chunk.to_vec());

@@ -5,8 +5,8 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use serde::Serialize;
 use common::Artist;
+use serde::Serialize;
 
 use crate::state::{AppState, ArtistQuery, AuthContext, JsonResult, ListResponse, Playlist};
 use crate::utils::json_error;
@@ -28,7 +28,9 @@ pub struct BrowseArtist {
 pub struct BrowseAlbum {
     pub id: String,
     pub artist_id: String,
+    pub artist_ids: Vec<String>,
     pub artist_name: String,
+    pub artist_names: Vec<String>,
     pub title: String,
     pub year: Option<i32>,
     pub genres: Vec<String>,
@@ -99,7 +101,12 @@ pub async fn list_artist_albums(
     let library = library_or_json_error(&state)?;
     let artist = match library.get_artist(&artist_id) {
         Ok(Some(artist)) => artist,
-        Ok(None) => return Err(json_error(StatusCode::NOT_FOUND, "artist not found".to_string())),
+        Ok(None) => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "artist not found".to_string(),
+            ))
+        }
         Err(err) => {
             return Err(json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -119,14 +126,17 @@ pub async fn list_artist_albums(
 
     let mut items = Vec::with_capacity(albums.len());
     for album in albums {
+        let artist_name = album_artist_name(&album, Some(artist.name.clone()));
         let track_count = match library.get_album_tracks(&album.id) {
             Ok(tracks) => tracks.len(),
             Err(_) => 0,
         };
         items.push(BrowseAlbum {
             id: album.id,
-            artist_id: album.artist_id,
-            artist_name: artist.name.clone(),
+            artist_id: album.artist_id.clone(),
+            artist_ids: album.artist_ids.clone(),
+            artist_name,
+            artist_names: album.artist_names.clone(),
             title: album.title,
             year: album.year,
             genres: album.genres,
@@ -137,6 +147,15 @@ pub async fn list_artist_albums(
     Ok(Json(items))
 }
 
+fn album_artist_name(album: &common::Album, fallback: Option<String>) -> String {
+    let display = album.artist_display_name();
+    if !display.trim().is_empty() {
+        display
+    } else {
+        fallback.unwrap_or_else(|| "Unknown Artist".to_string())
+    }
+}
+
 pub async fn get_artist(
     State(state): State<AppState>,
     Extension(_ctx): Extension<AuthContext>,
@@ -145,7 +164,10 @@ pub async fn get_artist(
     let library = library_or_json_error(&state)?;
     match library.get_artist(&artist_id) {
         Ok(Some(artist)) => Ok(Json(artist)),
-        Ok(None) => Err(json_error(StatusCode::NOT_FOUND, "artist not found".to_string())),
+        Ok(None) => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "artist not found".to_string(),
+        )),
         Err(err) => Err(json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("library error: {}", err),
@@ -169,14 +191,21 @@ pub async fn list_album_tracks(
         }
     };
     if tracks.is_empty() {
-        return Err(json_error(StatusCode::NOT_FOUND, "album not found".to_string()));
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "album not found".to_string(),
+        ));
     }
     tracks.sort_by(|a, b| {
         a.disc_no
             .unwrap_or(0)
             .cmp(&b.disc_no.unwrap_or(0))
             .then_with(|| a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0)))
-            .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+            .then_with(|| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            })
     });
 
     let liked_set = liked_set(&state)?;
@@ -199,7 +228,12 @@ pub async fn get_track(
     let library = library_or_json_error(&state)?;
     let track = match library.get_track(&track_id) {
         Ok(Some(track)) => track,
-        Ok(None) => return Err(json_error(StatusCode::NOT_FOUND, "track not found".to_string())),
+        Ok(None) => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "track not found".to_string(),
+            ))
+        }
         Err(err) => {
             return Err(json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -223,7 +257,10 @@ pub async fn list_playlist_tracks(
         .get_playlist(&playlist_id)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
     let Some(playlist) = playlist else {
-        return Err(json_error(StatusCode::NOT_FOUND, "playlist not found".to_string()));
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "playlist not found".to_string(),
+        ));
     };
     let library = library_or_json_error(&state)?;
     let liked_set = liked_set(&state)?;
@@ -261,7 +298,9 @@ pub async fn list_liked_tracks(
     Ok(Json(items))
 }
 
-fn liked_set(state: &AppState) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
+fn liked_set(
+    state: &AppState,
+) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let liked_ids = state
         .user_data
         .list_likes()
@@ -269,7 +308,9 @@ fn liked_set(state: &AppState) -> Result<HashSet<String>, (StatusCode, Json<crat
     Ok(liked_ids.into_iter().collect())
 }
 
-fn playlist_set(state: &AppState) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
+fn playlist_set(
+    state: &AppState,
+) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let playlists = state
         .user_data
         .list_playlists()

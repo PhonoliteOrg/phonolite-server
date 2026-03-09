@@ -4,9 +4,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -18,8 +18,8 @@ use crate::utils::{
     load_template, redirect_to, render_admin_page, wants_json, PageLayout,
 };
 
-use super::{admin_user_from_headers, is_admin, library_for_admin};
 use super::library::render_status_block_for_library;
+use super::{admin_user_from_headers, is_admin, library_for_admin};
 
 #[derive(Serialize)]
 struct ActivityStatusResponse {
@@ -64,7 +64,7 @@ pub async fn admin_activity(State(state): State<AppState>, headers: HeaderMap) -
         Ok((items, total)) => (render_issue_log(&items), total),
         Err(_) => match library_for_admin(&state) {
             Ok(library) => match library.list_tag_error_files(200, 0) {
-                Ok((items, total)) => (render_tag_error_files(&items), total),
+                Ok((items, total)) => (render_tag_error_files(&library, &items), total),
                 Err(err) => (
                     format!(
                         "<p class=\"muted\">Failed to load indexing issues: {}</p>",
@@ -94,15 +94,18 @@ pub async fn admin_activity(State(state): State<AppState>, headers: HeaderMap) -
         }
     };
 
-    let body = apply_template(template, &[
-        ("status_block", status_block),
-        ("events", events_html),
-        ("event_count", (active_count + stored_total).to_string()),
-        ("stored_count", stored_total.to_string()),
-        ("issue_count", issue_count.to_string()),
-        ("status_label", status_label),
-        ("tag_errors", tag_errors_html),
-    ]);
+    let body = apply_template(
+        template,
+        &[
+            ("status_block", status_block),
+            ("events", events_html),
+            ("event_count", (active_count + stored_total).to_string()),
+            ("stored_count", stored_total.to_string()),
+            ("issue_count", issue_count.to_string()),
+            ("status_label", status_label),
+            ("tag_errors", tag_errors_html),
+        ],
+    );
 
     html_response(
         StatusCode::OK,
@@ -140,39 +143,51 @@ pub async fn admin_activity_clear(State(state): State<AppState>, headers: Header
 
 pub async fn admin_activity_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.auth.has_admin().unwrap_or(false) {
-        return (StatusCode::UNAUTHORIZED, Json(ActivityStatusResponse {
-            count: 0,
-            status: "unauthorized".to_string(),
-            issues: 0,
-        }))
-        .into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ActivityStatusResponse {
+                count: 0,
+                status: "unauthorized".to_string(),
+                issues: 0,
+            }),
+        )
+            .into_response();
     }
     let user = match admin_user_from_headers(&state, &headers) {
         Ok(Some(user)) => user,
         Ok(None) => {
-            return (StatusCode::UNAUTHORIZED, Json(ActivityStatusResponse {
-                count: 0,
-                status: "unauthorized".to_string(),
-                issues: 0,
-            }))
-            .into_response()
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ActivityStatusResponse {
+                    count: 0,
+                    status: "unauthorized".to_string(),
+                    issues: 0,
+                }),
+            )
+                .into_response()
         }
         Err(err) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ActivityStatusResponse {
-                count: 0,
-                status: format!("auth error: {}", err),
-                issues: 0,
-            }))
-            .into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActivityStatusResponse {
+                    count: 0,
+                    status: format!("auth error: {}", err),
+                    issues: 0,
+                }),
+            )
+                .into_response()
         }
     };
     if !is_admin(&user) {
-        return (StatusCode::FORBIDDEN, Json(ActivityStatusResponse {
-            count: 0,
-            status: "forbidden".to_string(),
-            issues: 0,
-        }))
-        .into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActivityStatusResponse {
+                count: 0,
+                status: "forbidden".to_string(),
+                issues: 0,
+            }),
+        )
+            .into_response();
     }
 
     let (_, stored_total) = read_activity_log(&state, 1);
@@ -353,10 +368,7 @@ struct IssueLogItem {
     error: String,
 }
 
-fn read_issue_log(
-    state: &AppState,
-    limit: usize,
-) -> Result<(Vec<IssueLogItem>, usize), String> {
+fn read_issue_log(state: &AppState, limit: usize) -> Result<(Vec<IssueLogItem>, usize), String> {
     let log_dir = resolve_path(&state.config_path, &state.config.read().log_dir);
     let log_path = log_dir.join(LOG_ISSUE_FILE);
     let (lines, total) = read_log_tail(&log_path, limit)?;
@@ -418,7 +430,11 @@ fn parse_issue_line(line: &str) -> Option<IssueLogItem> {
     }
     let file = file?;
     let error = error.unwrap_or_else(|| "Unknown error".to_string());
-    Some(IssueLogItem { file, folder, error })
+    Some(IssueLogItem {
+        file,
+        folder,
+        error,
+    })
 }
 
 fn split_log_line(line: &str) -> Option<(&str, &str, &str)> {
@@ -460,11 +476,7 @@ fn render_issue_log(items: &[IssueLogItem]) -> String {
 
     let mut rows = String::new();
     for item in items {
-        let filename = item
-            .file
-            .split('/')
-            .last()
-            .unwrap_or(item.file.as_str());
+        let filename = item.file.split('/').last().unwrap_or(item.file.as_str());
         let folder = item.folder.clone().unwrap_or_else(|| "-".to_string());
         rows.push_str(&format!(
             "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
@@ -481,22 +493,25 @@ fn render_issue_log(items: &[IssueLogItem]) -> String {
     )
 }
 
-fn render_tag_error_files(items: &[library::TagErrorFile]) -> String {
+fn render_tag_error_files(library: &library::Library, items: &[library::TagErrorFile]) -> String {
     if items.is_empty() {
         return "<p class=\"muted\">No indexing issues detected.</p>".to_string();
     }
 
     let mut rows = String::new();
     for item in items {
-        let filename = item
-            .file_relpath
-            .split('/')
-            .last()
-            .unwrap_or(item.file_relpath.as_str());
+        let display_path = library
+            .resolve_relpath(&item.file_relpath)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| item.file_relpath.clone());
+        let filename = Path::new(&display_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(display_path.as_str());
         rows.push_str(&format!(
             "<tr><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
             escape_html(filename),
-            escape_html(&item.file_relpath),
+            escape_html(&display_path),
             escape_html(&item.error),
         ));
     }

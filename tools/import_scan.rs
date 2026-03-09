@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use library::Library;
+use library::{Library, LibraryRoot};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,8 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "data/library.redb".to_string());
 
     let index_exists = Path::new(&index_path).exists();
-    let (library, _) =
-        Library::load_or_scan(PathBuf::from(&music_root), PathBuf::from(&index_path))?;
+    let roots = vec![LibraryRoot::new(String::new(), PathBuf::from(&music_root))];
+    let (library, _) = Library::load_or_scan(roots, PathBuf::from(&index_path))?;
     let stats = if index_exists {
         library.rescan()?
     } else {

@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use redb::{
-    CommitError, Database, DatabaseError, ReadableTable, StorageError, TableDefinition,
-    TableError, TransactionError,
+    CommitError, Database, DatabaseError, ReadableTable, StorageError, TableDefinition, TableError,
+    TransactionError,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -194,10 +194,7 @@ impl UserDataStore {
         Ok(settings)
     }
 
-    pub fn set_playback_settings(
-        &self,
-        settings: PlaybackSettings,
-    ) -> Result<(), UserDataError> {
+    pub fn set_playback_settings(&self, settings: PlaybackSettings) -> Result<(), UserDataError> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PLAYBACK_SETTINGS_TABLE)?;

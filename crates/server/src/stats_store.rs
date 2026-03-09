@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use redb::{CommitError, Database, ReadableTable, StorageError, TableDefinition, TableError, TransactionError};
+use redb::{
+    CommitError, Database, ReadableTable, StorageError, TableDefinition, TableError,
+    TransactionError,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::warn;
