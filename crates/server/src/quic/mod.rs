@@ -24,6 +24,7 @@ const MAX_QUIC_DATAGRAM: usize = 1350;
 const CONTROL_STREAM_MAX_LINE: usize = 64 * 1024;
 const MAX_STREAM_BUFFER_BYTES: usize = 6 * 1024 * 1024;
 const SEEK_RESET_MARKER: u16 = 0xFFFF;
+const SEEK_RECOVERY_TARGET_MS: u32 = 400;
 const STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const STATS_MAX_PLAYBACK_DELTA_MS: u64 = 15_000;
 
@@ -50,7 +51,12 @@ enum ControlMessage {
         target_ms: Option<u32>,
     },
     #[serde(rename = "seek")]
-    Seek { track_id: String, position_ms: u32 },
+    Seek {
+        track_id: String,
+        position_ms: u32,
+        #[serde(default)]
+        seek_id: u32,
+    },
     #[serde(rename = "playback")]
     Playback {
         track_id: String,
@@ -320,6 +326,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
     let mut send_buf = vec![0u8; MAX_UDP_SIZE];
+    let mut pending_udp: VecDeque<(Vec<u8>, std::net::SocketAddr)> = VecDeque::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(25));
 
@@ -329,7 +336,13 @@ pub async fn run(state: AppState) -> Result<(), String> {
                 let (len, from) = match result {
                     Ok(value) => value,
                     Err(err) => {
-                        tracing::error!("quic recv error: {}", err);
+                        if err.kind() == std::io::ErrorKind::ConnectionReset
+                            || err.raw_os_error() == Some(10054)
+                        {
+                            tracing::debug!("quic recv reset by peer: {}", err);
+                        } else {
+                            tracing::error!("quic recv error: {}", err);
+                        }
                         continue;
                     }
                 };
@@ -403,7 +416,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                 flush_control(&mut client.session, &mut client.conn);
                 flush_streams(&mut client.session, &mut client.conn);
 
-                flush_conn(&mut client.conn, &socket, &mut send_buf);
+                flush_conn(&mut client.conn, &socket, &mut send_buf, &mut pending_udp);
                 client.timeout_at = client.conn.timeout().map(|t| Instant::now() + t);
             }
             _ = tick.tick() => {
@@ -444,7 +457,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                     handle_readable(&state, client);
                     flush_control(&mut client.session, &mut client.conn);
                     flush_streams(&mut client.session, &mut client.conn);
-                    flush_conn(&mut client.conn, &socket, &mut send_buf);
+                    flush_conn(&mut client.conn, &socket, &mut send_buf, &mut pending_udp);
                     client.timeout_at = client.conn.timeout().map(|t| Instant::now() + t);
                     maybe_log_streams(&mut client.session, &client.conn);
                 }
@@ -550,7 +563,7 @@ fn build_quic_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<quiche::
         )
         .map_err(|err| format!("key load error: {:?}", err))?;
     config.verify_peer(false);
-    config.set_max_idle_timeout(30_000);
+    config.set_max_idle_timeout(90_000);
     config.set_max_recv_udp_payload_size(MAX_QUIC_DATAGRAM);
     config.set_max_send_udp_payload_size(MAX_QUIC_DATAGRAM);
     config.set_initial_max_data(20_000_000);
@@ -746,8 +759,14 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
         ControlMessage::Seek {
             track_id,
             position_ms,
+            seek_id,
         } => {
-            tracing::info!("QUIC seek track={} position_ms={}", track_id, position_ms);
+            tracing::info!(
+                "QUIC seek track={} position_ms={} seek_id={}",
+                track_id,
+                position_ms,
+                seek_id
+            );
             if !client.session.authed {
                 tracing::warn!("QUIC seek rejected: unauthorized");
                 send_control(
@@ -758,6 +777,8 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 );
                 return;
             }
+            client.session.client_buffer_ms = 0;
+            client.session.buffer_target_ms = SEEK_RECOVERY_TARGET_MS;
             client.session.active_track = Some(track_id.clone());
             ensure_active_in_queue(&mut client.session);
             let mut frame_ms = active_frame_ms(&client.session);
@@ -770,12 +791,13 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     mode_label = Some(transcode_mode_label(outgoing.mode));
                     quality_label = Some(transcode_quality_label(outgoing.quality));
                     outgoing.role = StreamRole::Active;
-                    match seek_track_stream(state, outgoing, &track_id, position_ms) {
+                    match seek_track_stream(state, outgoing, &track_id, position_ms, seek_id) {
                         Ok(()) => {
                             tracing::info!(
-                                "QUIC seek reusing stream track={} stream_id={}",
+                                "QUIC seek reusing stream track={} stream_id={} seek_id={}",
                                 track_id,
-                                stream_id
+                                stream_id,
+                                seek_id
                             );
                             reused = true;
                         }
@@ -984,34 +1006,10 @@ fn spawn_track_transcode(
     let cacheable = mode == TranscodeMode::Fixed;
     let cache_key = CacheKey::new(track_id, frame_ms, mode, quality);
     let mut cache_guard = None;
+    let mut cache_writer = None;
     if cacheable {
-        if let Ok(Some(writer)) = state.stream_cache.writer(cache_key.clone()) {
-            cache_guard = Some(writer.guard());
-            let path_clone = path.clone();
-            let meta_clone = meta.clone();
-            let selector_clone = BitrateSelector {
-                mode: TranscodeMode::Fixed,
-                quality,
-                fixed_bitrate_bps: selector.fixed_bitrate_bps,
-                adaptive_bitrate_bps: None,
-            };
-            tokio::task::spawn_blocking(move || {
-                if let Err(err) = crate::transcode::transcode_to_raw_opus_cache(
-                    &path_clone,
-                    selector_clone,
-                    frame_ms,
-                    meta_clone,
-                    writer,
-                ) {
-                    tracing::info!("Memory cache fill stopped: {}", err);
-                }
-            });
-        }
         if let Ok(Some(reader)) = state.stream_cache.reader(&cache_key) {
-            if cache_guard.is_none() {
-                cache_guard = Some(reader.guard());
-            }
-            if reader.can_start(start_ms) {
+            if reader.is_complete() && reader.can_start(start_ms) {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
                 tokio::task::spawn_blocking(move || {
                     if let Err(err) = reader.stream_to(start_ms, &tx) {
@@ -1024,8 +1022,11 @@ fn spawn_track_transcode(
                 return Ok((rx, None, cache_guard));
             }
         }
+        if let Ok(Some(writer)) = state.stream_cache.writer(cache_key.clone()) {
+            cache_guard = Some(writer.guard());
+            cache_writer = Some(writer);
+        }
     }
-    let cache_writer = None;
     let (rx, cmd_tx) = crate::transcode::spawn_raw_opus_worker(
         path.clone(),
         selector,
@@ -1107,6 +1108,7 @@ fn seek_track_stream(
     outgoing: &mut OutgoingStream,
     track_id: &str,
     position_ms: u32,
+    seek_id: u32,
 ) -> Result<(), String> {
     let frame_ms = outgoing.frame_ms;
     let mode = outgoing.mode;
@@ -1114,7 +1116,9 @@ fn seek_track_stream(
     if mode == TranscodeMode::Fixed {
         let cache_key = CacheKey::new(track_id, frame_ms, mode, quality);
         if let Ok(Some(reader)) = state.stream_cache.reader(&cache_key) {
-            if reader.can_start(position_ms) {
+            // Reusing a partial cache for seek can strand the stream after the
+            // already-cached frames are drained, so only seek through complete entries.
+            if reader.can_start(position_ms) && reader.is_complete() {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
                 tokio::task::spawn_blocking(move || {
                     if let Err(err) = reader.stream_to(position_ms, &tx) {
@@ -1128,50 +1132,43 @@ fn seek_track_stream(
                     outgoing.stop_worker();
                 }
                 outgoing.cmd_tx = None;
+                outgoing.cache_guard = None;
                 outgoing.rx = rx;
-                outgoing.pending.clear();
-                outgoing.offset = 0;
-                outgoing.finished = false;
-                outgoing.buffered_bytes = 0;
-                outgoing.sent_bytes = 0;
-                let now = Instant::now();
-                outgoing.last_send = now;
-                outgoing.last_drain = now;
-                outgoing.last_send_log = now;
-                outgoing.last_send_err = None;
+                reset_outgoing_seek_state(outgoing);
 
-                let marker = SEEK_RESET_MARKER.to_le_bytes().to_vec();
-                outgoing.pending.push_back(Bytes::from(marker));
-                outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_add(2);
+                let marker = seek_reset_frame(seek_id);
+                outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_add(marker.len());
+                outgoing.pending.push_back(marker);
                 return Ok(());
             }
         }
     }
-    let mut reused = false;
-    if let Some(cmd_tx) = outgoing.cmd_tx.as_ref() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-        if cmd_tx
-            .send(TranscodeCommand::Seek {
-                start_ms: position_ms,
-                tx,
-            })
-            .is_ok()
-        {
-            outgoing.rx = rx;
-            reused = true;
-        } else {
-            outgoing.cmd_tx = None;
-        }
+    if outgoing.cmd_tx.is_some() {
+        outgoing.stop_worker();
     }
+    outgoing.cmd_tx = None;
+    let (rx, cmd_tx, cache_guard) =
+        spawn_track_transcode(state, track_id, frame_ms, mode, quality, position_ms)?;
+    outgoing.rx = rx;
+    outgoing.cmd_tx = cmd_tx;
+    outgoing.cache_guard = cache_guard;
+    reset_outgoing_seek_state(outgoing);
 
-    if !reused {
-        let (rx, cmd_tx, cache_guard) =
-            spawn_track_transcode(state, track_id, frame_ms, mode, quality, position_ms)?;
-        outgoing.rx = rx;
-        outgoing.cmd_tx = cmd_tx;
-        outgoing.cache_guard = cache_guard;
-    }
+    let marker = seek_reset_frame(seek_id);
+    outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_add(marker.len());
+    outgoing.pending.push_back(marker);
 
+    Ok(())
+}
+
+fn seek_reset_frame(seek_id: u32) -> Bytes {
+    let mut marker = Vec::with_capacity(6);
+    marker.extend_from_slice(&SEEK_RESET_MARKER.to_le_bytes());
+    marker.extend_from_slice(&seek_id.to_le_bytes());
+    Bytes::from(marker)
+}
+
+fn reset_outgoing_seek_state(outgoing: &mut OutgoingStream) {
     outgoing.pending.clear();
     outgoing.offset = 0;
     outgoing.finished = false;
@@ -1182,12 +1179,6 @@ fn seek_track_stream(
     outgoing.last_drain = now;
     outgoing.last_send_log = now;
     outgoing.last_send_err = None;
-
-    let marker = SEEK_RESET_MARKER.to_le_bytes().to_vec();
-    outgoing.pending.push_back(Bytes::from(marker));
-    outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_add(2);
-
-    Ok(())
 }
 
 fn send_control(client: &mut ClientConn, message: ControlResponse<'_>) {
@@ -1248,7 +1239,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
         let force_send = outgoing
             .pending
             .front()
-            .map(|front| front.len() == 2 && front[0] == 0xFF && front[1] == 0xFF)
+            .map(|front| front.len() >= 2 && front[0] == 0xFF && front[1] == 0xFF)
             .unwrap_or(false);
         if !force_send
             && outgoing.role == StreamRole::Active
@@ -1268,17 +1259,17 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
             };
             match send_result {
                 Ok(sent) => {
+                    if sent > 0 {
+                        outgoing.sent_bytes = outgoing.sent_bytes.saturating_add(sent as u64);
+                        outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_sub(sent);
+                        outgoing.last_send = Instant::now();
+                    }
                     if sent == data_len {
                         outgoing.pending.pop_front();
                         outgoing.offset = 0;
-                        outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_sub(data_len);
                     } else {
                         outgoing.offset = outgoing.offset.saturating_add(sent);
                         break;
-                    }
-                    if sent > 0 {
-                        outgoing.sent_bytes = outgoing.sent_bytes.saturating_add(sent as u64);
-                        outgoing.last_send = Instant::now();
                     }
                 }
                 Err(quiche::Error::Done) => break,
@@ -1303,6 +1294,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
                         }
                         outgoing.last_send_log = now;
                     }
+                    outgoing.buffered_bytes = outgoing.buffered_bytes.saturating_sub(data_len);
                     outgoing.pending.pop_front();
                     outgoing.offset = 0;
                 }
@@ -1489,12 +1481,47 @@ fn update_listen_stats_from_playback(
     }
 }
 
-fn flush_conn(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]) {
+fn flush_udp_queue(socket: &UdpSocket, pending: &mut VecDeque<(Vec<u8>, std::net::SocketAddr)>) {
+    while let Some((packet, addr)) = pending.pop_front() {
+        match socket.try_send_to(&packet, addr) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                pending.push_front((packet, addr));
+                tracing::debug!("quic send stalled with {} queued datagrams", pending.len());
+                break;
+            }
+            Err(err) => {
+                tracing::debug!("quic pending send error: {:?}", err);
+            }
+        }
+    }
+}
+
+fn flush_conn(
+    conn: &mut quiche::Connection,
+    socket: &UdpSocket,
+    out: &mut [u8],
+    pending: &mut VecDeque<(Vec<u8>, std::net::SocketAddr)>,
+) {
+    flush_udp_queue(socket, pending);
+    if !pending.is_empty() {
+        return;
+    }
+
     loop {
         match conn.send(out) {
-            Ok((len, send_info)) => {
-                let _ = socket.try_send_to(&out[..len], send_info.to);
-            }
+            Ok((len, send_info)) => match socket.try_send_to(&out[..len], send_info.to) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    pending.push_back((out[..len].to_vec(), send_info.to));
+                    tracing::debug!("quic send backpressure queued {} datagrams", pending.len());
+                    break;
+                }
+                Err(err) => {
+                    tracing::debug!("quic send error: {:?}", err);
+                    break;
+                }
+            },
             Err(quiche::Error::Done) => break,
             Err(err) => {
                 tracing::debug!("quic send error: {:?}", err);

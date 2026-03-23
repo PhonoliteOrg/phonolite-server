@@ -1255,11 +1255,7 @@ mod tests {
                 String::from("Another Guest"),
                 String::from("Kanye West"),
             ],
-            &[
-                String::from("Ye"),
-                String::from("Ye"),
-                String::from("Ye"),
-            ],
+            &[String::from("Ye"), String::from("Ye"), String::from("Ye")],
             &[
                 vec![String::from("Kanye West"), String::from("Guest Artist")],
                 vec![String::from("Kanye West"), String::from("Another Guest")],

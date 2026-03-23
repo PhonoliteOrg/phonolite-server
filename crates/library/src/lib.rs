@@ -200,6 +200,45 @@ impl Library {
         Ok(artist)
     }
 
+    pub fn artist_name_map(
+        &self,
+        artist_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, String>, LibraryError> {
+        let read_txn = self.db.begin_read()?;
+        let artist_table = read_txn.open_table(ARTISTS_TABLE)?;
+        let mut names = HashMap::with_capacity(artist_ids.len());
+        for artist_id in artist_ids {
+            if let Some(value) = artist_table.get(artist_id.as_str())? {
+                let artist: Artist = decode_value(value.value())?;
+                names.insert(artist_id.clone(), artist.name);
+            }
+        }
+        Ok(names)
+    }
+
+    pub fn artist_album_counts(
+        &self,
+        artist_ids: &[String],
+    ) -> Result<HashMap<String, usize>, LibraryError> {
+        let read_txn = self.db.begin_read()?;
+        let artist_album_table = read_txn.open_table(ARTIST_ALBUMS_TABLE)?;
+        let mut counts = HashMap::with_capacity(artist_ids.len());
+
+        for artist_id in artist_ids {
+            let prefix = prefix_key(artist_id);
+            let mut end = prefix.clone();
+            end.push('\u{10ffff}');
+            let mut count = 0usize;
+            for entry in artist_album_table.range(prefix.as_str()..end.as_str())? {
+                entry?;
+                count += 1;
+            }
+            counts.insert(artist_id.clone(), count);
+        }
+
+        Ok(counts)
+    }
+
     pub fn list_artist_albums(&self, artist_id: &str) -> Result<Vec<Album>, LibraryError> {
         let read_txn = self.db.begin_read()?;
         let album_table = read_txn.open_table(ALBUMS_TABLE)?;
@@ -221,6 +260,29 @@ impl Library {
         }
 
         Ok(albums)
+    }
+
+    pub fn album_track_counts(
+        &self,
+        album_ids: &[String],
+    ) -> Result<HashMap<String, usize>, LibraryError> {
+        let read_txn = self.db.begin_read()?;
+        let album_track_table = read_txn.open_table(ALBUM_TRACKS_TABLE)?;
+        let mut counts = HashMap::with_capacity(album_ids.len());
+
+        for album_id in album_ids {
+            let prefix = prefix_key(album_id);
+            let mut end = prefix.clone();
+            end.push('\u{10ffff}');
+            let mut count = 0usize;
+            for entry in album_track_table.range(prefix.as_str()..end.as_str())? {
+                entry?;
+                count += 1;
+            }
+            counts.insert(album_id.clone(), count);
+        }
+
+        Ok(counts)
     }
 
     pub fn list_albums(
@@ -381,6 +443,22 @@ impl Library {
             None => None,
         };
         Ok(album)
+    }
+
+    pub fn album_title_map(
+        &self,
+        album_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, String>, LibraryError> {
+        let read_txn = self.db.begin_read()?;
+        let album_table = read_txn.open_table(ALBUMS_TABLE)?;
+        let mut titles = HashMap::with_capacity(album_ids.len());
+        for album_id in album_ids {
+            if let Some(value) = album_table.get(album_id.as_str())? {
+                let album: Album = decode_value(value.value())?;
+                titles.insert(album_id.clone(), album.title);
+            }
+        }
+        Ok(titles)
     }
 
     pub fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>, LibraryError> {

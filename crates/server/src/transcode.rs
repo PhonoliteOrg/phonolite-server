@@ -268,8 +268,12 @@ pub fn spawn_raw_opus_worker(
         if let Err(err) =
             transcode_raw_worker_loop(path, selector, frame_ms, meta, start_ms, tx, cmd_rx, cache)
         {
-            send_worker_error(&tx_err, &err);
-            tracing::warn!("QUIC transcode worker failed: {}", err);
+            if err == "stream closed" {
+                tracing::debug!("QUIC transcode worker stopped: {}", err);
+            } else {
+                send_worker_error(&tx_err, &err);
+                tracing::warn!("QUIC transcode worker failed: {}", err);
+            }
         }
     });
     Ok((rx, cmd_tx))

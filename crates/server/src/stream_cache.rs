@@ -120,6 +120,10 @@ impl MemoryCache {
         }
     }
 
+    fn is_complete(&self) -> bool {
+        self.state.lock().complete
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
@@ -150,7 +154,7 @@ impl CacheGuard {
 impl Drop for CacheGuard {
     fn drop(&mut self) {
         let remaining = self.cache.active_streams.fetch_sub(1, Ordering::SeqCst) - 1;
-        if remaining == 0 {
+        if remaining == 0 && !self.cache.is_complete() {
             self.cache.cancel();
         }
     }
@@ -165,9 +169,13 @@ impl CacheReader {
         CacheGuard::new(Arc::clone(&self.cache))
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.cache.is_complete()
+    }
+
     pub fn can_start(&self, start_ms: u32) -> bool {
         let state = self.cache.state.lock();
-        if !state.complete {
+        if state.header.is_none() {
             return false;
         }
         let start_frame = (start_ms / self.cache.frame_ms) as usize;

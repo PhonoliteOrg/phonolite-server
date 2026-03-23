@@ -41,8 +41,9 @@ use state::{AppState, LibraryState, LibraryStatus};
 use stats_store::StatsStore;
 use stream_cache::StreamCache;
 use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tower_http::LatencyUnit;
+use tracing::{info, warn, Level};
 use user_data::{open_or_create_db as open_user_db, UserDataStore};
 
 #[tokio::main]
@@ -162,7 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .nest("/api/v1", api::api_router(state.clone())) // Removed duplicate
         .merge(admin_router(state.clone()))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http().on_response(
+                DefaultOnResponse::new()
+                    .level(Level::INFO)
+                    .latency_unit(LatencyUnit::Millis),
+            ),
+        );
 
     if state.config.read().quic_enabled {
         let quic_state = state.clone();

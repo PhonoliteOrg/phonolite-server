@@ -73,12 +73,23 @@ pub async fn list_artists(
         }
     };
 
+    let artist_ids = artists
+        .iter()
+        .map(|artist| artist.id.clone())
+        .collect::<Vec<_>>();
+    let album_counts = match library.artist_album_counts(&artist_ids) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("library error: {}", err),
+            ))
+        }
+    };
+
     let mut items = Vec::with_capacity(artists.len());
     for artist in artists {
-        let album_count = match library.list_artist_albums(&artist.id) {
-            Ok(albums) => albums.len(),
-            Err(_) => 0,
-        };
+        let album_count = album_counts.get(&artist.id).copied().unwrap_or(0);
         items.push(BrowseArtist {
             id: artist.id,
             name: artist.name,
@@ -124,13 +135,24 @@ pub async fn list_artist_albums(
         }
     };
 
+    let album_ids = albums
+        .iter()
+        .map(|album| album.id.clone())
+        .collect::<Vec<_>>();
+    let track_counts = match library.album_track_counts(&album_ids) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("library error: {}", err),
+            ))
+        }
+    };
+
     let mut items = Vec::with_capacity(albums.len());
     for album in albums {
         let artist_name = album_artist_name(&album, Some(artist.name.clone()));
-        let track_count = match library.get_album_tracks(&album.id) {
-            Ok(tracks) => tracks.len(),
-            Err(_) => 0,
-        };
+        let track_count = track_counts.get(&album.id).copied().unwrap_or(0);
         items.push(BrowseAlbum {
             id: album.id,
             artist_id: album.artist_id.clone(),
@@ -211,12 +233,8 @@ pub async fn list_album_tracks(
     let liked_set = liked_set(&state)?;
     let playlist_set = playlist_set(&state)?;
 
-    let mut items = Vec::with_capacity(tracks.len());
-    for track in tracks {
-        if let Ok(view) = build_track_view(&library, &track, &liked_set, &playlist_set) {
-            items.push(view);
-        }
-    }
+    let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(items))
 }
 
@@ -243,7 +261,16 @@ pub async fn get_track(
     };
     let liked_set = liked_set(&state)?;
     let playlist_set = playlist_set(&state)?;
-    let view = build_track_view(&library, &track, &liked_set, &playlist_set)?;
+    let mut items = build_track_views(
+        &library,
+        std::slice::from_ref(&track),
+        &liked_set,
+        &playlist_set,
+    )
+    .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let view = items
+        .pop()
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "track not found".to_string()))?;
     Ok(Json(view))
 }
 
@@ -265,14 +292,14 @@ pub async fn list_playlist_tracks(
     let library = library_or_json_error(&state)?;
     let liked_set = liked_set(&state)?;
     let playlist_set = playlist_set(&state)?;
-    let mut items = Vec::new();
+    let mut tracks = Vec::new();
     for track_id in playlist.track_ids {
         if let Ok(Some(track)) = library.get_track(&track_id) {
-            if let Ok(view) = build_track_view(&library, &track, &liked_set, &playlist_set) {
-                items.push(view);
-            }
+            tracks.push(track);
         }
     }
+    let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(items))
 }
 
@@ -287,14 +314,14 @@ pub async fn list_liked_tracks(
     let library = library_or_json_error(&state)?;
     let liked_set = liked_set(&state)?;
     let playlist_set = playlist_set(&state)?;
-    let mut items = Vec::new();
+    let mut tracks = Vec::new();
     for track_id in track_ids {
         if let Ok(Some(track)) = library.get_track(&track_id) {
-            if let Ok(view) = build_track_view(&library, &track, &liked_set, &playlist_set) {
-                items.push(view);
-            }
+            tracks.push(track);
         }
     }
+    let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(items))
 }
 
@@ -328,35 +355,47 @@ fn playlist_track_ids(playlists: &[Playlist]) -> HashSet<String> {
     ids
 }
 
-fn build_track_view(
+fn build_track_views(
     library: &library::Library,
-    track: &common::Track,
+    tracks: &[common::Track],
     liked_set: &HashSet<String>,
     playlist_set: &HashSet<String>,
-) -> Result<TrackView, (StatusCode, Json<crate::state::ErrorResponse>)> {
-    let artist_name = library
-        .get_artist(&track.artist_id)
-        .ok()
-        .flatten()
-        .map(|artist| artist.name)
-        .unwrap_or_else(|| "Unknown Artist".to_string());
-    let album_title = library
-        .get_album(&track.album_id)
-        .ok()
-        .flatten()
-        .map(|album| album.title)
-        .unwrap_or_else(|| "Unknown Album".to_string());
-    Ok(TrackView {
-        id: track.id.clone(),
-        title: track.title.clone(),
-        artist: artist_name,
-        album: album_title,
-        artist_id: track.artist_id.clone(),
-        album_id: track.album_id.clone(),
-        duration_ms: track.duration_ms,
-        track_no: track.track_no,
-        disc_no: track.disc_no,
-        liked: liked_set.contains(&track.id),
-        in_playlists: playlist_set.contains(&track.id),
-    })
+) -> Result<Vec<TrackView>, String> {
+    let artist_ids = tracks
+        .iter()
+        .map(|track| track.artist_id.clone())
+        .collect::<HashSet<_>>();
+    let album_ids = tracks
+        .iter()
+        .map(|track| track.album_id.clone())
+        .collect::<HashSet<_>>();
+    let artist_names = library
+        .artist_name_map(&artist_ids)
+        .map_err(|err| err.to_string())?;
+    let album_titles = library
+        .album_title_map(&album_ids)
+        .map_err(|err| err.to_string())?;
+
+    Ok(tracks
+        .iter()
+        .map(|track| TrackView {
+            id: track.id.clone(),
+            title: track.title.clone(),
+            artist: artist_names
+                .get(&track.artist_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown Artist".to_string()),
+            album: album_titles
+                .get(&track.album_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown Album".to_string()),
+            artist_id: track.artist_id.clone(),
+            album_id: track.album_id.clone(),
+            duration_ms: track.duration_ms,
+            track_no: track.track_no,
+            disc_no: track.disc_no,
+            liked: liked_set.contains(&track.id),
+            in_playlists: playlist_set.contains(&track.id),
+        })
+        .collect())
 }

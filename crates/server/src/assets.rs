@@ -20,6 +20,7 @@ pub enum CoverSource {
 pub enum CoverCacheKey {
     Album(String),
     Track(String),
+    Artist { id: String, variant: String },
 }
 
 pub fn metadata_root_path(state: &AppState) -> PathBuf {
@@ -140,8 +141,9 @@ async fn ensure_cover_cached(
     }
 
     let (id, prefix) = match key {
-        CoverCacheKey::Album(id) => (id, "album"),
-        CoverCacheKey::Track(id) => (id, "track"),
+        CoverCacheKey::Album(id) => (id.clone(), "album".to_string()),
+        CoverCacheKey::Track(id) => (id.clone(), "track".to_string()),
+        CoverCacheKey::Artist { id, variant } => (id.clone(), format!("artist-{}", variant)),
     };
 
     for ext in ["jpg", "png", "webp", "gif"] {

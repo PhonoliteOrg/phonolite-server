@@ -10,9 +10,8 @@ use common::{Album, Artist, Track};
 use serde::Serialize;
 
 use crate::assets::{
-    cover_response, fetch_cover, fetch_cover_cached, metadata_root_path,
-    resolve_artist_banner_source, resolve_artist_cover_source, resolve_artist_logo_source,
-    resolve_cover_source, CoverCacheKey,
+    cover_response, fetch_cover_cached, metadata_root_path, resolve_artist_banner_source,
+    resolve_artist_cover_source, resolve_artist_logo_source, resolve_cover_source, CoverCacheKey,
 };
 use crate::shuffle::{build_shuffle_queue, ShuffleError, ShuffleMode};
 use crate::state::{
@@ -51,7 +50,11 @@ pub async fn get_artist_cover(
         }
     };
 
-    match fetch_cover(source).await {
+    let key = CoverCacheKey::Artist {
+        id: artist_id.clone(),
+        variant: query.kind.as_deref().unwrap_or("cover").to_string(),
+    };
+    match fetch_cover_cached(&state, key, source).await {
         Ok((bytes, mime)) => cover_response(bytes, &mime),
         Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
     }
@@ -108,8 +111,19 @@ pub async fn search(
             ))
         }
     };
+    let album_artist_ids = albums
+        .iter()
+        .map(|album| album.artist_id.clone())
+        .collect::<HashSet<_>>();
+    let album_artist_names = library.artist_name_map(&album_artist_ids).map_err(|err| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("library error: {}", err),
+        )
+    })?;
     for album in albums {
-        let artist_name = album_artist_name(&library, &album);
+        let artist_name =
+            album_artist_name(&album, album_artist_names.get(&album.artist_id).cloned());
         let combined = format!("{} {}", album.title, artist_name);
         let score = score_match(&normalized, &combined);
         if score > 0 {
@@ -132,18 +146,34 @@ pub async fn search(
             ))
         }
     };
+    let track_artist_ids = tracks
+        .iter()
+        .map(|track| track.artist_id.clone())
+        .collect::<HashSet<_>>();
+    let track_album_ids = tracks
+        .iter()
+        .map(|track| track.album_id.clone())
+        .collect::<HashSet<_>>();
+    let track_artist_names = library.artist_name_map(&track_artist_ids).map_err(|err| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("library error: {}", err),
+        )
+    })?;
+    let track_album_titles = library.album_title_map(&track_album_ids).map_err(|err| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("library error: {}", err),
+        )
+    })?;
     for track in tracks {
-        let artist_name = library
-            .get_artist(&track.artist_id)
-            .ok()
-            .flatten()
-            .map(|artist| artist.name)
+        let artist_name = track_artist_names
+            .get(&track.artist_id)
+            .cloned()
             .unwrap_or_else(|| "Unknown Artist".to_string());
-        let album_title = library
-            .get_album(&track.album_id)
-            .ok()
-            .flatten()
-            .map(|album| album.title)
+        let album_title = track_album_titles
+            .get(&track.album_id)
+            .cloned()
             .unwrap_or_else(|| "Unknown Album".to_string());
         let combined = format!("{} {} {}", track.title, artist_name, album_title);
         let score = score_match(&normalized, &combined);
@@ -152,7 +182,7 @@ pub async fn search(
                 kind: "track".to_string(),
                 id: track.id,
                 title: track.title,
-                subtitle: Some(format!("{} — {}", artist_name, album_title)),
+                subtitle: Some(format!("{} - {}", artist_name, album_title)),
                 score,
             });
         }
@@ -227,44 +257,23 @@ pub async fn shuffle_tracks(
             ))
         }
     };
-
     if tracks.is_empty() {
         return Err(json_error(StatusCode::NOT_FOUND, "no tracks found"));
     }
 
     let playlist_set = playlist_set(&state)?;
-    let mut items = Vec::with_capacity(tracks.len());
-    for track in tracks {
-        if let Ok(view) = build_track_view(&library, &track, &liked_set, &playlist_set) {
-            items.push(view);
-        }
-    }
-
+    let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(items))
 }
 
-fn album_artist_name(library: &library::Library, album: &Album) -> String {
+fn album_artist_name(album: &Album, fallback: Option<String>) -> String {
     let display = album.artist_display_name();
     if !display.trim().is_empty() {
         display
     } else {
-        library
-            .get_artist(&album.artist_id)
-            .ok()
-            .flatten()
-            .map(|artist| artist.name)
-            .unwrap_or_else(|| "Unknown Artist".to_string())
+        fallback.unwrap_or_else(|| "Unknown Artist".to_string())
     }
-}
-
-fn split_list_param(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or("")
-        .split(',')
-        .map(|item| item.trim())
-        .filter(|item| !item.is_empty())
-        .map(|item| item.to_string())
-        .collect()
 }
 
 fn fetch_artists_for_search(
@@ -272,33 +281,10 @@ fn fetch_artists_for_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Artist>, String> {
-    let (items, _) = library
+    library
         .list_artists(Some(query), limit, 0)
-        .map_err(|err| err.to_string())?;
-    if !items.is_empty() {
-        return Ok(items);
-    }
-    fetch_all_artists_for_fuzzy(library, limit)
-}
-
-fn fetch_all_artists_for_fuzzy(
-    library: &library::Library,
-    max_items: usize,
-) -> Result<Vec<Artist>, String> {
-    let mut items = Vec::new();
-    let mut offset = 0usize;
-    let limit = 200usize;
-    while items.len() < max_items {
-        let (mut batch, total) = library
-            .list_artists(None, limit, offset)
-            .map_err(|err| err.to_string())?;
-        items.append(&mut batch);
-        if items.len() >= total {
-            break;
-        }
-        offset = items.len();
-    }
-    Ok(items)
+        .map(|(items, _)| items)
+        .map_err(|err| err.to_string())
 }
 
 fn fetch_albums_for_search(
@@ -306,33 +292,10 @@ fn fetch_albums_for_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Album>, String> {
-    let (items, _) = library
+    library
         .list_albums(Some(query), limit, 0)
-        .map_err(|err| err.to_string())?;
-    if !items.is_empty() {
-        return Ok(items);
-    }
-    fetch_all_albums_for_fuzzy(library, limit)
-}
-
-fn fetch_all_albums_for_fuzzy(
-    library: &library::Library,
-    max_items: usize,
-) -> Result<Vec<Album>, String> {
-    let mut items = Vec::new();
-    let mut offset = 0usize;
-    let limit = 200usize;
-    while items.len() < max_items {
-        let (mut batch, total) = library
-            .list_albums(None, limit, offset)
-            .map_err(|err| err.to_string())?;
-        items.append(&mut batch);
-        if items.len() >= total {
-            break;
-        }
-        offset = items.len();
-    }
-    Ok(items)
+        .map(|(items, _)| items)
+        .map_err(|err| err.to_string())
 }
 
 fn fetch_tracks_for_search(
@@ -340,33 +303,20 @@ fn fetch_tracks_for_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Track>, String> {
-    let (items, _) = library
+    library
         .list_tracks(Some(query), limit, 0)
-        .map_err(|err| err.to_string())?;
-    if !items.is_empty() {
-        return Ok(items);
-    }
-    fetch_all_tracks_for_fuzzy(library, limit)
+        .map(|(items, _)| items)
+        .map_err(|err| err.to_string())
 }
 
-fn fetch_all_tracks_for_fuzzy(
-    library: &library::Library,
-    max_items: usize,
-) -> Result<Vec<Track>, String> {
-    let mut items = Vec::new();
-    let mut offset = 0usize;
-    let limit = 200usize;
-    while items.len() < max_items {
-        let (mut batch, total) = library
-            .list_tracks(None, limit, offset)
-            .map_err(|err| err.to_string())?;
-        items.append(&mut batch);
-        if items.len() >= total {
-            break;
-        }
-        offset = items.len();
-    }
-    Ok(items)
+fn split_list_param(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
 }
 
 fn normalize_search(value: &str) -> String {
@@ -464,37 +414,48 @@ fn playlist_track_ids(playlists: &[Playlist]) -> HashSet<String> {
     ids
 }
 
-fn build_track_view(
+fn build_track_views(
     library: &library::Library,
-    track: &common::Track,
+    tracks: &[common::Track],
     liked_set: &HashSet<String>,
     playlist_set: &HashSet<String>,
-) -> Result<TrackView, (StatusCode, Json<crate::state::ErrorResponse>)> {
-    let artist_name = library
-        .get_artist(&track.artist_id)
-        .ok()
-        .flatten()
-        .map(|artist| artist.name)
-        .unwrap_or_else(|| "Unknown Artist".to_string());
-    let album_title = library
-        .get_album(&track.album_id)
-        .ok()
-        .flatten()
-        .map(|album| album.title)
-        .unwrap_or_else(|| "Unknown Album".to_string());
-    Ok(TrackView {
-        id: track.id.clone(),
-        title: track.title.clone(),
-        artist: artist_name,
-        album: album_title,
-        artist_id: track.artist_id.clone(),
-        album_id: track.album_id.clone(),
-        duration_ms: track.duration_ms,
-        track_no: track.track_no,
-        disc_no: track.disc_no,
-        liked: liked_set.contains(&track.id),
-        in_playlists: playlist_set.contains(&track.id),
-    })
+) -> Result<Vec<TrackView>, String> {
+    let artist_ids = tracks
+        .iter()
+        .map(|track| track.artist_id.clone())
+        .collect::<HashSet<_>>();
+    let album_ids = tracks
+        .iter()
+        .map(|track| track.album_id.clone())
+        .collect::<HashSet<_>>();
+    let artist_names = library
+        .artist_name_map(&artist_ids)
+        .map_err(|err| err.to_string())?;
+    let album_titles = library
+        .album_title_map(&album_ids)
+        .map_err(|err| err.to_string())?;
+    Ok(tracks
+        .iter()
+        .map(|track| TrackView {
+            id: track.id.clone(),
+            title: track.title.clone(),
+            artist: artist_names
+                .get(&track.artist_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown Artist".to_string()),
+            album: album_titles
+                .get(&track.album_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown Album".to_string()),
+            artist_id: track.artist_id.clone(),
+            album_id: track.album_id.clone(),
+            duration_ms: track.duration_ms,
+            track_no: track.track_no,
+            disc_no: track.disc_no,
+            liked: liked_set.contains(&track.id),
+            in_playlists: playlist_set.contains(&track.id),
+        })
+        .collect())
 }
 
 pub async fn get_album(
