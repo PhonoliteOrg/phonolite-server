@@ -8,7 +8,7 @@ use notify::{
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
-use crate::scan::{start_cover_sweep, start_enrichment_sweep};
+use crate::scan::start_rescan;
 use crate::state::AppState;
 
 pub fn configure_watcher(state: &AppState, library: &Library) {
@@ -111,24 +111,8 @@ async fn watch_loop(
                     let _ = state
                         .activity
                         .add_activity("Library auto-scan started.");
-                    let library = library.clone();
-                    let rescan_library = library.clone();
-                    match tokio::task::spawn_blocking(move || rescan_library.incremental_scan()).await {
-                        Ok(Ok(stats)) => {
-                            info!(
-                                "Auto-scan complete: {} artists, {} albums, {} tracks",
-                                stats.artists, stats.albums, stats.tracks
-                            );
-                            let _ = state.activity.add_activity(format!(
-                                "Library auto-scan finished: {} artists, {} albums, {} tracks.",
-                                stats.artists, stats.albums, stats.tracks
-                            ));
-                            start_enrichment_sweep(state.clone(), library.clone(), false);
-                            start_cover_sweep(state.clone(), library.clone());
-                        }
-                        Ok(Err(err)) => warn!("Auto-rescan failed: {}", err),
-                        Err(err) => warn!("Auto-rescan join error: {}", err),
-                    }
+                    info!("Library auto-scan dispatching full rescan for correctness");
+                    start_rescan(state.clone(), library.clone(), false);
                     break;
                 }
                 maybe_event = rx.recv() => {

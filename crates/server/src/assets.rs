@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
@@ -21,6 +22,12 @@ pub enum CoverCacheKey {
     Album(String),
     Track(String),
     Artist { id: String, variant: String },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataAssetPruneStats {
+    pub removed_files: usize,
+    pub removed_dirs: usize,
 }
 
 pub fn metadata_root_path(state: &AppState) -> PathBuf {
@@ -191,9 +198,11 @@ pub async fn fetch_cover(source: CoverSource) -> Result<(Vec<u8>, String), Strin
             Ok((data, mime))
         }
         CoverSource::Embedded(path) => {
-            match metadata::read_cover(&path)
-                .map_err(|e| format!("failed to read embedded cover: {:?}", e))?
-            {
+            let art = tokio::task::spawn_blocking(move || metadata::read_cover(&path))
+                .await
+                .map_err(|e| format!("embedded cover task failed: {}", e))?
+                .map_err(|e| format!("failed to read embedded cover: {:?}", e))?;
+            match art {
                 Some(art) => Ok((
                     art.data,
                     art.mime
@@ -226,4 +235,180 @@ pub async fn clear_metadata_assets(state: &AppState) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+pub async fn prune_stale_metadata_assets(
+    state: &AppState,
+    library: &Library,
+) -> Result<MetadataAssetPruneStats, String> {
+    let root = metadata_root_path(state);
+    if !root.exists() {
+        return Ok(MetadataAssetPruneStats::default());
+    }
+
+    let artist_ids = load_artist_ids(library)?;
+    let album_ids = load_album_ids(library)?;
+    let track_ids = load_track_ids(library)?;
+
+    let mut stats = MetadataAssetPruneStats::default();
+    stats.removed_files +=
+        prune_cover_cache(&root.join("covers"), &artist_ids, &album_ids, &track_ids).await?;
+    stats.removed_files += prune_flat_artist_assets(&root.join("logos"), &artist_ids).await?;
+    stats.removed_files += prune_flat_artist_assets(&root.join("banners"), &artist_ids).await?;
+    stats.removed_dirs += prune_legacy_artist_assets(&root.join("artists"), &artist_ids).await?;
+    Ok(stats)
+}
+
+fn load_artist_ids(library: &Library) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    let mut offset = 0usize;
+    let page_size = 500usize;
+    loop {
+        let (items, total) = library
+            .list_artists(None, page_size, offset)
+            .map_err(|e| e.to_string())?;
+        for item in items {
+            ids.insert(item.id);
+        }
+        if ids.len() >= total {
+            break;
+        }
+        offset = ids.len();
+    }
+    Ok(ids)
+}
+
+fn load_album_ids(library: &Library) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    let mut offset = 0usize;
+    let page_size = 500usize;
+    loop {
+        let (items, total) = library
+            .list_albums(None, page_size, offset)
+            .map_err(|e| e.to_string())?;
+        for item in items {
+            ids.insert(item.id);
+        }
+        if ids.len() >= total {
+            break;
+        }
+        offset = ids.len();
+    }
+    Ok(ids)
+}
+
+fn load_track_ids(library: &Library) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    let mut offset = 0usize;
+    let page_size = 1000usize;
+    loop {
+        let (items, total) = library
+            .list_tracks(None, page_size, offset)
+            .map_err(|e| e.to_string())?;
+        for item in items {
+            ids.insert(item.id);
+        }
+        if ids.len() >= total {
+            break;
+        }
+        offset = ids.len();
+    }
+    Ok(ids)
+}
+
+async fn prune_cover_cache(
+    dir: &Path,
+    artist_ids: &HashSet<String>,
+    album_ids: &HashSet<String>,
+    track_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    let mut removed = 0usize;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.to_string()),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let stale = if let Some(id) = stem.strip_prefix("album-") {
+            !album_ids.contains(id)
+        } else if let Some(id) = stem.strip_prefix("track-") {
+            !track_ids.contains(id)
+        } else if let Some(id) = stem.strip_prefix("artist-logo-") {
+            !artist_ids.contains(id)
+        } else if let Some(id) = stem.strip_prefix("artist-banner-") {
+            !artist_ids.contains(id)
+        } else {
+            false
+        };
+        if stale {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| e.to_string())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+async fn prune_flat_artist_assets(
+    dir: &Path,
+    artist_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    let mut removed = 0usize;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.to_string()),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !artist_ids.contains(stem) {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| e.to_string())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+async fn prune_legacy_artist_assets(
+    dir: &Path,
+    artist_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    let mut removed = 0usize;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.to_string()),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !artist_ids.contains(name) {
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(|e| e.to_string())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }

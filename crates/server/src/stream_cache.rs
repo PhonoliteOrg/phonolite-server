@@ -292,12 +292,116 @@ impl CacheWriter {
         Ok(())
     }
 
-    pub fn finalize(mut self) -> io::Result<()> {
+    pub fn finalize(self) -> io::Result<()> {
         let mut state = self.cache.state.lock();
         if !state.aborted && !self.cache.is_cancelled() {
             state.complete = true;
         }
         self.cache.ready.notify_all();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use super::{CacheKey, MemoryCache, StreamCache};
+    use crate::transcode::{TranscodeMode, TranscodeQuality};
+
+    #[test]
+    fn disabled_cache_never_creates_readers_or_writers() {
+        let cache = StreamCache::new(std::path::PathBuf::from("unused"), false);
+        let key = CacheKey::new("track-1", 20, TranscodeMode::Fixed, TranscodeQuality::High);
+
+        assert!(cache.writer(key.clone()).unwrap().is_none());
+        assert!(cache.reader(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn writer_is_exclusive_while_cache_entry_is_alive() {
+        let cache = StreamCache::new(std::path::PathBuf::from("unused"), true);
+        let key = CacheKey::new(
+            "track-2",
+            20,
+            TranscodeMode::Fixed,
+            TranscodeQuality::Medium,
+        );
+
+        let writer = cache.writer(key.clone()).unwrap();
+        let second = cache.writer(key).unwrap();
+
+        assert!(writer.is_some());
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn reader_streams_header_frames_and_eos_after_finalize() {
+        let cache = StreamCache::new(std::path::PathBuf::from("unused"), true);
+        let key = CacheKey::new("track-3", 20, TranscodeMode::Auto, TranscodeQuality::Low);
+
+        let mut writer = cache.writer(key.clone()).unwrap().unwrap();
+        writer.write_header(&[1, 2, 3]).unwrap();
+        writer.write_frame(&[4, 5]).unwrap();
+        writer.write_frame(&[6, 7]).unwrap();
+        let reader = cache.reader(&key).unwrap().unwrap();
+        writer.finalize().unwrap();
+
+        assert!(reader.is_complete());
+        assert!(reader.can_start(0));
+        assert!(!reader.can_start(60));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reader.stream_to(0, &tx).unwrap();
+        drop(tx);
+
+        let payloads = runtime.block_on(async move {
+            let mut payloads = Vec::new();
+            while let Some(item) = rx.recv().await {
+                payloads.push(item.unwrap());
+            }
+            payloads
+        });
+
+        assert_eq!(payloads.len(), 4);
+        assert_eq!(payloads[0], Bytes::from_static(&[1, 2, 3]));
+        assert_eq!(payloads[1], Bytes::from_static(&[4, 5]));
+        assert_eq!(payloads[2], Bytes::from_static(&[6, 7]));
+        assert_eq!(payloads[3], Bytes::from_static(&[0, 0]));
+    }
+
+    #[test]
+    fn dropping_last_cache_guard_cancels_an_incomplete_entry() {
+        let cache = StreamCache::new(std::path::PathBuf::from("unused"), true);
+        let key = CacheKey::new("track-4", 20, TranscodeMode::Fixed, TranscodeQuality::High);
+
+        let mut writer = cache.writer(key.clone()).unwrap().unwrap();
+        writer.write_header(&[1, 2, 3]).unwrap();
+        let reader = cache.reader(&key).unwrap().unwrap();
+
+        let guard = reader.guard();
+        drop(guard);
+
+        assert!(writer.is_cancelled());
+        assert!(writer.write_frame(&[4, 5]).is_err());
+    }
+
+    #[test]
+    fn cache_writer_respects_the_per_entry_memory_limit() {
+        let cache = Arc::new(MemoryCache::new(20, 4));
+        let mut writer = super::CacheWriter { cache };
+
+        writer.write_header(&[1, 2]).unwrap();
+        writer.write_frame(&[3, 4]).unwrap();
+
+        let err = writer.write_frame(&[5]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "memory cache full");
     }
 }

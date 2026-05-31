@@ -22,6 +22,8 @@ use crate::utils::{
 
 use super::{admin_user_from_headers, is_admin};
 
+const LOG_UI_DEFAULT_LINES: usize = 1_000;
+
 #[derive(Deserialize)]
 pub struct LogTailQuery {
     pub lines: Option<usize>,
@@ -85,7 +87,7 @@ pub async fn admin_logs(State(state): State<AppState>, headers: HeaderMap) -> Re
         template,
         &[
             ("log_dir", escape_html(&log_dir.to_string_lossy())),
-            ("log_limit", LOG_MAX_LINES.to_string()),
+            ("log_limit", LOG_UI_DEFAULT_LINES.to_string()),
             ("log_debug_checked", log_debug_checked),
         ],
     );
@@ -150,16 +152,29 @@ pub async fn admin_logs_tail(
     }
 
     let log_dir = resolve_path(&state.config_path, &state.config.read().log_dir);
-    let limit = query.lines.unwrap_or(LOG_MAX_LINES).min(LOG_MAX_LINES);
+    let limit = query
+        .lines
+        .unwrap_or(LOG_UI_DEFAULT_LINES)
+        .min(LOG_MAX_LINES);
     let view = query.view.as_deref().unwrap_or("all");
     let log_path = log_file_for_view(&log_dir, view);
-    match read_log_tail(&log_path, limit) {
-        Ok((lines, total, updated_at)) => (
+    let result = tokio::task::spawn_blocking(move || read_log_tail(&log_path, limit)).await;
+    match result {
+        Ok(Ok((lines, total, updated_at))) => (
             StatusCode::OK,
             Json(LogTailResponse {
                 lines,
                 total,
                 updated_at,
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(LogTailResponse {
+                lines: vec![format!("Failed to read logs: {}", err)],
+                total: 1,
+                updated_at: 0,
             }),
         )
             .into_response(),
@@ -172,38 +187,6 @@ pub async fn admin_logs_tail(
             }),
         )
             .into_response(),
-    }
-}
-
-pub async fn admin_logs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !state.auth.has_admin().unwrap_or(false) {
-        return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized");
-    }
-    let user = match admin_user_from_headers(&state, &headers) {
-        Ok(Some(user)) => user,
-        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
-        Err(err) => {
-            return json_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("auth error: {}", err),
-            )
-        }
-    };
-    if !is_admin(&user) {
-        return json_error_response(StatusCode::FORBIDDEN, "forbidden");
-    }
-
-    if let Err(err) = state.log_control.clear_all() {
-        return json_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to clear logs: {}", err),
-        );
-    }
-
-    if wants_json(&headers) {
-        json_ok_response()
-    } else {
-        redirect_to("/logs")
     }
 }
 
@@ -237,4 +220,35 @@ fn log_file_for_view(log_dir: &PathBuf, view: &str) -> PathBuf {
         _ => LOG_ALL_FILE,
     };
     log_dir.join(name)
+}
+pub async fn admin_logs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.has_admin().unwrap_or(false) {
+        return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let user = match admin_user_from_headers(&state, &headers) {
+        Ok(Some(user)) => user,
+        Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+        Err(err) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("auth error: {}", err),
+            )
+        }
+    };
+    if !is_admin(&user) {
+        return json_error_response(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    if let Err(err) = state.log_control.clear_all() {
+        return json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to clear logs: {}", err),
+        );
+    }
+
+    if wants_json(&headers) {
+        json_ok_response()
+    } else {
+        redirect_to("/logs")
+    }
 }

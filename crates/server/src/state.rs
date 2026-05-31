@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::activity_store::ActivityStore;
 use crate::auth::{AuthStore, AuthUser};
 use crate::config::ServerConfig;
+use crate::download_jobs::DownloadJobStore;
 use crate::logging::LogControl;
+use crate::metadata_events::MetadataEventBus;
 use crate::stats_store::StatsStore;
 use crate::stream_cache::StreamCache;
 use crate::stream_sessions::StreamSessions;
@@ -35,6 +37,8 @@ pub struct AppState {
     pub external_client: Client,
     pub stream_sessions: StreamSessions,
     pub stream_cache: StreamCache,
+    pub metadata_events: MetadataEventBus,
+    pub download_jobs: DownloadJobStore,
 }
 
 #[derive(Clone)]

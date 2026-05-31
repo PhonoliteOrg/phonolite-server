@@ -444,7 +444,10 @@ fn format_bind_target(host: &str, port: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_target, parse_port, split_bind_addr};
+    use super::{
+        bind_target, normalize_music_roots, parse_port, split_bind_addr, MusicRootConfig,
+        ServerConfig,
+    };
 
     #[test]
     fn parse_legacy_ipv4_bind_addr() {
@@ -464,5 +467,59 @@ mod tests {
     #[test]
     fn format_ipv6_bind_target() {
         assert_eq!(bind_target(Some("::"), 3000), "[::]:3000");
+    }
+
+    #[test]
+    fn bind_target_defaults_to_all_interfaces() {
+        assert_eq!(bind_target(None, 3000), "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn normalize_music_roots_migrates_legacy_root_when_list_is_empty() {
+        let mut config = ServerConfig {
+            music_root: "D:/music".to_string(),
+            music_roots: Vec::new(),
+            ..ServerConfig::default()
+        };
+
+        normalize_music_roots(&mut config);
+
+        assert_eq!(config.music_roots.len(), 1);
+        assert_eq!(config.music_roots[0].id, "");
+        assert_eq!(config.music_roots[0].path, "D:/music");
+        assert_eq!(config.music_root, "D:/music");
+    }
+
+    #[test]
+    fn normalize_music_roots_assigns_unique_ids_after_the_default_root() {
+        let mut config = ServerConfig {
+            music_roots: vec![
+                MusicRootConfig {
+                    id: "".to_string(),
+                    path: "D:/music".to_string(),
+                },
+                MusicRootConfig {
+                    id: "".to_string(),
+                    path: "E:/music".to_string(),
+                },
+                MusicRootConfig {
+                    id: "dup".to_string(),
+                    path: "F:/music".to_string(),
+                },
+                MusicRootConfig {
+                    id: "dup".to_string(),
+                    path: "G:/music".to_string(),
+                },
+            ],
+            ..ServerConfig::default()
+        };
+
+        normalize_music_roots(&mut config);
+
+        assert_eq!(config.music_roots[0].id, "");
+        assert!(!config.music_roots[1].id.is_empty());
+        assert_eq!(config.music_roots[2].id, "dup");
+        assert_ne!(config.music_roots[3].id, "dup");
+        assert_eq!(config.music_root, "D:/music");
     }
 }

@@ -1,10 +1,12 @@
 pub mod auth;
 pub mod browse;
+pub mod download_v2;
 pub mod library;
 pub mod player;
 pub mod server;
 pub mod stats;
 pub mod user_data;
+pub mod views;
 
 use crate::state::LibraryStatus;
 use ::library::Library;
@@ -29,8 +31,19 @@ pub fn api_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/library/search", get(library::search))
+        .route("/library/v2/events", get(download_v2::metadata_events))
+        .route(
+            "/library/v2/metadata/snapshots/:kind/:id",
+            get(download_v2::metadata_snapshot),
+        )
         .route("/library/shuffle", get(library::shuffle_tracks))
+        .route("/library/metadata-events", get(library::metadata_events))
         .route("/library/albums/:album_id", get(library::get_album))
+        .route(
+            "/library/tracks/:track_id/offline-metadata",
+            get(library::get_offline_track_metadata),
+        )
+        .route("/library/match-tracks", post(library::match_tracks))
         .route("/library/playlists", get(user_data::list_playlists))
         .route("/library/playlists", post(user_data::create_playlist))
         .route(
@@ -41,10 +54,31 @@ pub fn api_router(state: AppState) -> Router {
             "/library/playlists/:playlist_id",
             axum::routing::delete(user_data::delete_playlist),
         )
+        .route("/library/likes/batch", post(user_data::batch_update_likes))
         .route("/library/likes/:track_id", post(user_data::add_like))
         .route(
             "/library/likes/:track_id",
             axum::routing::delete(user_data::remove_like),
+        )
+        .route("/download/batches", post(library::create_download_batch))
+        .route("/download/tracks/:track_id", get(library::download_track))
+        .route("/download/v2/jobs", post(download_v2::create_download_job))
+        .route("/download/v2/jobs", get(download_v2::list_download_jobs))
+        .route(
+            "/download/v2/jobs/:job_id",
+            get(download_v2::get_download_job),
+        )
+        .route(
+            "/download/v2/jobs/:job_id/actions",
+            post(download_v2::apply_download_job_action),
+        )
+        .route(
+            "/download/v2/jobs/:job_id/events",
+            get(download_v2::download_job_events),
+        )
+        .route(
+            "/download/v2/tracks/:track_id/file",
+            get(download_v2::download_track_file),
         )
         .route("/browse/artists", get(browse::list_artists))
         .route("/browse/artists/:artist_id", get(browse::get_artist))
@@ -77,6 +111,7 @@ pub fn api_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/server/capabilities", get(download_v2::get_capabilities))
         .route("/server/ports", get(server::get_ports))
         .merge(auth)
         .merge(protected)

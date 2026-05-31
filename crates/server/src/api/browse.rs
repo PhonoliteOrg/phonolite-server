@@ -5,59 +5,23 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use common::Artist;
-use serde::Serialize;
 
 use crate::state::{AppState, ArtistQuery, AuthContext, JsonResult, ListResponse, Playlist};
 use crate::utils::json_error;
 
-use super::library_or_json_error;
-
-#[derive(Serialize)]
-pub struct BrowseArtist {
-    pub id: String,
-    pub name: String,
-    pub genres: Vec<String>,
-    pub album_count: usize,
-    pub summary: Option<String>,
-    pub logo_ref: Option<String>,
-    pub banner_ref: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct BrowseAlbum {
-    pub id: String,
-    pub artist_id: String,
-    pub artist_ids: Vec<String>,
-    pub artist_name: String,
-    pub artist_names: Vec<String>,
-    pub title: String,
-    pub year: Option<i32>,
-    pub genres: Vec<String>,
-    pub track_count: usize,
-    pub summary: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-pub struct TrackView {
-    pub id: String,
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub artist_id: String,
-    pub album_id: String,
-    pub duration_ms: u32,
-    pub track_no: Option<u16>,
-    pub disc_no: Option<u16>,
-    pub liked: bool,
-    pub in_playlists: bool,
-}
+use super::{
+    library_or_json_error,
+    views::{
+        build_album_views, build_artist_view, build_artist_views, build_track_views, AlbumView,
+        ArtistView, TrackView,
+    },
+};
 
 pub async fn list_artists(
     State(state): State<AppState>,
     Extension(_ctx): Extension<AuthContext>,
     Query(params): Query<ArtistQuery>,
-) -> JsonResult<ListResponse<BrowseArtist>> {
+) -> JsonResult<ListResponse<ArtistView>> {
     let library = library_or_json_error(&state)?;
     let limit = params.limit.unwrap_or(200).max(1);
     let offset = params.offset.unwrap_or(0);
@@ -73,33 +37,8 @@ pub async fn list_artists(
         }
     };
 
-    let artist_ids = artists
-        .iter()
-        .map(|artist| artist.id.clone())
-        .collect::<Vec<_>>();
-    let album_counts = match library.artist_album_counts(&artist_ids) {
-        Ok(value) => value,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-
-    let mut items = Vec::with_capacity(artists.len());
-    for artist in artists {
-        let album_count = album_counts.get(&artist.id).copied().unwrap_or(0);
-        items.push(BrowseArtist {
-            id: artist.id,
-            name: artist.name,
-            genres: artist.genres,
-            album_count,
-            summary: artist.summary,
-            logo_ref: artist.logo_ref,
-            banner_ref: artist.banner_ref,
-        });
-    }
+    let items = build_artist_views(&library, artists)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     Ok(Json(ListResponse { items, total }))
 }
@@ -108,9 +47,9 @@ pub async fn list_artist_albums(
     State(state): State<AppState>,
     Extension(_ctx): Extension<AuthContext>,
     AxumPath(artist_id): AxumPath<String>,
-) -> JsonResult<Vec<BrowseAlbum>> {
+) -> JsonResult<Vec<AlbumView>> {
     let library = library_or_json_error(&state)?;
-    let artist = match library.get_artist(&artist_id) {
+    let _artist = match library.get_artist(&artist_id) {
         Ok(Some(artist)) => artist,
         Ok(None) => {
             return Err(json_error(
@@ -135,57 +74,21 @@ pub async fn list_artist_albums(
         }
     };
 
-    let album_ids = albums
-        .iter()
-        .map(|album| album.id.clone())
-        .collect::<Vec<_>>();
-    let track_counts = match library.album_track_counts(&album_ids) {
-        Ok(value) => value,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-
-    let mut items = Vec::with_capacity(albums.len());
-    for album in albums {
-        let artist_name = album_artist_name(&album, Some(artist.name.clone()));
-        let track_count = track_counts.get(&album.id).copied().unwrap_or(0);
-        items.push(BrowseAlbum {
-            id: album.id,
-            artist_id: album.artist_id.clone(),
-            artist_ids: album.artist_ids.clone(),
-            artist_name,
-            artist_names: album.artist_names.clone(),
-            title: album.title,
-            year: album.year,
-            genres: album.genres,
-            track_count,
-            summary: album.summary,
-        });
-    }
+    let items = build_album_views(&library, albums)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(items))
-}
-
-fn album_artist_name(album: &common::Album, fallback: Option<String>) -> String {
-    let display = album.artist_display_name();
-    if !display.trim().is_empty() {
-        display
-    } else {
-        fallback.unwrap_or_else(|| "Unknown Artist".to_string())
-    }
 }
 
 pub async fn get_artist(
     State(state): State<AppState>,
     Extension(_ctx): Extension<AuthContext>,
     AxumPath(artist_id): AxumPath<String>,
-) -> JsonResult<Artist> {
+) -> JsonResult<ArtistView> {
     let library = library_or_json_error(&state)?;
     match library.get_artist(&artist_id) {
-        Ok(Some(artist)) => Ok(Json(artist)),
+        Ok(Some(artist)) => build_artist_view(&library, artist)
+            .map(Json)
+            .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err)),
         Ok(None) => Err(json_error(
             StatusCode::NOT_FOUND,
             "artist not found".to_string(),
@@ -353,49 +256,4 @@ fn playlist_track_ids(playlists: &[Playlist]) -> HashSet<String> {
         }
     }
     ids
-}
-
-fn build_track_views(
-    library: &library::Library,
-    tracks: &[common::Track],
-    liked_set: &HashSet<String>,
-    playlist_set: &HashSet<String>,
-) -> Result<Vec<TrackView>, String> {
-    let artist_ids = tracks
-        .iter()
-        .map(|track| track.artist_id.clone())
-        .collect::<HashSet<_>>();
-    let album_ids = tracks
-        .iter()
-        .map(|track| track.album_id.clone())
-        .collect::<HashSet<_>>();
-    let artist_names = library
-        .artist_name_map(&artist_ids)
-        .map_err(|err| err.to_string())?;
-    let album_titles = library
-        .album_title_map(&album_ids)
-        .map_err(|err| err.to_string())?;
-
-    Ok(tracks
-        .iter()
-        .map(|track| TrackView {
-            id: track.id.clone(),
-            title: track.title.clone(),
-            artist: artist_names
-                .get(&track.artist_id)
-                .cloned()
-                .unwrap_or_else(|| "Unknown Artist".to_string()),
-            album: album_titles
-                .get(&track.album_id)
-                .cloned()
-                .unwrap_or_else(|| "Unknown Album".to_string()),
-            artist_id: track.artist_id.clone(),
-            album_id: track.album_id.clone(),
-            duration_ms: track.duration_ms,
-            track_no: track.track_no,
-            disc_no: track.disc_no,
-            liked: liked_set.contains(&track.id),
-            in_playlists: playlist_set.contains(&track.id),
-        })
-        .collect())
 }

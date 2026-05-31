@@ -1,7 +1,9 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::warn;
 
 use crate::musicbrainz_rate_limit;
 
@@ -48,11 +50,23 @@ pub async fn fetch_artist(
 ) -> Result<Option<ExternalMetadata>, String> {
     let mut combined = ExternalMetadata::default();
     let mut found = false;
+    let mut last_error: Option<String> = None;
     for source in &config.sources {
         let result = match source.provider {
             Provider::TheAudioDb => fetch_theaudiodb_artist(client, source, artist_name).await,
             Provider::MusicBrainz => fetch_musicbrainz_artist(client, source, artist_name).await,
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    "External artist metadata source {:?} failed for '{}': {}",
+                    source.provider, artist_name, err
+                );
+                last_error = Some(err);
+                continue;
+            }
+        };
         if let Some(metadata) = result {
             merge_metadata(&mut combined, metadata, source.provider);
             found = true;
@@ -60,6 +74,8 @@ pub async fn fetch_artist(
     }
     if found {
         Ok(Some(combined))
+    } else if let Some(err) = last_error {
+        Err(err)
     } else {
         Ok(None)
     }
@@ -73,6 +89,7 @@ pub async fn fetch_album(
 ) -> Result<Option<ExternalMetadata>, String> {
     let mut combined = ExternalMetadata::default();
     let mut found = false;
+    let mut last_error: Option<String> = None;
     for source in &config.sources {
         let result = match source.provider {
             Provider::TheAudioDb => {
@@ -81,7 +98,18 @@ pub async fn fetch_album(
             Provider::MusicBrainz => {
                 fetch_musicbrainz_album(client, source, artist_name, album_title).await
             }
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    "External album metadata source {:?} failed for '{} - {}': {}",
+                    source.provider, artist_name, album_title, err
+                );
+                last_error = Some(err);
+                continue;
+            }
+        };
         if let Some(metadata) = result {
             merge_metadata(&mut combined, metadata, source.provider);
             found = true;
@@ -89,6 +117,8 @@ pub async fn fetch_album(
     }
     if found {
         Ok(Some(combined))
+    } else if let Some(err) = last_error {
+        Err(err)
     } else {
         Ok(None)
     }
@@ -174,6 +204,8 @@ struct TheAudioDbArtist {
     fanart3: Option<String>,
     #[serde(rename = "strArtistFanart4")]
     fanart4: Option<String>,
+    #[serde(flatten)]
+    fields: HashMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +221,8 @@ struct TheAudioDbAlbum {
     genre: Option<String>,
     #[serde(rename = "strStyle")]
     style: Option<String>,
+    #[serde(flatten)]
+    fields: HashMap<String, Value>,
 }
 
 async fn fetch_theaudiodb_artist(
@@ -203,7 +237,7 @@ async fn fetch_theaudiodb_artist(
     let url = format!(
         "https://www.theaudiodb.com/api/v1/json/{}/search.php?s={}",
         api_key,
-        url_escape(artist_name)
+        url_escape(artist_name.trim())
     );
     let response = client
         .get(&url)
@@ -218,12 +252,18 @@ async fn fetch_theaudiodb_artist(
         .json::<TheAudioDbArtistResponse>()
         .await
         .map_err(|err| err.to_string())?;
-    let artist = match payload.artists.and_then(|mut items| items.pop()) {
+    let artist = match payload.artists.and_then(|items| items.into_iter().next()) {
         Some(artist) => artist,
         None => return Ok(None),
     };
 
-    let summary = clean_text(artist.bio);
+    let summary = clean_text_field(artist.bio, &artist.fields, "strBiography");
+    if summary.is_none() {
+        warn!(
+            "TheAudioDB returned no artist description for '{}'",
+            artist_name
+        );
+    }
     let genres = collect_genres(&[artist.genre, artist.style]);
     let thumb = artist.thumb.clone();
     let logo_url = clean_url(artist.logo)
@@ -255,10 +295,46 @@ async fn fetch_theaudiodb_album(
     if api_key.is_empty() {
         return Ok(None);
     }
+    let mut best = None;
+    for candidate in album_title_candidates(album_title) {
+        let metadata =
+            fetch_theaudiodb_album_candidate(client, source, api_key, artist_name, &candidate)
+                .await?;
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        if metadata.summary.is_some() {
+            return Ok(Some(metadata));
+        }
+        if best.is_none() {
+            best = Some(metadata);
+        }
+    }
+    if best
+        .as_ref()
+        .and_then(|metadata| metadata.summary.as_ref())
+        .is_none()
+    {
+        warn!(
+            "TheAudioDB returned no album description for '{} - {}'",
+            artist_name,
+            album_title.trim()
+        );
+    }
+    Ok(best)
+}
+
+async fn fetch_theaudiodb_album_candidate(
+    client: &Client,
+    source: &ExternalSource,
+    api_key: &str,
+    artist_name: &str,
+    album_title: &str,
+) -> Result<Option<ExternalMetadata>, String> {
     let url = format!(
         "https://www.theaudiodb.com/api/v1/json/{}/searchalbum.php?s={}&a={}",
         api_key,
-        url_escape(artist_name),
+        url_escape(artist_name.trim()),
         url_escape(album_title)
     );
     let response = client
@@ -274,12 +350,12 @@ async fn fetch_theaudiodb_album(
         .json::<TheAudioDbAlbumResponse>()
         .await
         .map_err(|err| err.to_string())?;
-    let album = match payload.album.and_then(|mut items| items.pop()) {
+    let album = match payload.album.and_then(|items| items.into_iter().next()) {
         Some(album) => album,
         None => return Ok(None),
     };
 
-    let summary = clean_text(album.description);
+    let summary = clean_text_field(album.description, &album.fields, "strDescription");
     let genres = collect_genres(&[album.genre, album.style]);
     Ok(Some(ExternalMetadata {
         summary,
@@ -331,7 +407,7 @@ async fn fetch_musicbrainz_artist(
     );
     let payload: MusicBrainzArtistResponse =
         fetch_musicbrainz_json(client, source, &url, user_agent).await?;
-    let artist = match payload.artists.and_then(|mut items| items.pop()) {
+    let artist = match payload.artists.and_then(|items| items.into_iter().next()) {
         Some(artist) => artist,
         None => return Ok(None),
     };
@@ -362,7 +438,10 @@ async fn fetch_musicbrainz_album(
     );
     let payload: MusicBrainzReleaseGroupResponse =
         fetch_musicbrainz_json(client, source, &url, user_agent).await?;
-    let album = match payload.release_groups.and_then(|mut items| items.pop()) {
+    let album = match payload
+        .release_groups
+        .and_then(|items| items.into_iter().next())
+    {
         Some(album) => album,
         None => return Ok(None),
     };
@@ -451,18 +530,7 @@ fn collect_genres(values: &[Option<String>]) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
         if let Some(value) = clean_text(value.clone()) {
-            for part in value.split(&[';', ',', '/', '|'][..]) {
-                let trimmed = part.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if !out
-                    .iter()
-                    .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
-                {
-                    out.push(trimmed.to_string());
-                }
-            }
+            add_genre_parts(&mut out, &value);
         }
     }
     out
@@ -475,33 +543,51 @@ fn collect_tag_genres(tags: Option<Vec<MusicBrainzTag>>) -> Vec<String> {
         None => return out,
     };
     for tag in tags {
-        let name = tag.name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        if !out
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
-        {
-            out.push(name.to_string());
-        }
+        add_genre_parts(&mut out, &tag.name);
     }
     out
 }
 
-fn merge_metadata(base: &mut ExternalMetadata, incoming: ExternalMetadata, provider: Provider) {
-    let mut prefer = false;
-    if matches!(provider, Provider::MusicBrainz) {
-        prefer = true;
+fn add_genre_parts(out: &mut Vec<String>, value: &str) {
+    let value = normalize_genre_separators(value);
+    for part in value.split(&[';', ',', '/', '|', '\0'][..]) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+        {
+            out.push(trimmed.to_string());
+        }
     }
+}
+
+fn normalize_genre_separators(value: &str) -> String {
+    value
+        .replace("&bull;", "|")
+        .replace("&#8226;", "|")
+        .replace("&#x2022;", "|")
+        .replace("&middot;", "|")
+        .replace("\u{2022}", "|")
+        .replace("\u{00B7}", "|")
+        .replace("\u{00E2}\u{20AC}\u{00A2}", "|")
+        .replace("\u{00E2}\u{0080}\u{00A2}", "|")
+        .replace("\u{00C2}\u{20AC}\u{00A2}", "|")
+}
+
+fn merge_metadata(base: &mut ExternalMetadata, incoming: ExternalMetadata, provider: Provider) {
+    let prefer_summary = matches!(provider, Provider::TheAudioDb);
+    let prefer_genres = matches!(provider, Provider::MusicBrainz);
 
     if let Some(summary) = incoming.summary {
-        if prefer || base.summary.is_none() {
+        if prefer_summary || base.summary.is_none() {
             base.summary = Some(summary);
         }
     }
     if !incoming.genres.is_empty() {
-        if prefer || base.genres.is_empty() {
+        if prefer_genres || base.genres.is_empty() {
             base.genres = incoming.genres;
         }
     }
@@ -511,6 +597,93 @@ fn merge_metadata(base: &mut ExternalMetadata, incoming: ExternalMetadata, provi
     if base.banner_url.is_none() {
         base.banner_url = incoming.banner_url;
     }
+}
+
+fn album_title_candidates(title: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = title.trim().to_string();
+    add_unique_candidate(&mut out, &current);
+
+    loop {
+        let Some(stripped) = strip_trailing_release_qualifier(&current) else {
+            break;
+        };
+        current = stripped;
+        add_unique_candidate(&mut out, &current);
+    }
+
+    out
+}
+
+fn add_unique_candidate(out: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !out
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+    {
+        out.push(trimmed.to_string());
+    }
+}
+
+fn strip_trailing_release_qualifier(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (open, close) = match trimmed.chars().last()? {
+        ')' => ('(', ')'),
+        ']' => ('[', ']'),
+        _ => return None,
+    };
+    let start = trimmed.rfind(open)?;
+    let qualifier = trimmed[start + open.len_utf8()..trimmed.len() - close.len_utf8()].trim();
+    if !is_release_qualifier(qualifier) {
+        return None;
+    }
+    let stripped = trimmed[..start].trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+fn is_release_qualifier(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let digits = lower.chars().filter(|ch| ch.is_ascii_digit()).count();
+    digits >= 4
+        || lower.contains("remaster")
+        || lower.contains("deluxe")
+        || lower.contains("hi-res")
+        || lower.contains("hi res")
+        || lower.contains("version")
+        || lower.contains("edition")
+        || lower.contains("anniversary")
+}
+
+fn clean_text_field(
+    primary: Option<String>,
+    fields: &HashMap<String, Value>,
+    prefix: &str,
+) -> Option<String> {
+    if let Some(value) = clean_text(primary) {
+        return Some(value);
+    }
+
+    let mut keys = fields
+        .keys()
+        .filter(|key| key.starts_with(prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        if let Some(value) = fields.get(&key).and_then(Value::as_str) {
+            if let Some(value) = clean_text(Some(value.to_string())) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn clean_text(value: Option<String>) -> Option<String> {
@@ -545,4 +718,108 @@ fn url_escape(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::Value;
+
+    use super::*;
+
+    #[test]
+    fn collect_genres_splits_bullets_and_mojibake() {
+        let genres = collect_genres(&[Some(
+            "Rock \u{2022} Alternative Rock \u{00C2}\u{20AC}\u{00A2} Nu Metal".to_string(),
+        )]);
+
+        assert_eq!(genres, vec!["Rock", "Alternative Rock", "Nu Metal"]);
+    }
+
+    #[test]
+    fn clean_text_field_uses_localized_fallback() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "strBiographyDE".to_string(),
+            Value::String(" Deutsche Bio ".to_string()),
+        );
+
+        assert_eq!(
+            clean_text_field(None, &fields, "strBiography").as_deref(),
+            Some("Deutsche Bio")
+        );
+        assert_eq!(
+            clean_text_field(Some(" English Bio ".to_string()), &fields, "strBiography").as_deref(),
+            Some("English Bio")
+        );
+    }
+
+    #[test]
+    fn album_title_candidates_trim_and_remove_release_qualifiers() {
+        assert_eq!(
+            album_title_candidates("Californication "),
+            vec!["Californication"]
+        );
+        assert_eq!(
+            album_title_candidates("Chopin : Nocturnes (1999 remastered)"),
+            vec!["Chopin : Nocturnes (1999 remastered)", "Chopin : Nocturnes"]
+        );
+        assert_eq!(
+            album_title_candidates("System Of A Down (Deluxe)"),
+            vec!["System Of A Down (Deluxe)", "System Of A Down"]
+        );
+        assert_eq!(
+            album_title_candidates("Automaton (Hi-Res Version)"),
+            vec!["Automaton (Hi-Res Version)", "Automaton"]
+        );
+    }
+
+    #[test]
+    fn musicbrainz_genres_do_not_replace_existing_summary() {
+        let mut base = ExternalMetadata {
+            summary: Some("Full TheAudioDB biography".to_string()),
+            genres: vec!["Rock".to_string()],
+            ..ExternalMetadata::default()
+        };
+        let incoming = ExternalMetadata {
+            summary: Some("MusicBrainz disambiguation".to_string()),
+            genres: vec!["Alternative".to_string()],
+            ..ExternalMetadata::default()
+        };
+
+        merge_metadata(&mut base, incoming, Provider::MusicBrainz);
+
+        assert_eq!(base.summary.as_deref(), Some("Full TheAudioDB biography"));
+        assert_eq!(base.genres, vec!["Alternative"]);
+    }
+
+    #[test]
+    fn summaries_fill_empty_values() {
+        let mut base = ExternalMetadata::default();
+        let incoming = ExternalMetadata {
+            summary: Some("Fallback summary".to_string()),
+            ..ExternalMetadata::default()
+        };
+
+        merge_metadata(&mut base, incoming, Provider::MusicBrainz);
+
+        assert_eq!(base.summary.as_deref(), Some("Fallback summary"));
+    }
+
+    #[test]
+    fn theaudiodb_summary_replaces_musicbrainz_fallback() {
+        let mut base = ExternalMetadata {
+            summary: Some("MusicBrainz disambiguation".to_string()),
+            ..ExternalMetadata::default()
+        };
+        let incoming = ExternalMetadata {
+            summary: Some("Full TheAudioDB biography".to_string()),
+            ..ExternalMetadata::default()
+        };
+
+        merge_metadata(&mut base, incoming, Provider::TheAudioDb);
+
+        assert_eq!(base.summary.as_deref(), Some("Full TheAudioDB biography"));
+    }
 }

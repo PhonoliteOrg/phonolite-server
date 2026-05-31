@@ -148,8 +148,12 @@
       <input name="external_metadata_on_tag_error" type="checkbox" {{external_tag_error_checked}} />
       Enrich when tag reading fails
     </label>
-    <label>Max items to enrich per scan</label>
+    <label>Max items to enrich per scan phase</label>
     <input name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
+    <p class="hint">
+      Normal scans apply this limit separately to artists, MusicBrainz album-artist fixes, and albums.
+      Reindex ignores the limit.
+    </p>
   </div>
 </form>
 <div class="card">

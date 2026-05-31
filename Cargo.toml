@@ -6,7 +6,6 @@ members = [
   "crates/library",
   "crates/codecs_ffi",
   "crates/server",
-  "crates/quic_client",
   "tools",
 ]
 

@@ -3,9 +3,31 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, CreatePlaylistRequest, JsonResult, Playlist, UpdatePlaylistRequest};
+use crate::user_data::LikeState;
 use crate::utils::json_error;
+
+#[derive(Debug, Deserialize)]
+pub struct BatchLikeRequest {
+    #[serde(default)]
+    pub items: Vec<BatchLikeUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchLikeUpdate {
+    pub track_id: String,
+    pub liked: bool,
+    pub updated_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LikeStateView {
+    pub track_id: String,
+    pub liked: bool,
+    pub updated_at: u64,
+}
 
 pub async fn list_playlists(State(state): State<AppState>) -> JsonResult<Vec<Playlist>> {
     let playlists = state
@@ -88,4 +110,34 @@ pub async fn remove_like(
         .remove_like(&track_id)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
     Ok(Json(()))
+}
+
+pub async fn batch_update_likes(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchLikeRequest>,
+) -> JsonResult<Vec<LikeStateView>> {
+    if payload.items.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let mut out = Vec::new();
+    for item in payload.items {
+        let track_id = item.track_id.trim();
+        if track_id.is_empty() {
+            continue;
+        }
+        let like_state = state
+            .user_data
+            .set_like_state_with_updated_at(track_id, item.liked, item.updated_at)
+            .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
+        out.push(like_state_view(track_id.to_string(), like_state));
+    }
+    Ok(Json(out))
+}
+
+pub(crate) fn like_state_view(track_id: String, state: LikeState) -> LikeStateView {
+    LikeStateView {
+        track_id,
+        liked: state.liked,
+        updated_at: state.updated_at,
+    }
 }

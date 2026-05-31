@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use crate::config::{bind_target, resolve_path, ServerConfig};
 use crate::state::AppState;
 use crate::stream_cache::{CacheGuard, CacheKey};
+use crate::stream_sessions::StreamSessionHandle;
 use crate::streaming::{
     build_raw_opus_meta, parse_frame_ms, parse_transcode_mode, parse_transcode_quality,
     transcode_mode_label, transcode_quality_label,
@@ -25,6 +26,7 @@ const CONTROL_STREAM_MAX_LINE: usize = 64 * 1024;
 const MAX_STREAM_BUFFER_BYTES: usize = 6 * 1024 * 1024;
 const SEEK_RESET_MARKER: u16 = 0xFFFF;
 const SEEK_RECOVERY_TARGET_MS: u32 = 400;
+const PREFETCH_TRACK_LIMIT: usize = 1;
 const STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const STATS_MAX_PLAYBACK_DELTA_MS: u64 = 15_000;
 
@@ -41,8 +43,6 @@ enum ControlMessage {
         frame_ms: Option<u32>,
         queue: Option<Vec<String>>,
     },
-    #[serde(rename = "queue")]
-    Queue { track_ids: Vec<String> },
     #[serde(rename = "advance")]
     Advance,
     #[serde(rename = "buffer")]
@@ -153,11 +153,13 @@ impl ControlOutbox {
 
 struct OutgoingStream {
     stream_id: u64,
+    generation: u64,
     track_id: String,
     role: StreamRole,
     frame_ms: u32,
     mode: TranscodeMode,
     quality: TranscodeQuality,
+    adaptive_session: Option<StreamSessionHandle>,
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
     cmd_tx: Option<mpsc::Sender<TranscodeCommand>>,
     cache_guard: Option<CacheGuard>,
@@ -175,11 +177,13 @@ struct OutgoingStream {
 impl OutgoingStream {
     fn new(
         stream_id: u64,
+        generation: u64,
         track_id: String,
         role: StreamRole,
         frame_ms: u32,
         mode: TranscodeMode,
         quality: TranscodeQuality,
+        adaptive_session: Option<StreamSessionHandle>,
         rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
         cmd_tx: Option<mpsc::Sender<TranscodeCommand>>,
         cache_guard: Option<CacheGuard>,
@@ -187,11 +191,13 @@ impl OutgoingStream {
         let now = Instant::now();
         Self {
             stream_id,
+            generation,
             track_id,
             role,
             frame_ms,
             mode,
             quality,
+            adaptive_session,
             rx,
             cmd_tx,
             cache_guard,
@@ -245,6 +251,7 @@ struct SessionState {
     control_outbox: ControlOutbox,
     control_parser: ControlParser,
     next_uni_stream_id: u64,
+    stream_generation: u64,
     active_track: Option<String>,
     queue: VecDeque<String>,
     outgoing: HashMap<u64, OutgoingStream>,
@@ -271,6 +278,7 @@ impl SessionState {
             control_outbox: ControlOutbox::new(),
             control_parser: ControlParser::new(),
             next_uni_stream_id: 3,
+            stream_generation: 0,
             active_track: None,
             queue: VecDeque::new(),
             outgoing: HashMap::new(),
@@ -293,6 +301,11 @@ impl SessionState {
         let id = self.next_uni_stream_id;
         self.next_uni_stream_id = self.next_uni_stream_id.saturating_add(4);
         id
+    }
+
+    fn bump_stream_generation(&mut self) -> u64 {
+        self.stream_generation = self.stream_generation.saturating_add(1);
+        self.stream_generation
     }
 }
 
@@ -689,6 +702,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 );
                 return;
             }
+            let generation = client.session.bump_stream_generation();
             client.session.active_track = Some(track_id.clone());
             if let Some(queue) = queue {
                 client.session.queue = queue.into();
@@ -696,7 +710,12 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 client.session.queue.push_back(track_id.clone());
             }
             ensure_active_in_queue(&mut client.session);
-            promote_existing_stream(&mut client.session, &track_id, StreamRole::Active);
+            promote_existing_stream(
+                &mut client.session,
+                &track_id,
+                StreamRole::Active,
+                generation,
+            );
             prune_streams(&mut client.session, &mut client.conn);
             let frame_ms = frame_ms.unwrap_or(20);
             if !client.session.track_streams.contains_key(&track_id) {
@@ -721,30 +740,28 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     track_id: &track_id,
                 },
             );
-            prebuffer_next_two(state, client, mode.as_deref(), quality.as_deref(), frame_ms);
-        }
-        ControlMessage::Queue { track_ids } => {
-            client.session.queue = track_ids.into();
-            ensure_active_in_queue(&mut client.session);
-            prune_streams(&mut client.session, &mut client.conn);
-            let frame_ms = active_frame_ms(&client.session);
-            prebuffer_next_two(state, client, None, None, frame_ms);
+            prebuffer_next_tracks(state, client, mode.as_deref(), quality.as_deref(), frame_ms);
         }
         ControlMessage::Advance => {
             if let Some(next) = next_track_in_queue(&client.session) {
+                let generation = client.session.bump_stream_generation();
                 let frame_ms = active_frame_ms(&client.session);
                 client.session.active_track = Some(next.clone());
-                let _ = start_track_stream(
-                    state,
-                    client,
-                    next,
-                    StreamRole::Active,
-                    frame_ms,
-                    0,
-                    None,
-                    None,
-                );
-                prebuffer_next_two(state, client, None, None, frame_ms);
+                promote_existing_stream(&mut client.session, &next, StreamRole::Active, generation);
+                prune_streams(&mut client.session, &mut client.conn);
+                if !client.session.track_streams.contains_key(&next) {
+                    let _ = start_track_stream(
+                        state,
+                        client,
+                        next,
+                        StreamRole::Active,
+                        frame_ms,
+                        0,
+                        None,
+                        None,
+                    );
+                }
+                prebuffer_next_tracks(state, client, None, None, frame_ms);
             }
         }
         ControlMessage::Buffer {
@@ -755,6 +772,10 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             if let Some(target) = target_ms {
                 client.session.buffer_target_ms = target;
             }
+            report_active_buffer(state, &client.session);
+            prune_streams(&mut client.session, &mut client.conn);
+            let frame_ms = active_frame_ms(&client.session);
+            prebuffer_next_tracks(state, client, None, None, frame_ms);
         }
         ControlMessage::Seek {
             track_id,
@@ -777,6 +798,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 );
                 return;
             }
+            let generation = client.session.bump_stream_generation();
             client.session.client_buffer_ms = 0;
             client.session.buffer_target_ms = SEEK_RECOVERY_TARGET_MS;
             client.session.active_track = Some(track_id.clone());
@@ -791,7 +813,14 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     mode_label = Some(transcode_mode_label(outgoing.mode));
                     quality_label = Some(transcode_quality_label(outgoing.quality));
                     outgoing.role = StreamRole::Active;
-                    match seek_track_stream(state, outgoing, &track_id, position_ms, seek_id) {
+                    match seek_track_stream(
+                        state,
+                        outgoing,
+                        generation,
+                        &track_id,
+                        position_ms,
+                        seek_id,
+                    ) {
                         Ok(()) => {
                             tracing::info!(
                                 "QUIC seek reusing stream track={} stream_id={} seek_id={}",
@@ -826,6 +855,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                     send_control(client, ControlResponse::Error { message: &err });
                 }
             }
+            prune_streams(&mut client.session, &mut client.conn);
         }
         ControlMessage::Playback {
             track_id,
@@ -884,12 +914,62 @@ fn ensure_active_in_queue(session: &mut SessionState) {
     session.queue.push_front(active.clone());
 }
 
-fn promote_existing_stream(session: &mut SessionState, track_id: &str, role: StreamRole) {
+fn promote_existing_stream(
+    session: &mut SessionState,
+    track_id: &str,
+    role: StreamRole,
+    generation: u64,
+) {
     if let Some(stream_id) = session.track_streams.get(track_id).cloned() {
         if let Some(outgoing) = session.outgoing.get_mut(&stream_id) {
             outgoing.role = role;
+            outgoing.generation = generation;
         }
     }
+}
+
+fn allowed_prefetch_tracks(session: &SessionState) -> Vec<String> {
+    let active = match session.active_track.as_ref() {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+    let mut remaining = Vec::new();
+    let mut seen_active = false;
+    for id in session.queue.iter() {
+        if !seen_active {
+            if id == active {
+                seen_active = true;
+            }
+            continue;
+        }
+        remaining.push(id.clone());
+        if remaining.len() >= PREFETCH_TRACK_LIMIT {
+            break;
+        }
+    }
+    remaining
+}
+
+fn should_prefetch(session: &SessionState) -> bool {
+    session.buffer_target_ms > 0 && session.client_buffer_ms >= session.buffer_target_ms
+}
+
+fn report_active_buffer(state: &AppState, session: &SessionState) {
+    let Some(active) = session.active_track.as_ref() else {
+        return;
+    };
+    let Some(stream_id) = session.track_streams.get(active) else {
+        return;
+    };
+    let Some(outgoing) = session.outgoing.get(stream_id) else {
+        return;
+    };
+    let Some(adaptive_session) = outgoing.adaptive_session.as_ref() else {
+        return;
+    };
+    state
+        .stream_sessions
+        .report_buffer(adaptive_session.id, session.client_buffer_ms as u64);
 }
 
 fn prune_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
@@ -897,12 +977,15 @@ fn prune_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     if let Some(active) = session.active_track.as_ref() {
         allowed.insert(active.clone());
     }
-    for id in session.queue.iter() {
-        allowed.insert(id.clone());
+    if should_prefetch(session) {
+        for id in allowed_prefetch_tracks(session) {
+            allowed.insert(id.clone());
+        }
     }
     let mut remove_ids = Vec::new();
     for (stream_id, outgoing) in session.outgoing.iter() {
-        if !allowed.contains(&outgoing.track_id) {
+        if outgoing.generation != session.stream_generation || !allowed.contains(&outgoing.track_id)
+        {
             remove_ids.push((*stream_id, outgoing.track_id.clone()));
         }
     }
@@ -915,32 +998,17 @@ fn prune_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     }
 }
 
-fn prebuffer_next_two(
+fn prebuffer_next_tracks(
     state: &AppState,
     client: &mut ClientConn,
     mode: Option<&str>,
     quality: Option<&str>,
     frame_ms: u32,
 ) {
-    let active = match client.session.active_track.as_ref() {
-        Some(value) => value.clone(),
-        None => return,
-    };
-    let mut remaining = Vec::new();
-    let mut seen_active = false;
-    for id in client.session.queue.iter() {
-        if !seen_active {
-            if id == &active {
-                seen_active = true;
-            }
-            continue;
-        }
-        remaining.push(id.clone());
-        if remaining.len() >= 2 {
-            break;
-        }
+    if !should_prefetch(&client.session) {
+        return;
     }
-    for track_id in remaining {
+    for track_id in allowed_prefetch_tracks(&client.session) {
         let _ = start_track_stream(
             state,
             client,
@@ -966,6 +1034,7 @@ fn spawn_track_transcode(
         tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
         Option<mpsc::Sender<TranscodeCommand>>,
         Option<CacheGuard>,
+        Option<StreamSessionHandle>,
     ),
     String,
 > {
@@ -1019,7 +1088,7 @@ fn spawn_track_transcode(
                         )));
                     }
                 });
-                return Ok((rx, None, cache_guard));
+                return Ok((rx, None, cache_guard, None));
             }
         }
         if let Ok(Some(writer)) = state.stream_cache.writer(cache_key.clone()) {
@@ -1035,7 +1104,7 @@ fn spawn_track_transcode(
         start_ms,
         cache_writer,
     )?;
-    Ok((rx, Some(cmd_tx), cache_guard))
+    Ok((rx, Some(cmd_tx), cache_guard, session))
 }
 
 fn start_track_stream(
@@ -1063,7 +1132,8 @@ fn start_track_stream(
     let mode = parse_transcode_mode(mode).unwrap_or(TranscodeMode::Auto);
     let quality = parse_transcode_quality(quality).unwrap_or(TranscodeQuality::High);
     let frame_ms = parse_frame_ms(Some(frame_ms)).unwrap_or(20);
-    let (rx, cmd_tx, cache_guard) =
+    let generation = client.session.stream_generation;
+    let (rx, cmd_tx, cache_guard, adaptive_session) =
         spawn_track_transcode(state, &track_id, frame_ms, mode, quality, start_ms)?;
 
     let stream_id = client.session.next_server_uni_stream();
@@ -1075,11 +1145,13 @@ fn start_track_stream(
         stream_id,
         OutgoingStream::new(
             stream_id,
+            generation,
             track_id.clone(),
             role,
             frame_ms,
             mode,
             quality,
+            adaptive_session,
             rx,
             cmd_tx,
             cache_guard,
@@ -1106,10 +1178,12 @@ fn start_track_stream(
 fn seek_track_stream(
     state: &AppState,
     outgoing: &mut OutgoingStream,
+    generation: u64,
     track_id: &str,
     position_ms: u32,
     seek_id: u32,
 ) -> Result<(), String> {
+    outgoing.generation = generation;
     let frame_ms = outgoing.frame_ms;
     let mode = outgoing.mode;
     let quality = outgoing.quality;
@@ -1133,6 +1207,7 @@ fn seek_track_stream(
                 }
                 outgoing.cmd_tx = None;
                 outgoing.cache_guard = None;
+                outgoing.adaptive_session = None;
                 outgoing.rx = rx;
                 reset_outgoing_seek_state(outgoing);
 
@@ -1147,11 +1222,12 @@ fn seek_track_stream(
         outgoing.stop_worker();
     }
     outgoing.cmd_tx = None;
-    let (rx, cmd_tx, cache_guard) =
+    let (rx, cmd_tx, cache_guard, adaptive_session) =
         spawn_track_transcode(state, track_id, frame_ms, mode, quality, position_ms)?;
     outgoing.rx = rx;
     outgoing.cmd_tx = cmd_tx;
     outgoing.cache_guard = cache_guard;
+    outgoing.adaptive_session = adaptive_session;
     reset_outgoing_seek_state(outgoing);
 
     let marker = seek_reset_frame(seek_id);
@@ -1225,6 +1301,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     let mut finished = Vec::new();
     let mut active_ids = Vec::new();
     let mut prefetch_ids = Vec::new();
+    let prefetch_allowed = should_prefetch(session);
     for (stream_id, outgoing) in session.outgoing.iter() {
         if outgoing.role == StreamRole::Active {
             active_ids.push(*stream_id);
@@ -1241,6 +1318,9 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
             .front()
             .map(|front| front.len() >= 2 && front[0] == 0xFF && front[1] == 0xFF)
             .unwrap_or(false);
+        if !force_send && outgoing.role == StreamRole::Prefetch && !prefetch_allowed {
+            continue;
+        }
         if !force_send
             && outgoing.role == StreamRole::Active
             && session.buffer_target_ms > 0

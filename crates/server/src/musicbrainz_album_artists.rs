@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use common::{stable_id, Album, Artist, Track};
+use common::{artist_identity_id, Album, Artist, Track};
 use library::Library;
 use metadata::read_tags;
 use regex::Regex;
@@ -433,9 +433,11 @@ fn materialize_artists(
             continue;
         }
 
-        let canonical_id = stable_id(canonical.as_str());
+        let canonical_id = artist_identity_id(canonical.as_str());
         if let Some(existing) = existing_by_id.get(&canonical_id) {
-            out.push(existing.clone());
+            let mut artist = existing.clone();
+            artist.name = canonical;
+            out.push(artist);
             continue;
         }
 
@@ -1174,7 +1176,7 @@ fn candidate_score(
 
 #[cfg(test)]
 mod tests {
-    use common::{stable_id, Artist};
+    use common::{artist_identity_id, stable_id, Artist};
 
     use super::{
         artist_search_tokens, build_release_queries, dedupe_key, default_artist_name_map,
@@ -1220,9 +1222,30 @@ mod tests {
         );
 
         assert_eq!(artists.len(), 1);
-        assert_eq!(artists[0].id, stable_id("Kanye West"));
+        assert_eq!(artists[0].id, artist_identity_id("Kanye West"));
         assert_eq!(artists[0].name, "Kanye West");
         assert_eq!(artists[0].summary.as_deref(), Some("alias metadata"));
+    }
+
+    #[test]
+    fn materialize_artists_reuses_case_variant_identity() {
+        let artists = materialize_artists(
+            &[String::from("System of a Down")],
+            &[Artist {
+                id: artist_identity_id("System Of A Down"),
+                name: String::from("System Of A Down"),
+                genres: vec![String::from("Metal")],
+                summary: None,
+                logo_ref: None,
+                banner_ref: None,
+            }],
+            &default_artist_name_map(),
+        );
+
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].id, artist_identity_id("System of a Down"));
+        assert_eq!(artists[0].name, "System of a Down");
+        assert_eq!(artists[0].genres, vec![String::from("Metal")]);
     }
 
     #[test]

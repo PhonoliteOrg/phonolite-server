@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{
     CommitError, Database, DatabaseError, ReadableTable, StorageError, TableDefinition, TableError,
@@ -21,6 +22,23 @@ const PLAYBACK_SETTINGS_KEY: &str = "global";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlaybackSettings {
     pub repeat_mode: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LikeState {
+    #[serde(default = "default_liked")]
+    pub liked: bool,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl LikeState {
+    pub fn with_state(liked: bool) -> Self {
+        Self {
+            liked,
+            updated_at: now_millis(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -141,43 +159,72 @@ impl UserDataStore {
     }
 
     pub fn list_likes(&self) -> Result<Vec<String>, UserDataError> {
+        let mut liked_states: Vec<_> = self
+            .list_like_states()?
+            .into_iter()
+            .filter(|(_, state)| state.liked)
+            .collect();
+        liked_states.sort_by(|left, right| {
+            right
+                .1
+                .updated_at
+                .cmp(&left.1.updated_at)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(liked_states
+            .into_iter()
+            .map(|(track_id, _)| track_id)
+            .collect())
+    }
+
+    pub fn list_like_states(&self) -> Result<Vec<(String, LikeState)>, UserDataError> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(LIKES_TABLE) {
             Ok(table) => table,
             Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(err) => return Err(err.into()),
         };
-        let mut ids = Vec::new();
+        let mut states = Vec::new();
         for entry in table.iter()? {
             let entry = entry?;
-            ids.push(entry.0.value().to_string());
+            states.push((
+                entry.0.value().to_string(),
+                decode_like_state(entry.1.value()),
+            ));
         }
-        Ok(ids)
+        Ok(states)
     }
 
     pub fn add_like(&self, track_id: &str) -> Result<(), UserDataError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(LIKES_TABLE)?;
-            let value = [1u8];
-            table.insert(track_id, value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.set_like_state(track_id, true).map(|_| ())
     }
 
     pub fn remove_like(&self, track_id: &str) -> Result<(), UserDataError> {
+        self.set_like_state(track_id, false).map(|_| ())
+    }
+
+    pub fn set_like_state(&self, track_id: &str, liked: bool) -> Result<LikeState, UserDataError> {
+        self.set_like_state_with_updated_at(track_id, liked, None)
+    }
+
+    pub fn set_like_state_with_updated_at(
+        &self,
+        track_id: &str,
+        liked: bool,
+        updated_at: Option<u64>,
+    ) -> Result<LikeState, UserDataError> {
+        let state = updated_at
+            .filter(|value| *value > 0)
+            .map(|updated_at| LikeState { liked, updated_at })
+            .unwrap_or_else(|| LikeState::with_state(liked));
         let write_txn = self.db.begin_write()?;
         {
-            let mut table = match write_txn.open_table(LIKES_TABLE) {
-                Ok(table) => table,
-                Err(TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(err) => return Err(err.into()),
-            };
-            let _ = table.remove(track_id)?;
+            let mut table = write_txn.open_table(LIKES_TABLE)?;
+            let bytes = encode_value(&state)?;
+            table.insert(track_id, bytes.as_slice())?;
         }
         write_txn.commit()?;
-        Ok(())
+        Ok(state)
     }
 
     pub fn get_playback_settings(&self) -> Result<Option<PlaybackSettings>, UserDataError> {
@@ -313,4 +360,141 @@ fn encode_value<T: Serialize>(value: &T) -> Result<Vec<u8>, UserDataError> {
 
 fn decode_value<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, UserDataError> {
     Ok(bincode::deserialize(bytes)?)
+}
+
+fn decode_like_state(bytes: &[u8]) -> LikeState {
+    match bincode::deserialize::<LikeState>(bytes) {
+        Ok(state) => state,
+        Err(_) if !bytes.is_empty() => LikeState {
+            liked: true,
+            updated_at: 0,
+        },
+        Err(_) => LikeState {
+            liked: false,
+            updated_at: 0,
+        },
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn default_liked() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDb {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn test_store() -> (UserDataStore, TestDb) {
+        let path =
+            std::env::temp_dir().join(format!("phonolite_user_data_{}.redb", Uuid::new_v4()));
+        let db = Arc::new(open_or_create_db(&path).unwrap());
+        let store = UserDataStore::new(db);
+        store.init_tables().unwrap();
+        (store, TestDb { path })
+    }
+
+    #[test]
+    fn legacy_like_rows_decode_as_liked() {
+        let (store, _db) = test_store();
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(LIKES_TABLE).unwrap();
+            table.insert("legacy-track", [1u8].as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        assert_eq!(store.list_likes().unwrap(), vec!["legacy-track"]);
+        let states = store.list_like_states().unwrap();
+        assert!(states
+            .iter()
+            .any(|(track_id, state)| track_id == "legacy-track" && state.liked));
+    }
+
+    #[test]
+    fn unlike_writes_tombstone_and_list_likes_excludes_it() {
+        let (store, _db) = test_store();
+        store.add_like("track-1").unwrap();
+        assert_eq!(store.list_likes().unwrap(), vec!["track-1"]);
+
+        store.remove_like("track-1").unwrap();
+        assert!(store.list_likes().unwrap().is_empty());
+        let states = store.list_like_states().unwrap();
+        let (_, state) = states
+            .iter()
+            .find(|(track_id, _)| track_id == "track-1")
+            .expect("tombstone should be preserved");
+        assert!(!state.liked);
+        assert!(state.updated_at > 0);
+    }
+
+    #[test]
+    fn list_likes_orders_newest_liked_first() {
+        let (store, _db) = test_store();
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(LIKES_TABLE).unwrap();
+            let older = encode_value(&LikeState {
+                liked: true,
+                updated_at: 1000,
+            })
+            .unwrap();
+            let newer = encode_value(&LikeState {
+                liked: true,
+                updated_at: 3000,
+            })
+            .unwrap();
+            let tombstone = encode_value(&LikeState {
+                liked: false,
+                updated_at: 4000,
+            })
+            .unwrap();
+            table.insert("older-liked", older.as_slice()).unwrap();
+            table.insert("newer-liked", newer.as_slice()).unwrap();
+            table.insert("newer-unliked", tombstone.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        assert_eq!(
+            store.list_likes().unwrap(),
+            vec!["newer-liked", "older-liked"]
+        );
+    }
+
+    #[test]
+    fn set_like_state_returns_updated_state() {
+        let (store, _db) = test_store();
+        let state = store.set_like_state("track-2", true).unwrap();
+        assert!(state.liked);
+        assert!(state.updated_at > 0);
+    }
+
+    #[test]
+    fn set_like_state_can_preserve_client_like_timestamp() {
+        let (store, _db) = test_store();
+        let state = store
+            .set_like_state_with_updated_at("track-3", true, Some(1234))
+            .unwrap();
+
+        assert!(state.liked);
+        assert_eq!(state.updated_at, 1234);
+        assert_eq!(store.list_likes().unwrap(), vec!["track-3"]);
+    }
 }

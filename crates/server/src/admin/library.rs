@@ -1077,11 +1077,45 @@ fn render_pagination(
 }
 
 fn format_genres_html(genres: &[String]) -> String {
+    let genres = normalize_display_genres(genres);
     if genres.is_empty() {
         "<span class=\"muted\">-</span>".to_string()
     } else {
         escape_html(&genres.join(", "))
     }
+}
+
+fn normalize_display_genres(genres: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for genre in genres {
+        let genre = normalize_genre_separators(genre);
+        for part in genre.split(&[';', ',', '/', '|', '\0'][..]) {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !out
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+            {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn normalize_genre_separators(value: &str) -> String {
+    value
+        .replace("&bull;", "|")
+        .replace("&#8226;", "|")
+        .replace("&#x2022;", "|")
+        .replace("&middot;", "|")
+        .replace("\u{2022}", "|")
+        .replace("\u{00B7}", "|")
+        .replace("\u{00E2}\u{20AC}\u{00A2}", "|")
+        .replace("\u{00E2}\u{0080}\u{00A2}", "|")
+        .replace("\u{00C2}\u{20AC}\u{00A2}", "|")
 }
 
 pub fn render_status_block_for_library(state: &AppState) -> String {

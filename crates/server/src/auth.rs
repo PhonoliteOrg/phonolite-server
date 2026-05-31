@@ -476,7 +476,34 @@ impl AuthStore {
     }
 
     pub fn update_password(&self, id: &str, password: &str) -> Result<(), AuthError> {
-        self.update_user(id, "", Some(password), UserRole::User) // Hacky reuse, but we need to fetch user first to keep username/role
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        {
+            let mut table = txn
+                .open_table(USERS_TABLE)
+                .map_err(|e| AuthError::DbError(e.to_string()))?;
+            let mut user: AuthUser = {
+                let user_result = table
+                    .get(id)
+                    .map_err(|e: StorageError| AuthError::DbError(e.to_string()))?;
+                match user_result {
+                    Some(v) => bincode::deserialize(v.value())
+                        .map_err(|e: Box<bincode::ErrorKind>| AuthError::DbError(e.to_string()))?,
+                    None => return Err(AuthError::UserNotFound),
+                }
+            };
+
+            user.password_hash = hash_password(password);
+            let bytes = bincode::serialize(&user).map_err(|e| AuthError::DbError(e.to_string()))?;
+            table
+                .insert(id, bytes.as_slice())
+                .map_err(|e| AuthError::DbError(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        Ok(())
     }
 
     pub fn delete_user(&self, id: &str) -> Result<(), AuthError> {
@@ -541,4 +568,136 @@ fn generate_token() -> String {
         })
         .collect();
     token
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use redb::{Database, ReadableTable};
+
+    use super::{AuthStore, UserRole};
+
+    struct TestDb {
+        path: PathBuf,
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn test_store() -> (AuthStore, TestDb) {
+        let path =
+            std::env::temp_dir().join(format!("phonolite-auth-test-{}.redb", uuid::Uuid::new_v4()));
+        let db = Arc::new(Database::create(&path).unwrap());
+        let store = AuthStore::new(db, Duration::from_secs(60));
+        store.init_tables().unwrap();
+        (store, TestDb { path })
+    }
+
+    fn set_disabled(store: &AuthStore, user_id: &str, disabled: bool) {
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(super::USERS_TABLE).unwrap();
+            let bytes = table.get(user_id).unwrap().unwrap().value().to_vec();
+            let mut user: super::AuthUser = bincode::deserialize(&bytes).unwrap();
+            user.disabled = disabled;
+            let bytes = bincode::serialize(&user).unwrap();
+            table.insert(user_id, bytes.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn authenticate_and_session_round_trip() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("admin", "hunter2").unwrap();
+
+        let authenticated = store.authenticate("admin", "hunter2").unwrap().unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        let from_token = store.user_from_token(&session.token).unwrap().unwrap();
+
+        assert_eq!(authenticated.id, user.id);
+        assert_eq!(from_token.username, "admin");
+        assert_eq!(from_token.role, UserRole::SuperAdmin);
+    }
+
+    #[test]
+    fn usernames_are_unique_case_insensitively() {
+        let (store, _db) = test_store();
+        store.create_superadmin("Admin", "hunter2").unwrap();
+
+        let err = store
+            .create_user("admin", "secret", UserRole::User)
+            .unwrap_err();
+
+        assert!(matches!(err, super::AuthError::UserExists));
+    }
+
+    #[test]
+    fn update_password_preserves_username_and_role() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("root", "old-password").unwrap();
+
+        store.update_password(&user.id, "new-password").unwrap();
+
+        let updated = store.get_user(&user.id).unwrap().unwrap();
+        let authenticated = store.authenticate("root", "new-password").unwrap().unwrap();
+
+        assert_eq!(updated.username, "root");
+        assert_eq!(updated.role, UserRole::SuperAdmin);
+        assert_eq!(authenticated.id, user.id);
+    }
+
+    #[test]
+    fn disabled_users_are_rejected_by_authentication_and_session_lookup() {
+        let (store, _db) = test_store();
+        let user = store
+            .create_user("listener", "secret", UserRole::User)
+            .unwrap();
+        let session = store.create_session(&user.id).unwrap();
+
+        set_disabled(&store, &user.id, true);
+
+        assert!(store.authenticate("listener", "secret").unwrap().is_none());
+        assert!(store.user_from_token(&session.token).unwrap().is_none());
+        assert!(!store.has_admin().unwrap());
+    }
+
+    #[test]
+    fn delete_user_rejects_last_admin_but_allows_deletion_after_replacement() {
+        let (store, _db) = test_store();
+        let superadmin = store.create_superadmin("root", "secret").unwrap();
+
+        let err = store.delete_user(&superadmin.id).unwrap_err();
+        assert!(matches!(err, super::AuthError::LastAdmin));
+
+        let backup = store
+            .create_user("backup", "secret", UserRole::Admin)
+            .unwrap();
+        store.delete_user(&superadmin.id).unwrap();
+
+        assert!(store.get_user(&superadmin.id).unwrap().is_none());
+        assert_eq!(
+            store.get_user(&backup.id).unwrap().unwrap().role,
+            UserRole::Admin
+        );
+    }
+
+    #[test]
+    fn revoked_sessions_can_no_longer_be_used() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("root", "secret").unwrap();
+        let session = store.create_session(&user.id).unwrap();
+
+        assert!(store.user_from_token(&session.token).unwrap().is_some());
+
+        store.revoke_session(&session.token).unwrap();
+
+        assert!(store.user_from_token(&session.token).unwrap().is_none());
+    }
 }

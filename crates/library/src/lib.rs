@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bincode;
 use common::{
-    join_relpath, relpath_from, stable_id, Album, Artist, Codec, CoverRef, SeekIndex, SeekPoint,
-    Track,
+    artist_identity_id, artist_identity_key, join_relpath, relpath_from, stable_id, Album, Artist,
+    Codec, CoverRef, SeekIndex, SeekPoint, Track,
 };
 use metadata::{read_tags, MetadataError, TagInfo};
 use redb::{
@@ -15,10 +15,10 @@ use redb::{
     TransactionError, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-const INDEX_VERSION: u32 = 8;
+const INDEX_VERSION: u32 = 10;
 const SEEK_STEP_MS: u32 = 5000;
 const KEY_SEP: char = '\x1f';
 const ROOT_SEP: &str = "::";
@@ -553,9 +553,9 @@ impl Library {
                         updated = true;
                     }
                 } else {
-                    let before = artist.genres.len();
+                    let before = artist.genres.clone();
                     merge_genres(&mut artist.genres, genres);
-                    if artist.genres.len() != before {
+                    if artist.genres != before {
                         updated = true;
                     }
                 }
@@ -591,6 +591,7 @@ impl Library {
         album_id: &str,
         summary: Option<String>,
         genres: &[String],
+        replace: bool,
     ) -> Result<bool, LibraryError> {
         let write_txn = self.db.begin_write()?;
         let updated = {
@@ -601,22 +602,34 @@ impl Library {
             };
 
             let mut updated = false;
-            if album
-                .summary
-                .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
+            let should_update_summary = replace
+                || album
+                    .summary
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+            if should_update_summary {
                 if let Some(summary) = summary.and_then(clean_summary) {
-                    album.summary = Some(summary);
-                    updated = true;
+                    if album.summary.as_deref() != Some(summary.as_str()) {
+                        album.summary = Some(summary);
+                        updated = true;
+                    }
                 }
             }
             if !genres.is_empty() {
-                let before = album.genres.len();
-                merge_genres(&mut album.genres, genres);
-                if album.genres.len() != before {
-                    updated = true;
+                if replace {
+                    let mut normalized = Vec::new();
+                    merge_genres(&mut normalized, genres);
+                    if album.genres != normalized {
+                        album.genres = normalized;
+                        updated = true;
+                    }
+                } else {
+                    let before = album.genres.clone();
+                    merge_genres(&mut album.genres, genres);
+                    if album.genres != before {
+                        updated = true;
+                    }
                 }
             }
 
@@ -696,7 +709,18 @@ impl Library {
                 match existing {
                     Some(mut existing) => {
                         let mut changed = false;
-                        if existing.name.trim().is_empty() && !artist.name.trim().is_empty() {
+                        let old_artist_name_key = if !existing.name.trim().is_empty() {
+                            Some(artist_name_key(&existing.name, &existing.id))
+                        } else {
+                            None
+                        };
+                        let existing_key = artist_identity_key(&existing.name);
+                        let incoming_key = artist_identity_key(&artist.name);
+                        if !artist.name.trim().is_empty()
+                            && existing.name.trim() != artist.name.trim()
+                            && (existing.name.trim().is_empty()
+                                || (!existing_key.is_empty() && existing_key == incoming_key))
+                        {
                             existing.name = artist.name.clone();
                             changed = true;
                         }
@@ -712,9 +736,9 @@ impl Library {
                             existing.banner_ref = artist.banner_ref.clone();
                             changed = true;
                         }
-                        let genre_count = existing.genres.len();
+                        let genres_before = existing.genres.clone();
                         merge_genres(&mut existing.genres, &artist.genres);
-                        if existing.genres.len() != genre_count {
+                        if existing.genres != genres_before {
                             changed = true;
                         }
                         if changed {
@@ -723,6 +747,11 @@ impl Library {
                         }
                         if !existing.name.trim().is_empty() {
                             let key = artist_name_key(&existing.name, &existing.id);
+                            if old_artist_name_key.as_ref() != Some(&key) {
+                                if let Some(old_key) = old_artist_name_key {
+                                    let _ = artists_by_name_table.remove(old_key.as_str())?;
+                                }
+                            }
                             artists_by_name_table.insert(key.as_str(), existing.id.as_bytes())?;
                         }
                     }
@@ -1137,6 +1166,10 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
         let mut album_count = 0usize;
         let mut track_count = 0usize;
         let mut artist_sidecar_cache: HashMap<PathBuf, Option<SidecarInfo>> = HashMap::new();
+        let mut artist_ids_by_key: HashMap<String, String> = HashMap::new();
+        let mut album_ids_by_group: HashMap<String, Vec<AlbumIdentity>> = HashMap::new();
+        let mut track_identities_by_album: HashMap<String, Vec<TrackIdentity>> = HashMap::new();
+        let mut next_track_order_by_album: HashMap<String, usize> = HashMap::new();
 
         for (root, album_dir) in album_dirs {
             let files = audio_files_in_dir(&album_dir);
@@ -1148,7 +1181,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                 Some(rel) => prefix_relpath(&root.id, &rel),
                 None => continue,
             };
-            info!(
+            debug!(
                 "Scanning album folder '{}' ({} audio files)",
                 folder_relpath.as_str(),
                 files.len()
@@ -1171,7 +1204,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                 load_sidecar_info(&mut artist_sidecar_cache, parent.join("artist.json"))
             });
             if let Some(info) = &album_sidecar {
-                info!(
+                debug!(
                     "Album sidecar loaded for '{}': summary_present={}, genres={:?}",
                     folder_relpath.as_str(),
                     info.summary
@@ -1182,7 +1215,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                 );
             }
             if let Some(info) = &artist_sidecar {
-                info!(
+                debug!(
                     "Artist sidecar loaded for '{}': summary_present={}, genres={:?}",
                     fallback_artist.as_str(),
                     info.summary
@@ -1215,7 +1248,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     Some(rel) => prefix_relpath(&root.id, &rel),
                     None => continue,
                 };
-                info!("Reading tags for '{}'", relpath.as_str());
+                debug!("Reading tags for '{}'", relpath.as_str());
 
                 let tag = match read_tags(&file) {
                     Ok(tag) => tag,
@@ -1254,7 +1287,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     merge_genres(&mut album_genres, &tag.genres);
                 }
 
-                info!(
+                debug!(
                     "Tag fields for '{}': album={:?}, album_artist={:?}, artist={:?}, year={:?}, title={:?}, track_no={:?}, disc_no={:?}, summary_present={}, genres={:?}",
                     relpath.as_str(),
                     tag.album.as_deref(),
@@ -1294,14 +1327,14 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     .or_else(|| album_artist.clone())
                     .unwrap_or_else(|| fallback_artist.clone());
                 let year_hint = tag.year.or(album_year).or(folder_year);
-                info!(
+                debug!(
                     "Indexing track '{}' for album '{}' (artist='{}', year={:?})",
                     title.as_str(),
                     album_hint,
                     artist_hint,
                     year_hint
                 );
-                info!(
+                debug!(
                     "Track metadata: relpath='{}', track_no={:?}, disc_no={:?}, duration_ms={}, codec={:?}, sample_rate={:?}, channels={:?}, bitrate={:?}, genres={:?}, embedded_cover={}",
                     relpath.as_str(),
                     tag.track_no,
@@ -1319,19 +1352,13 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     album_cover = Some(CoverRef::Embedded {
                         track_id: id.clone(),
                     });
-                    info!(
+                    debug!(
                         "Album cover set from embedded art in '{}'",
                         relpath.as_str()
                     );
                 } else if tag.has_embedded_cover {
-                    info!("Found embedded art in '{}'", relpath.as_str());
+                    debug!("Found embedded art in '{}'", relpath.as_str());
                 }
-
-                embedded_cover_table.insert(id.as_str(), bool_bytes(tag.has_embedded_cover))?;
-
-                let seek = build_seek_index(duration_ms, file_size);
-                let seek_bytes = encode_value(&seek)?;
-                seek_table.insert(id.as_str(), seek_bytes.as_slice())?;
 
                 track_drafts.push(TrackDraft {
                     id,
@@ -1346,6 +1373,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     bitrate: tag.bitrate,
                     file_size,
                     genres: tag.genres,
+                    has_embedded_cover: tag.has_embedded_cover,
                 });
             }
 
@@ -1359,9 +1387,36 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
 
             let album_title = album_title.unwrap_or(folder_title);
             let album_artist = album_artist.unwrap_or(fallback_artist).trim().to_string();
-            let artist_id = stable_id(album_artist.trim());
-            let album_id = stable_id(&folder_relpath);
-            info!(
+            let artist_key = canonical_artist_key(&album_artist);
+            let artist_id = artist_ids_by_key
+                .get(&artist_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let id = artist_identity_id(&album_artist);
+                    artist_ids_by_key.insert(artist_key.clone(), id.clone());
+                    id
+                });
+            let album_group_key = canonical_album_group_key(&artist_key, &album_title);
+            let candidate_album_id = stable_id(&folder_relpath);
+            let album_identities = album_ids_by_group
+                .entry(album_group_key.clone())
+                .or_default();
+            let album_identity_idx = find_compatible_album_identity(album_identities, album_year);
+            let (album_id, is_new_album) = match album_identity_idx {
+                Some(idx) => {
+                    let identity = &mut album_identities[idx];
+                    identity.year = merged_album_year(identity.year, album_year);
+                    (identity.id.clone(), false)
+                }
+                None => {
+                    album_identities.push(AlbumIdentity {
+                        id: candidate_album_id.clone(),
+                        year: album_year,
+                    });
+                    (candidate_album_id, true)
+                }
+            };
+            debug!(
                 "Detected album '{}' (artist='{}', year={:?}) with {} tracks",
                 album_title.as_str(),
                 album_artist.as_str(),
@@ -1371,14 +1426,14 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
 
             if album_cover.is_none() {
                 if let Some(cover_rel) = find_folder_cover(&root.path, &root.id, &album_dir) {
-                    info!(
+                    debug!(
                         "Found folder cover for album '{}': {}",
                         album_title.as_str(),
                         cover_rel.as_str()
                     );
                     album_cover = Some(CoverRef::File { relpath: cover_rel });
                 } else {
-                    info!(
+                    debug!(
                         "No folder cover detected for album '{}'",
                         album_title.as_str()
                     );
@@ -1395,10 +1450,12 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                 .and_then(|info| info.summary.clone());
             let mut artist_logo = None;
             let mut artist_banner = None;
+            let mut artist_name = album_artist.clone();
 
             if let Some(value) = artists_table.get(artist_id.as_str())? {
                 let existing: Artist = decode_value(value.value())?;
                 merge_genres(&mut artist_genres, &existing.genres);
+                artist_name = existing.name;
                 if artist_summary.is_none() {
                     artist_summary = existing.summary;
                 }
@@ -1412,7 +1469,7 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
 
             let artist = Artist {
                 id: artist_id.clone(),
-                name: album_artist.clone(),
+                name: artist_name,
                 genres: artist_genres,
                 summary: artist_summary,
                 logo_ref: artist_logo,
@@ -1427,18 +1484,65 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
             let artist_name_key = artist_name_key(&artist.name, &artist.id);
             artists_by_name_table.insert(artist_name_key.as_str(), artist.id.as_bytes())?;
 
-            let album = Album {
-                id: album_id.clone(),
-                artist_id: artist_id.clone(),
-                artist_ids: vec![artist_id.clone()],
-                artist_names: vec![artist.name.clone()],
-                title: album_title,
-                year: album_year,
-                folder_relpath,
-                cover_ref: album_cover,
-                genres: album_genres.clone(),
-                summary: album_summary,
+            let (mut album, old_album_name_key, old_album_index_key) = if is_new_album {
+                let album = Album {
+                    id: album_id.clone(),
+                    artist_id: artist_id.clone(),
+                    artist_ids: vec![artist_id.clone()],
+                    artist_names: vec![artist.name.clone()],
+                    title: album_title,
+                    year: album_year,
+                    folder_relpath,
+                    cover_ref: album_cover,
+                    genres: album_genres.clone(),
+                    summary: album_summary,
+                };
+                let old_name_key = album_name_key(&artist.name, &album);
+                let old_index_key = album_index_key(&artist_id, &album);
+                (album, old_name_key, old_index_key)
+            } else {
+                let mut existing = match albums_table.get(album_id.as_str())? {
+                    Some(value) => decode_value::<Album>(value.value())?,
+                    None => Album {
+                        id: album_id.clone(),
+                        artist_id: artist_id.clone(),
+                        artist_ids: vec![artist_id.clone()],
+                        artist_names: vec![artist.name.clone()],
+                        title: album_title,
+                        year: album_year,
+                        folder_relpath,
+                        cover_ref: album_cover.clone(),
+                        genres: Vec::new(),
+                        summary: None,
+                    },
+                };
+                let old_name_key = album_name_key(&artist.name, &existing);
+                let old_index_key = album_index_key(&artist_id, &existing);
+                if existing
+                    .summary
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(summary) = album_summary.and_then(clean_summary) {
+                        existing.summary = Some(summary);
+                    }
+                }
+                merge_genres(&mut existing.genres, &album_genres);
+                if existing.year.is_none() {
+                    existing.year = album_year;
+                }
+                if existing.cover_ref.is_none() {
+                    if let Some(CoverRef::File { relpath }) = album_cover {
+                        existing.cover_ref = Some(CoverRef::File { relpath });
+                    }
+                }
+                (existing, old_name_key, old_index_key)
             };
+
+            album.artist_id = artist_id.clone();
+            album.artist_ids = vec![artist_id.clone()];
+            album.artist_names = vec![artist.name.clone()];
 
             let album_bytes = encode_value(&album)?;
             let prev = albums_table.insert(album_id.as_str(), album_bytes.as_slice())?;
@@ -1447,9 +1551,15 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
             }
 
             let album_name_key = album_name_key(&artist.name, &album);
+            if album_name_key != old_album_name_key {
+                let _ = albums_by_name_table.remove(old_album_name_key.as_str())?;
+            }
             albums_by_name_table.insert(album_name_key.as_str(), album.id.as_bytes())?;
 
             let album_index_key = album_index_key(&artist_id, &album);
+            if album_index_key != old_album_index_key {
+                let _ = artist_albums_table.remove(old_album_index_key.as_str())?;
+            }
             artist_albums_table.insert(album_index_key.as_str(), album_id.as_bytes())?;
 
             if album_tag_error {
@@ -1489,37 +1599,53 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     .then_with(|| a.relpath.cmp(&b.relpath))
             });
 
-            for (order, draft) in track_drafts.into_iter().enumerate() {
-                let TrackDraft {
-                    id,
-                    relpath,
-                    title,
-                    track_no,
-                    disc_no,
-                    duration_ms,
-                    codec,
-                    sample_rate,
-                    channels,
-                    bitrate,
-                    file_size,
-                    genres,
-                } = draft;
-                let mut track_genres = genres;
+            for draft in track_drafts.into_iter() {
+                let mut track_genres = draft.genres.clone();
                 merge_genres(&mut track_genres, &album_genres);
+                let duplicate_track_id = {
+                    let identities = track_identities_by_album
+                        .entry(album_id.clone())
+                        .or_default();
+                    find_duplicate_track_id(identities, &draft)
+                };
+                if let Some(track_id) = duplicate_track_id {
+                    let existing = match tracks_table.get(track_id.as_str())? {
+                        Some(value) => Some(decode_value::<Track>(value.value())?),
+                        None => None,
+                    };
+                    if let Some(mut existing) = existing {
+                        let before = existing.genres.clone();
+                        merge_genres(&mut existing.genres, &track_genres);
+                        if existing.genres != before {
+                            let bytes = encode_value(&existing)?;
+                            tracks_table.insert(track_id.as_str(), bytes.as_slice())?;
+                        }
+                    }
+                    continue;
+                }
+
+                let order = next_track_order_by_album
+                    .entry(album_id.clone())
+                    .or_insert_with(|| {
+                        track_identities_by_album
+                            .get(&album_id)
+                            .map(|items| items.len())
+                            .unwrap_or(0)
+                    });
                 let track = Track {
-                    id,
+                    id: draft.id.clone(),
                     album_id: album_id.clone(),
                     artist_id: artist_id.clone(),
-                    title,
-                    track_no,
-                    disc_no,
-                    duration_ms,
-                    codec,
-                    sample_rate,
-                    channels,
-                    bitrate,
-                    file_relpath: relpath,
-                    file_size,
+                    title: draft.title.clone(),
+                    track_no: draft.track_no,
+                    disc_no: draft.disc_no,
+                    duration_ms: draft.duration_ms,
+                    codec: draft.codec.clone(),
+                    sample_rate: draft.sample_rate,
+                    channels: draft.channels,
+                    bitrate: draft.bitrate,
+                    file_relpath: draft.relpath.clone(),
+                    file_size: draft.file_size,
                     genres: track_genres,
                 };
 
@@ -1529,8 +1655,15 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     track_count += 1;
                 }
 
-                let track_index_key = album_track_key(&album_id, order, &track.id);
+                embedded_cover_table
+                    .insert(track.id.as_str(), bool_bytes(draft.has_embedded_cover))?;
+                let seek = build_seek_index(track.duration_ms, track.file_size);
+                let seek_bytes = encode_value(&seek)?;
+                seek_table.insert(track.id.as_str(), seek_bytes.as_slice())?;
+
+                let track_index_key = album_track_key(&album_id, *order, &track.id);
                 album_tracks_table.insert(track_index_key.as_str(), track.id.as_bytes())?;
+                *order += 1;
 
                 let track_name_key = track_name_key(
                     &artist.name,
@@ -1541,6 +1674,10 @@ fn scan_library(roots: &[LibraryRoot], db: &Database) -> Result<LibraryStats, Li
                     &track.id,
                 );
                 tracks_by_name_table.insert(track_name_key.as_str(), track.id.as_bytes())?;
+                track_identities_by_album
+                    .entry(album_id.clone())
+                    .or_default()
+                    .push(track_identity_from_track(&track));
             }
         }
 
@@ -1598,6 +1735,63 @@ fn scan_library_incremental(
         let mut album_count = running_stats.albums;
         let mut track_count = running_stats.tracks;
         let mut artist_sidecar_cache: HashMap<PathBuf, Option<SidecarInfo>> = HashMap::new();
+        let mut artist_ids_by_key: HashMap<String, String> = HashMap::new();
+        for entry in artists_table.iter()? {
+            let entry = entry?;
+            let artist: Artist = decode_value(entry.1.value())?;
+            artist_ids_by_key
+                .entry(canonical_artist_key(&artist.name))
+                .or_insert(artist.id);
+        }
+
+        let mut album_ids_by_group: HashMap<String, Vec<AlbumIdentity>> = HashMap::new();
+        for entry in albums_table.iter()? {
+            let entry = entry?;
+            let album: Album = decode_value(entry.1.value())?;
+            let artist_name = album.artist_names.first().cloned().or_else(|| {
+                artists_table
+                    .get(album.artist_id.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|value| decode_value::<Artist>(value.value()).ok())
+                    .map(|artist| artist.name)
+            });
+            let Some(artist_name) = artist_name else {
+                continue;
+            };
+            let artist_key = canonical_artist_key(&artist_name);
+            let group_key = canonical_album_group_key(&artist_key, &album.title);
+            album_ids_by_group
+                .entry(group_key)
+                .or_default()
+                .push(AlbumIdentity {
+                    id: album.id,
+                    year: album.year,
+                });
+        }
+
+        let mut track_identities_by_album: HashMap<String, Vec<TrackIdentity>> = HashMap::new();
+        for entry in tracks_table.iter()? {
+            let entry = entry?;
+            let track: Track = decode_value(entry.1.value())?;
+            track_identities_by_album
+                .entry(track.album_id.clone())
+                .or_default()
+                .push(track_identity_from_track(&track));
+        }
+
+        let mut next_track_order_by_album: HashMap<String, usize> = HashMap::new();
+        for entry in album_tracks_table.iter()? {
+            let entry = entry?;
+            let key = entry.0.value();
+            let (prefix, _) = split_key_last(key)?;
+            let (album_id, order_text) = split_key_last(prefix)?;
+            let next_order = order_text.parse::<usize>().unwrap_or(0).saturating_add(1);
+            next_track_order_by_album
+                .entry(album_id.to_string())
+                .and_modify(|order| *order = (*order).max(next_order))
+                .or_insert(next_order);
+        }
 
         for (root, album_dir) in album_dirs {
             let files = audio_files_in_dir(&album_dir);
@@ -1609,15 +1803,15 @@ fn scan_library_incremental(
                 Some(rel) => prefix_relpath(&root.id, &rel),
                 None => continue,
             };
-            info!(
+            debug!(
                 "Scanning album folder '{}' ({} audio files)",
                 folder_relpath.as_str(),
                 files.len()
             );
 
-            let album_id = stable_id(&folder_relpath);
-            if albums_table.get(album_id.as_str())?.is_some() {
-                info!(
+            let folder_album_id = stable_id(&folder_relpath);
+            if albums_table.get(folder_album_id.as_str())?.is_some() {
+                debug!(
                     "Skipping already indexed album folder '{}'",
                     folder_relpath.as_str()
                 );
@@ -1641,7 +1835,7 @@ fn scan_library_incremental(
                 load_sidecar_info(&mut artist_sidecar_cache, parent.join("artist.json"))
             });
             if let Some(info) = &album_sidecar {
-                info!(
+                debug!(
                     "Album sidecar loaded for '{}': summary_present={}, genres={:?}",
                     folder_relpath.as_str(),
                     info.summary
@@ -1652,7 +1846,7 @@ fn scan_library_incremental(
                 );
             }
             if let Some(info) = &artist_sidecar {
-                info!(
+                debug!(
                     "Artist sidecar loaded for '{}': summary_present={}, genres={:?}",
                     fallback_artist.as_str(),
                     info.summary
@@ -1685,7 +1879,7 @@ fn scan_library_incremental(
                     Some(rel) => prefix_relpath(&root.id, &rel),
                     None => continue,
                 };
-                info!("Reading tags for '{}'", relpath.as_str());
+                debug!("Reading tags for '{}'", relpath.as_str());
 
                 let tag = match read_tags(&file) {
                     Ok(tag) => tag,
@@ -1724,7 +1918,7 @@ fn scan_library_incremental(
                     merge_genres(&mut album_genres, &tag.genres);
                 }
 
-                info!(
+                debug!(
                     "Tag fields for '{}': album={:?}, album_artist={:?}, artist={:?}, year={:?}, title={:?}, track_no={:?}, disc_no={:?}, summary_present={}, genres={:?}",
                     relpath.as_str(),
                     tag.album.as_deref(),
@@ -1764,14 +1958,14 @@ fn scan_library_incremental(
                     .or_else(|| album_artist.clone())
                     .unwrap_or_else(|| fallback_artist.clone());
                 let year_hint = tag.year.or(album_year).or(folder_year);
-                info!(
+                debug!(
                     "Indexing track '{}' for album '{}' (artist='{}', year={:?})",
                     title.as_str(),
                     album_hint,
                     artist_hint,
                     year_hint
                 );
-                info!(
+                debug!(
                     "Track metadata: relpath='{}', track_no={:?}, disc_no={:?}, duration_ms={}, codec={:?}, sample_rate={:?}, channels={:?}, bitrate={:?}, genres={:?}, embedded_cover={}",
                     relpath.as_str(),
                     tag.track_no,
@@ -1789,19 +1983,13 @@ fn scan_library_incremental(
                     album_cover = Some(CoverRef::Embedded {
                         track_id: id.clone(),
                     });
-                    info!(
+                    debug!(
                         "Album cover set from embedded art in '{}'",
                         relpath.as_str()
                     );
                 } else if tag.has_embedded_cover {
-                    info!("Found embedded art in '{}'", relpath.as_str());
+                    debug!("Found embedded art in '{}'", relpath.as_str());
                 }
-
-                embedded_cover_table.insert(id.as_str(), bool_bytes(tag.has_embedded_cover))?;
-
-                let seek = build_seek_index(duration_ms, file_size);
-                let seek_bytes = encode_value(&seek)?;
-                seek_table.insert(id.as_str(), seek_bytes.as_slice())?;
 
                 track_drafts.push(TrackDraft {
                     id,
@@ -1816,6 +2004,7 @@ fn scan_library_incremental(
                     bitrate: tag.bitrate,
                     file_size,
                     genres: tag.genres,
+                    has_embedded_cover: tag.has_embedded_cover,
                 });
             }
 
@@ -1829,8 +2018,36 @@ fn scan_library_incremental(
 
             let album_title = album_title.unwrap_or(folder_title);
             let album_artist = album_artist.unwrap_or(fallback_artist).trim().to_string();
-            let artist_id = stable_id(album_artist.trim());
-            info!(
+            let artist_key = canonical_artist_key(&album_artist);
+            let artist_id = artist_ids_by_key
+                .get(&artist_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let id = artist_identity_id(&album_artist);
+                    artist_ids_by_key.insert(artist_key.clone(), id.clone());
+                    id
+                });
+            let album_group_key = canonical_album_group_key(&artist_key, &album_title);
+            let candidate_album_id = stable_id(&folder_relpath);
+            let album_identities = album_ids_by_group
+                .entry(album_group_key.clone())
+                .or_default();
+            let album_identity_idx = find_compatible_album_identity(album_identities, album_year);
+            let (album_id, is_new_album) = match album_identity_idx {
+                Some(idx) => {
+                    let identity = &mut album_identities[idx];
+                    identity.year = merged_album_year(identity.year, album_year);
+                    (identity.id.clone(), false)
+                }
+                None => {
+                    album_identities.push(AlbumIdentity {
+                        id: candidate_album_id.clone(),
+                        year: album_year,
+                    });
+                    (candidate_album_id, true)
+                }
+            };
+            debug!(
                 "Detected album '{}' (artist='{}', year={:?}) with {} tracks",
                 album_title.as_str(),
                 album_artist.as_str(),
@@ -1840,14 +2057,14 @@ fn scan_library_incremental(
 
             if album_cover.is_none() {
                 if let Some(cover_rel) = find_folder_cover(&root.path, &root.id, &album_dir) {
-                    info!(
+                    debug!(
                         "Found folder cover for album '{}': {}",
                         album_title.as_str(),
                         cover_rel.as_str()
                     );
                     album_cover = Some(CoverRef::File { relpath: cover_rel });
                 } else {
-                    info!(
+                    debug!(
                         "No folder cover detected for album '{}'",
                         album_title.as_str()
                     );
@@ -1864,10 +2081,12 @@ fn scan_library_incremental(
                 .and_then(|info| info.summary.clone());
             let mut artist_logo = None;
             let mut artist_banner = None;
+            let mut artist_name = album_artist.clone();
 
             if let Some(value) = artists_table.get(artist_id.as_str())? {
                 let existing: Artist = decode_value(value.value())?;
                 merge_genres(&mut artist_genres, &existing.genres);
+                artist_name = existing.name;
                 if artist_summary.is_none() {
                     artist_summary = existing.summary;
                 }
@@ -1881,7 +2100,7 @@ fn scan_library_incremental(
 
             let artist = Artist {
                 id: artist_id.clone(),
-                name: album_artist.clone(),
+                name: artist_name,
                 genres: artist_genres,
                 summary: artist_summary,
                 logo_ref: artist_logo,
@@ -1896,18 +2115,65 @@ fn scan_library_incremental(
             let artist_name_key = artist_name_key(&artist.name, &artist.id);
             artists_by_name_table.insert(artist_name_key.as_str(), artist.id.as_bytes())?;
 
-            let album = Album {
-                id: album_id.clone(),
-                artist_id: artist_id.clone(),
-                artist_ids: vec![artist_id.clone()],
-                artist_names: vec![artist.name.clone()],
-                title: album_title,
-                year: album_year,
-                folder_relpath,
-                cover_ref: album_cover,
-                genres: album_genres.clone(),
-                summary: album_summary,
+            let (mut album, old_album_name_key, old_album_index_key) = if is_new_album {
+                let album = Album {
+                    id: album_id.clone(),
+                    artist_id: artist_id.clone(),
+                    artist_ids: vec![artist_id.clone()],
+                    artist_names: vec![artist.name.clone()],
+                    title: album_title,
+                    year: album_year,
+                    folder_relpath,
+                    cover_ref: album_cover,
+                    genres: album_genres.clone(),
+                    summary: album_summary,
+                };
+                let old_name_key = album_name_key(&artist.name, &album);
+                let old_index_key = album_index_key(&artist_id, &album);
+                (album, old_name_key, old_index_key)
+            } else {
+                let mut existing = match albums_table.get(album_id.as_str())? {
+                    Some(value) => decode_value::<Album>(value.value())?,
+                    None => Album {
+                        id: album_id.clone(),
+                        artist_id: artist_id.clone(),
+                        artist_ids: vec![artist_id.clone()],
+                        artist_names: vec![artist.name.clone()],
+                        title: album_title,
+                        year: album_year,
+                        folder_relpath,
+                        cover_ref: album_cover.clone(),
+                        genres: Vec::new(),
+                        summary: None,
+                    },
+                };
+                let old_name_key = album_name_key(&artist.name, &existing);
+                let old_index_key = album_index_key(&artist_id, &existing);
+                if existing
+                    .summary
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(summary) = album_summary.and_then(clean_summary) {
+                        existing.summary = Some(summary);
+                    }
+                }
+                merge_genres(&mut existing.genres, &album_genres);
+                if existing.year.is_none() {
+                    existing.year = album_year;
+                }
+                if existing.cover_ref.is_none() {
+                    if let Some(CoverRef::File { relpath }) = album_cover {
+                        existing.cover_ref = Some(CoverRef::File { relpath });
+                    }
+                }
+                (existing, old_name_key, old_index_key)
             };
+
+            album.artist_id = artist_id.clone();
+            album.artist_ids = vec![artist_id.clone()];
+            album.artist_names = vec![artist.name.clone()];
 
             let album_bytes = encode_value(&album)?;
             let prev = albums_table.insert(album_id.as_str(), album_bytes.as_slice())?;
@@ -1916,9 +2182,15 @@ fn scan_library_incremental(
             }
 
             let album_name_key = album_name_key(&artist.name, &album);
+            if album_name_key != old_album_name_key {
+                let _ = albums_by_name_table.remove(old_album_name_key.as_str())?;
+            }
             albums_by_name_table.insert(album_name_key.as_str(), album.id.as_bytes())?;
 
             let album_index_key = album_index_key(&artist_id, &album);
+            if album_index_key != old_album_index_key {
+                let _ = artist_albums_table.remove(old_album_index_key.as_str())?;
+            }
             artist_albums_table.insert(album_index_key.as_str(), album_id.as_bytes())?;
 
             if album_tag_error {
@@ -1958,37 +2230,53 @@ fn scan_library_incremental(
                     .then_with(|| a.relpath.cmp(&b.relpath))
             });
 
-            for (order, draft) in track_drafts.into_iter().enumerate() {
-                let TrackDraft {
-                    id,
-                    relpath,
-                    title,
-                    track_no,
-                    disc_no,
-                    duration_ms,
-                    codec,
-                    sample_rate,
-                    channels,
-                    bitrate,
-                    file_size,
-                    genres,
-                } = draft;
-                let mut track_genres = genres;
+            for draft in track_drafts.into_iter() {
+                let mut track_genres = draft.genres.clone();
                 merge_genres(&mut track_genres, &album_genres);
+                let duplicate_track_id = {
+                    let identities = track_identities_by_album
+                        .entry(album_id.clone())
+                        .or_default();
+                    find_duplicate_track_id(identities, &draft)
+                };
+                if let Some(track_id) = duplicate_track_id {
+                    let existing = match tracks_table.get(track_id.as_str())? {
+                        Some(value) => Some(decode_value::<Track>(value.value())?),
+                        None => None,
+                    };
+                    if let Some(mut existing) = existing {
+                        let before = existing.genres.clone();
+                        merge_genres(&mut existing.genres, &track_genres);
+                        if existing.genres != before {
+                            let bytes = encode_value(&existing)?;
+                            tracks_table.insert(track_id.as_str(), bytes.as_slice())?;
+                        }
+                    }
+                    continue;
+                }
+
+                let order = next_track_order_by_album
+                    .entry(album_id.clone())
+                    .or_insert_with(|| {
+                        track_identities_by_album
+                            .get(&album_id)
+                            .map(|items| items.len())
+                            .unwrap_or(0)
+                    });
                 let track = Track {
-                    id,
+                    id: draft.id.clone(),
                     album_id: album_id.clone(),
                     artist_id: artist_id.clone(),
-                    title,
-                    track_no,
-                    disc_no,
-                    duration_ms,
-                    codec,
-                    sample_rate,
-                    channels,
-                    bitrate,
-                    file_relpath: relpath,
-                    file_size,
+                    title: draft.title.clone(),
+                    track_no: draft.track_no,
+                    disc_no: draft.disc_no,
+                    duration_ms: draft.duration_ms,
+                    codec: draft.codec.clone(),
+                    sample_rate: draft.sample_rate,
+                    channels: draft.channels,
+                    bitrate: draft.bitrate,
+                    file_relpath: draft.relpath.clone(),
+                    file_size: draft.file_size,
                     genres: track_genres,
                 };
 
@@ -1998,8 +2286,15 @@ fn scan_library_incremental(
                     track_count += 1;
                 }
 
-                let track_index_key = album_track_key(&album_id, order, &track.id);
+                embedded_cover_table
+                    .insert(track.id.as_str(), bool_bytes(draft.has_embedded_cover))?;
+                let seek = build_seek_index(track.duration_ms, track.file_size);
+                let seek_bytes = encode_value(&seek)?;
+                seek_table.insert(track.id.as_str(), seek_bytes.as_slice())?;
+
+                let track_index_key = album_track_key(&album_id, *order, &track.id);
                 album_tracks_table.insert(track_index_key.as_str(), track.id.as_bytes())?;
+                *order += 1;
 
                 let track_name_key = track_name_key(
                     &artist.name,
@@ -2010,6 +2305,10 @@ fn scan_library_incremental(
                     &track.id,
                 );
                 tracks_by_name_table.insert(track_name_key.as_str(), track.id.as_bytes())?;
+                track_identities_by_album
+                    .entry(album_id.clone())
+                    .or_default()
+                    .push(track_identity_from_track(&track));
             }
         }
 
@@ -2059,23 +2358,38 @@ fn bool_bytes(value: bool) -> &'static [u8] {
 }
 
 fn merge_genres(target: &mut Vec<String>, incoming: &[String]) {
-    if incoming.is_empty() {
+    if target.is_empty() && incoming.is_empty() {
         return;
     }
-    let mut seen: HashSet<String> = target
-        .iter()
-        .map(|genre| normalize_genre_key(genre))
-        .collect();
-    for genre in incoming {
-        let trimmed = normalize_genre_label(genre.trim());
-        if trimmed.is_empty() {
-            continue;
-        }
-        let key = normalize_genre_key(&trimmed);
-        if seen.insert(key) {
-            target.push(trimmed);
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for genre in target.iter().chain(incoming.iter()) {
+        let genre = normalize_genre_separators(genre);
+        for part in genre.split(&[';', ',', '/', '|', '\0'][..]) {
+            let trimmed = normalize_genre_label(part.trim());
+            if trimmed.is_empty() {
+                continue;
+            }
+            let key = normalize_genre_key(&trimmed);
+            if seen.insert(key) {
+                merged.push(trimmed);
+            }
         }
     }
+    *target = merged;
+}
+
+fn normalize_genre_separators(value: &str) -> String {
+    value
+        .replace("&bull;", "|")
+        .replace("&#8226;", "|")
+        .replace("&#x2022;", "|")
+        .replace("&middot;", "|")
+        .replace("\u{2022}", "|")
+        .replace("\u{00B7}", "|")
+        .replace("\u{00E2}\u{20AC}\u{00A2}", "|")
+        .replace("\u{00E2}\u{0080}\u{00A2}", "|")
+        .replace("\u{00C2}\u{20AC}\u{00A2}", "|")
 }
 
 fn normalize_genre_label(value: &str) -> String {
@@ -2242,6 +2556,123 @@ fn clean_summary(summary: String) -> Option<String> {
     }
 }
 
+fn canonical_artist_key(name: &str) -> String {
+    artist_identity_key(name)
+}
+
+fn canonical_album_group_key(artist_key: &str, album_title: &str) -> String {
+    let mut out = String::new();
+    out.push_str(artist_key);
+    out.push(KEY_SEP);
+    out.push_str(&canonical_text_key(album_title));
+    out
+}
+
+fn canonical_text_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in value.trim().chars() {
+        for lower in ch.to_lowercase() {
+            let mapped = fold_identity_char(lower);
+            if mapped.is_ascii_alphanumeric() {
+                out.push(mapped);
+                last_space = false;
+            } else if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+fn fold_identity_char(ch: char) -> char {
+    match ch {
+        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ą' | 'ǎ' | 'ª' => 'a',
+        'æ' => 'a',
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ď' | 'đ' => 'd',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ƒ' => 'f',
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'ĥ' | 'ħ' => 'h',
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
+        'ĵ' => 'j',
+        'ķ' => 'k',
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => 'n',
+        'ò' | 'ó' | 'ô' | 'ö' | 'õ' | 'ō' | 'ŏ' | 'ő' | 'ø' | 'º' => 'o',
+        'œ' => 'o',
+        'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ś' | 'ŝ' | 'ş' | 'š' | 'ß' => 's',
+        'ţ' | 'ť' | 'ŧ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ŵ' => 'w',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ź' | 'ż' | 'ž' => 'z',
+        _ => ch,
+    }
+}
+
+fn find_compatible_album_identity(
+    identities: &[AlbumIdentity],
+    year: Option<i32>,
+) -> Option<usize> {
+    identities
+        .iter()
+        .position(|existing| album_years_compatible(existing.year, year))
+}
+
+fn album_years_compatible(existing: Option<i32>, incoming: Option<i32>) -> bool {
+    match (existing, incoming) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn merged_album_year(existing: Option<i32>, incoming: Option<i32>) -> Option<i32> {
+    existing.or(incoming)
+}
+
+fn track_identity_from_track(track: &Track) -> TrackIdentity {
+    TrackIdentity {
+        id: track.id.clone(),
+        disc_no: track.disc_no,
+        track_no: track.track_no,
+        title_key: canonical_text_key(&track.title),
+        duration_ms: track.duration_ms,
+    }
+}
+
+fn find_duplicate_track_id(identities: &[TrackIdentity], draft: &TrackDraft) -> Option<String> {
+    identities
+        .iter()
+        .find(|existing| track_identity_matches(existing, draft))
+        .map(|existing| existing.id.clone())
+}
+
+fn track_identity_matches(existing: &TrackIdentity, draft: &TrackDraft) -> bool {
+    if let (Some(left), Some(right)) = (existing.track_no, draft.track_no) {
+        return left == right && disc_numbers_compatible(existing.disc_no, draft.disc_no);
+    }
+    existing.title_key == canonical_text_key(&draft.title)
+        && durations_compatible(existing.duration_ms, draft.duration_ms)
+}
+
+fn disc_numbers_compatible(existing: Option<u16>, incoming: Option<u16>) -> bool {
+    match (existing, incoming) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn durations_compatible(existing_ms: u32, incoming_ms: u32) -> bool {
+    if existing_ms == 0 || incoming_ms == 0 {
+        return true;
+    }
+    existing_ms.abs_diff(incoming_ms) <= 5_000
+}
+
 fn artist_name_key(name: &str, artist_id: &str) -> String {
     let mut out = String::new();
     out.push_str(name.trim().to_lowercase().as_str());
@@ -2401,6 +2832,22 @@ struct TrackDraft {
     bitrate: Option<u32>,
     file_size: u64,
     genres: Vec<String>,
+    has_embedded_cover: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AlbumIdentity {
+    id: String,
+    year: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct TrackIdentity {
+    id: String,
+    disc_no: Option<u16>,
+    track_no: Option<u16>,
+    title_key: String,
+    duration_ms: u32,
 }
 
 fn collect_album_dirs(root: &Path) -> Vec<PathBuf> {
@@ -2775,5 +3222,211 @@ fn roman_to_u16(input: &str) -> Option<u16> {
         None
     } else {
         Some(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_genres_splits_bullet_mojibake_and_dedupes() {
+        let mut genres = vec![
+            "Rock \u{00C2}\u{20AC}\u{00A2} Alternative Rock".to_string(),
+            "rock".to_string(),
+        ];
+        let incoming = vec!["Industrial Rock \u{2022} Alternative Rock".to_string()];
+
+        merge_genres(&mut genres, &incoming);
+
+        assert_eq!(genres, vec!["Rock", "Alternative Rock", "Industrial Rock"]);
+    }
+
+    #[test]
+    fn copied_album_across_roots_collapses_to_one_catalog_entry() {
+        let workspace = TestWorkspace::new("copied-album");
+        workspace.write_audio("root-a/Artist/Album/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album/Song.mp3");
+
+        let library = workspace.load_library(&[("", "root-a"), ("root-b", "root-b")]);
+        let stats = library.stats().unwrap();
+
+        assert_eq!(stats.artists, 1);
+        assert_eq!(stats.albums, 1);
+        assert_eq!(stats.tracks, 1);
+    }
+
+    #[test]
+    fn normalized_artist_names_share_one_artist_with_distinct_albums() {
+        let workspace = TestWorkspace::new("artist-merge");
+        workspace.write_audio("root-a/Jay-Z/First/Song.mp3");
+        workspace.write_audio("root-b/jay z/Second/Song.mp3");
+
+        let library = workspace.load_library(&[("", "root-a"), ("root-b", "root-b")]);
+        let (artists, total) = library.list_artists(None, 20, 0).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(artists.len(), 1);
+        let albums = library.list_artist_albums(&artists[0].id).unwrap();
+        let mut titles = albums
+            .into_iter()
+            .map(|album| album.title)
+            .collect::<Vec<_>>();
+        titles.sort();
+        assert_eq!(titles, vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn canonical_album_artist_merge_reuses_local_artist_identity() {
+        let workspace = TestWorkspace::new("canonical-album-artist");
+        workspace.write_audio("root/System Of A Down/System Of A Down (Deluxe)/Song.mp3");
+        workspace.write_audio("root/System Of A Down/Toxicity/Song.mp3");
+
+        let library = workspace.load_library(&[("", "root")]);
+        let (albums, total_albums) = library.list_albums(None, 20, 0).unwrap();
+        let toxicity = albums
+            .iter()
+            .find(|album| album.title == "Toxicity")
+            .expect("toxicity album");
+
+        assert_eq!(total_albums, 2);
+        assert!(library
+            .merge_album_artists(
+                &toxicity.id,
+                &[Artist {
+                    id: artist_identity_id("System of a Down"),
+                    name: "System of a Down".to_string(),
+                    genres: Vec::new(),
+                    summary: None,
+                    logo_ref: None,
+                    banner_ref: None,
+                }],
+            )
+            .unwrap());
+
+        let (artists, total_artists) = library.list_artists(None, 20, 0).unwrap();
+        assert_eq!(total_artists, 1);
+        assert_eq!(artists[0].name, "System of a Down");
+        assert_eq!(library.list_artist_albums(&artists[0].id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_album_can_contribute_extra_tracks() {
+        let workspace = TestWorkspace::new("extra-track");
+        workspace.write_audio("root-a/Artist/Album/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album/Bonus.mp3");
+
+        let library = workspace.load_library(&[("", "root-a"), ("root-b", "root-b")]);
+        let (albums, total) = library.list_albums(None, 20, 0).unwrap();
+        let tracks = library.get_album_tracks(&albums[0].id).unwrap();
+        let mut titles = tracks
+            .into_iter()
+            .map(|track| track.title)
+            .collect::<Vec<_>>();
+        titles.sort();
+
+        assert_eq!(total, 1);
+        assert_eq!(titles, vec!["Bonus", "Song"]);
+    }
+
+    #[test]
+    fn incremental_scan_merges_duplicate_album_from_later_root() {
+        let workspace = TestWorkspace::new("incremental-extra-track");
+        workspace.write_audio("root-a/Artist/Album/Song.mp3");
+        let library = workspace.load_library(&[("", "root-a"), ("root-b", "root-b")]);
+
+        workspace.write_audio("root-b/Artist/Album/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album/Bonus.mp3");
+        let stats = library.incremental_scan().unwrap();
+        let (albums, total) = library.list_albums(None, 20, 0).unwrap();
+        let tracks = library.get_album_tracks(&albums[0].id).unwrap();
+
+        assert_eq!(stats.artists, 1);
+        assert_eq!(stats.albums, 1);
+        assert_eq!(stats.tracks, 2);
+        assert_eq!(total, 1);
+        assert_eq!(tracks.len(), 2);
+    }
+
+    #[test]
+    fn first_configured_root_wins_duplicate_track_source() {
+        let workspace = TestWorkspace::new("root-order");
+        workspace.write_audio("root-a/Artist/Album/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album/Song.mp3");
+
+        let library = workspace.load_library(&[("preferred", "root-b"), ("", "root-a")]);
+        let (tracks, total) = library.list_tracks(None, 20, 0).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(tracks[0].file_relpath, "preferred::Artist/Album/Song.mp3");
+    }
+
+    #[test]
+    fn conflicting_non_empty_album_years_do_not_merge() {
+        let workspace = TestWorkspace::new("year-conflict");
+        workspace.write_audio("root-a/Artist/Album (1999)/Song.mp3");
+        workspace.write_audio("root-b/Artist/Album (2000)/Song.mp3");
+
+        let library = workspace.load_library(&[("", "root-a"), ("root-b", "root-b")]);
+        let (albums, total) = library.list_albums(None, 20, 0).unwrap();
+        let mut years = albums
+            .into_iter()
+            .map(|album| album.year)
+            .collect::<Vec<_>>();
+        years.sort();
+
+        assert_eq!(total, 2);
+        assert_eq!(years, vec![Some(1999), Some(2000)]);
+    }
+
+    struct TestWorkspace {
+        root: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "phonolite-library-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn write_audio(&self, relpath: &str) {
+            let path = self.path(relpath);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, b"not really audio").unwrap();
+        }
+
+        fn load_library(&self, roots: &[(&str, &str)]) -> Library {
+            let roots = roots
+                .iter()
+                .map(|(id, relpath)| LibraryRoot::new((*id).to_string(), self.path(relpath)))
+                .collect::<Vec<_>>();
+            let db_path = self.path("library.redb");
+            Library::load_or_scan(roots, db_path).unwrap().0
+        }
+
+        fn path(&self, relpath: &str) -> PathBuf {
+            let mut path = self.root.clone();
+            for part in relpath.split('/') {
+                path.push(part);
+            }
+            path
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }

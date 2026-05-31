@@ -9,13 +9,14 @@ use axum::{
 };
 use tracing::warn;
 
+use crate::assets::clear_metadata_assets;
 use crate::config::{
     new_music_root_id, normalize_music_roots, resolve_path, save_config, MetadataSourceConfig,
     MusicRootConfig,
 };
 use crate::external::{self, ExternalSource};
 use crate::scan::{
-    apply_music_roots_update, new_source_id, parse_provider, source_fields_from_parts,
+    apply_music_roots_update, new_source_id, parse_provider, source_fields_from_parts, start_rescan,
 };
 use crate::state::{
     AppState, DebugLogToggleForm, MetadataSourceForm, MetadataTestForm, MetadataToggleForm,
@@ -555,6 +556,16 @@ pub async fn admin_delete_metadata_source(
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
     *state.config.write() = config;
+    let library = state.library_state.read().library.clone();
+    if let Err(err) = clear_metadata_assets(&state).await {
+        warn!(
+            "Failed to clear metadata assets after source delete: {}",
+            err
+        );
+    }
+    if let Some(library) = library {
+        start_rescan(state.clone(), library, true);
+    }
     json_ok_response()
 }
 

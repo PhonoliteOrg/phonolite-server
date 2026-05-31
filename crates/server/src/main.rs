@@ -4,8 +4,10 @@ mod api;
 mod assets;
 mod auth;
 mod config;
+mod download_jobs;
 mod external;
 mod logging;
+mod metadata_events;
 mod musicbrainz_album_artists;
 mod musicbrainz_rate_limit;
 mod quic;
@@ -33,7 +35,9 @@ use axum::Router;
 use config::{
     bind_target, config_path_from_env, load_or_create_config, resolve_music_roots, resolve_path,
 };
+use download_jobs::DownloadJobStore;
 use library::Library;
+use metadata_events::MetadataEventBus;
 use parking_lot::RwLock;
 use reqwest::Client;
 use scan::{set_library_missing, start_index};
@@ -106,6 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = user_data.init_tables() {
         warn!("Failed to create user data tables: {:?}", err);
     }
+    let download_jobs = DownloadJobStore::new(Arc::clone(&user_db));
+    if let Err(err) = download_jobs.init_tables() {
+        warn!("Failed to create download job tables: {}", err);
+    }
 
     let stats_db_path = resolve_path(&config_path, "stats.redb");
     if let Some(parent) = stats_db_path.parent() {
@@ -140,6 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         external_client,
         stream_sessions: stream_sessions::StreamSessions::new(),
         stream_cache,
+        metadata_events: MetadataEventBus::new(1024),
+        download_jobs,
     };
     let roots = resolve_music_roots(&state.config_path, &config.music_roots);
     if roots.is_empty() {
