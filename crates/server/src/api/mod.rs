@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 
@@ -53,6 +53,18 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/library/playlists/:playlist_id",
             axum::routing::delete(user_data::delete_playlist),
+        )
+        .route(
+            "/library/playlists/:playlist_id/cover",
+            get(user_data::get_playlist_cover),
+        )
+        .route(
+            "/library/playlists/:playlist_id/cover",
+            put(user_data::upload_playlist_cover),
+        )
+        .route(
+            "/library/playlists/:playlist_id/cover",
+            axum::routing::delete(user_data::delete_playlist_cover),
         )
         .route("/library/likes/batch", post(user_data::batch_update_likes))
         .route("/library/likes/:track_id", post(user_data::add_like))

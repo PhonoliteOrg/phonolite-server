@@ -125,6 +125,10 @@ pub struct Playlist {
     pub name: String,
     #[serde(default)]
     pub track_ids: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub image_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,12 +136,15 @@ pub struct CreatePlaylistRequest {
     pub name: String,
     #[serde(default)]
     pub track_ids: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePlaylistRequest {
     pub name: Option<String>,
     pub track_ids: Option<Vec<String>>,
+    pub description: Option<String>,
 }
 
 #[derive(Clone)]

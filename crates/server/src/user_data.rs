@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::state::Playlist;
 
 const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlists");
+const PLAYLIST_IMAGES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlist_images");
 const LIKES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("likes");
 const PLAYBACK_SETTINGS_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("playback_settings");
@@ -30,6 +31,31 @@ pub struct LikeState {
     pub liked: bool,
     #[serde(default)]
     pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaylistImage {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyPlaylist {
+    id: String,
+    name: String,
+    #[serde(default)]
+    track_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PlaylistWithImageRefLegacy {
+    id: String,
+    name: String,
+    #[serde(default)]
+    track_ids: Vec<String>,
+    #[serde(default)]
+    image_ref: Option<String>,
 }
 
 impl LikeState {
@@ -55,6 +81,7 @@ impl UserDataStore {
         let write_txn = self.db.begin_write()?;
         {
             let _ = write_txn.open_table(PLAYLISTS_TABLE)?;
+            let _ = write_txn.open_table(PLAYLIST_IMAGES_TABLE)?;
             let _ = write_txn.open_table(LIKES_TABLE)?;
             let _ = write_txn.open_table(PLAYBACK_SETTINGS_TABLE)?;
         }
@@ -72,7 +99,7 @@ impl UserDataStore {
         let mut items = Vec::new();
         for entry in table.iter()? {
             let entry = entry?;
-            let playlist: Playlist = decode_value(entry.1.value())?;
+            let playlist = decode_playlist(entry.1.value())?;
             items.push(playlist);
         }
         Ok(items)
@@ -86,7 +113,7 @@ impl UserDataStore {
             Err(err) => return Err(err.into()),
         };
         let playlist = match table.get(playlist_id)? {
-            Some(value) => Some(decode_value(value.value())?),
+            Some(value) => Some(decode_playlist(value.value())?),
             None => None,
         };
         Ok(playlist)
@@ -95,12 +122,15 @@ impl UserDataStore {
     pub fn create_playlist(
         &self,
         name: String,
+        description: Option<String>,
         track_ids: Vec<String>,
     ) -> Result<Playlist, UserDataError> {
         let playlist = Playlist {
             id: Uuid::new_v4().to_string(),
             name,
             track_ids,
+            description: normalize_optional_text(description),
+            image_ref: None,
         };
         let write_txn = self.db.begin_write()?;
         {
@@ -116,6 +146,7 @@ impl UserDataStore {
         &self,
         playlist_id: &str,
         name: Option<String>,
+        description: Option<String>,
         track_ids: Option<Vec<String>>,
     ) -> Result<Option<Playlist>, UserDataError> {
         let write_txn = self.db.begin_write()?;
@@ -125,12 +156,15 @@ impl UserDataStore {
                 Err(TableError::TableDoesNotExist(_)) => return Ok(None),
                 Err(err) => return Err(err.into()),
             };
-            let mut playlist: Playlist = match table.get(playlist_id)? {
-                Some(value) => decode_value(value.value())?,
+            let mut playlist = match table.get(playlist_id)? {
+                Some(value) => decode_playlist(value.value())?,
                 None => return Ok(None),
             };
             if let Some(name) = name {
                 playlist.name = name;
+            }
+            if let Some(description) = description {
+                playlist.description = normalize_optional_text(Some(description));
             }
             if let Some(track_ids) = track_ids {
                 playlist.track_ids = track_ids;
@@ -143,15 +177,110 @@ impl UserDataStore {
         Ok(Some(updated))
     }
 
+    pub fn get_playlist_image(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Option<PlaylistImage>, UserDataError> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(PLAYLIST_IMAGES_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let image = match table.get(playlist_id)? {
+            Some(value) => Some(decode_value(value.value())?),
+            None => None,
+        };
+        Ok(image)
+    }
+
+    pub fn set_playlist_image(
+        &self,
+        playlist_id: &str,
+        content_type: String,
+        bytes: Vec<u8>,
+    ) -> Result<Option<Playlist>, UserDataError> {
+        let updated_at = now_millis();
+        let image = PlaylistImage {
+            content_type,
+            bytes,
+            updated_at,
+        };
+        let write_txn = self.db.begin_write()?;
+        let updated = {
+            let playlist = {
+                let mut table = match write_txn.open_table(PLAYLISTS_TABLE) {
+                    Ok(table) => table,
+                    Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let mut playlist = match table.get(playlist_id)? {
+                    Some(value) => decode_playlist(value.value())?,
+                    None => return Ok(None),
+                };
+                playlist.image_ref = Some(format!("{}-{}", updated_at, Uuid::new_v4()));
+                let playlist_bytes = encode_value(&playlist)?;
+                table.insert(playlist_id, playlist_bytes.as_slice())?;
+                playlist
+            };
+            {
+                let mut table = write_txn.open_table(PLAYLIST_IMAGES_TABLE)?;
+                let image_bytes = encode_value(&image)?;
+                table.insert(playlist_id, image_bytes.as_slice())?;
+            }
+            playlist
+        };
+        write_txn.commit()?;
+        Ok(Some(updated))
+    }
+
+    pub fn clear_playlist_image(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Option<Playlist>, UserDataError> {
+        let write_txn = self.db.begin_write()?;
+        let updated = {
+            let playlist = {
+                let mut table = match write_txn.open_table(PLAYLISTS_TABLE) {
+                    Ok(table) => table,
+                    Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let mut playlist = match table.get(playlist_id)? {
+                    Some(value) => decode_playlist(value.value())?,
+                    None => return Ok(None),
+                };
+                playlist.image_ref = None;
+                let playlist_bytes = encode_value(&playlist)?;
+                table.insert(playlist_id, playlist_bytes.as_slice())?;
+                playlist
+            };
+            {
+                let mut table = write_txn.open_table(PLAYLIST_IMAGES_TABLE)?;
+                let _ = table.remove(playlist_id)?;
+            }
+            playlist
+        };
+        write_txn.commit()?;
+        Ok(Some(updated))
+    }
+
     pub fn delete_playlist(&self, playlist_id: &str) -> Result<bool, UserDataError> {
         let write_txn = self.db.begin_write()?;
         let deleted = {
-            let mut table = match write_txn.open_table(PLAYLISTS_TABLE) {
-                Ok(table) => table,
-                Err(TableError::TableDoesNotExist(_)) => return Ok(false),
-                Err(err) => return Err(err.into()),
+            let removed = {
+                let mut table = match write_txn.open_table(PLAYLISTS_TABLE) {
+                    Ok(table) => table,
+                    Err(TableError::TableDoesNotExist(_)) => return Ok(false),
+                    Err(err) => return Err(err.into()),
+                };
+                let removed = table.remove(playlist_id)?.is_some();
+                removed
             };
-            let removed = table.remove(playlist_id)?.is_some();
+            if removed {
+                let mut images = write_txn.open_table(PLAYLIST_IMAGES_TABLE)?;
+                let _ = images.remove(playlist_id)?;
+            }
             removed
         };
         write_txn.commit()?;
@@ -362,6 +491,37 @@ fn decode_value<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, UserDat
     Ok(bincode::deserialize(bytes)?)
 }
 
+fn decode_playlist(bytes: &[u8]) -> Result<Playlist, UserDataError> {
+    match bincode::deserialize::<Playlist>(bytes) {
+        Ok(playlist) => Ok(playlist),
+        Err(_) => {
+            if let Ok(legacy) = bincode::deserialize::<PlaylistWithImageRefLegacy>(bytes) {
+                return Ok(Playlist {
+                    id: legacy.id,
+                    name: legacy.name,
+                    track_ids: legacy.track_ids,
+                    description: None,
+                    image_ref: legacy.image_ref,
+                });
+            }
+            let legacy: LegacyPlaylist = decode_value(bytes)?;
+            Ok(Playlist {
+                id: legacy.id,
+                name: legacy.name,
+                track_ids: legacy.track_ids,
+                description: None,
+                image_ref: None,
+            })
+        }
+    }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn decode_like_state(bytes: &[u8]) -> LikeState {
     match bincode::deserialize::<LikeState>(bytes) {
         Ok(state) => state,
@@ -496,5 +656,95 @@ mod tests {
         assert!(state.liked);
         assert_eq!(state.updated_at, 1234);
         assert_eq!(store.list_likes().unwrap(), vec!["track-3"]);
+    }
+
+    #[test]
+    fn legacy_playlist_rows_decode_without_image_ref() {
+        let (store, _db) = test_store();
+        let legacy = LegacyPlaylist {
+            id: "playlist-legacy".to_string(),
+            name: "Legacy".to_string(),
+            track_ids: vec!["track-1".to_string()],
+        };
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(PLAYLISTS_TABLE).unwrap();
+            let bytes = encode_value(&legacy).unwrap();
+            table.insert("playlist-legacy", bytes.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let playlists = store.list_playlists().unwrap();
+
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].id, "playlist-legacy");
+        assert_eq!(playlists[0].track_ids, vec!["track-1"]);
+        assert_eq!(playlists[0].description, None);
+        assert_eq!(playlists[0].image_ref, None);
+    }
+
+    #[test]
+    fn playlist_rows_with_image_ref_decode_without_description() {
+        let (store, _db) = test_store();
+        let legacy = PlaylistWithImageRefLegacy {
+            id: "playlist-image-legacy".to_string(),
+            name: "Legacy Cover".to_string(),
+            track_ids: vec!["track-1".to_string()],
+            image_ref: Some("cover-rev".to_string()),
+        };
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(PLAYLISTS_TABLE).unwrap();
+            let bytes = encode_value(&legacy).unwrap();
+            table
+                .insert("playlist-image-legacy", bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let playlists = store.list_playlists().unwrap();
+
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].description, None);
+        assert_eq!(playlists[0].image_ref.as_deref(), Some("cover-rev"));
+    }
+
+    #[test]
+    fn playlist_image_lifecycle_updates_ref_and_deletes_blob() {
+        let (store, _db) = test_store();
+        let playlist = store
+            .create_playlist(
+                "Mix".to_string(),
+                Some("Playlist summary".to_string()),
+                vec!["track-1".to_string()],
+            )
+            .unwrap();
+        assert_eq!(playlist.description.as_deref(), Some("Playlist summary"));
+        assert_eq!(playlist.image_ref, None);
+
+        let updated = store
+            .set_playlist_image(&playlist.id, "image/png".to_string(), vec![1, 2, 3])
+            .unwrap()
+            .expect("playlist should exist");
+        assert!(updated.image_ref.is_some());
+        let image = store
+            .get_playlist_image(&playlist.id)
+            .unwrap()
+            .expect("image should exist");
+        assert_eq!(image.content_type, "image/png");
+        assert_eq!(image.bytes, vec![1, 2, 3]);
+
+        let cleared = store
+            .clear_playlist_image(&playlist.id)
+            .unwrap()
+            .expect("playlist should exist");
+        assert_eq!(cleared.image_ref, None);
+        assert!(store.get_playlist_image(&playlist.id).unwrap().is_none());
+
+        store
+            .set_playlist_image(&playlist.id, "image/jpeg".to_string(), vec![4, 5, 6])
+            .unwrap();
+        assert!(store.delete_playlist(&playlist.id).unwrap());
+        assert!(store.get_playlist_image(&playlist.id).unwrap().is_none());
     }
 }
