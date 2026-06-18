@@ -29,6 +29,7 @@ const SEEK_RECOVERY_TARGET_MS: u32 = 400;
 const PREFETCH_TRACK_LIMIT: usize = 1;
 const STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const STATS_MAX_PLAYBACK_DELTA_MS: u64 = 15_000;
+const BUFFER_REPORT_STALE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -269,6 +270,7 @@ struct SessionState {
     track_streams: HashMap<String, u64>,
     buffer_target_ms: u32,
     client_buffer_ms: u32,
+    last_buffer_report: Instant,
     last_debug: Instant,
     stats_pending_ms: u64,
     stats_pending_plays: u64,
@@ -282,6 +284,7 @@ struct SessionState {
 
 impl SessionState {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             authed: false,
             user_id: None,
@@ -296,7 +299,8 @@ impl SessionState {
             track_streams: HashMap::new(),
             buffer_target_ms: 8000,
             client_buffer_ms: 0,
-            last_debug: Instant::now(),
+            last_buffer_report: now,
+            last_debug: now,
             stats_pending_ms: 0,
             stats_pending_plays: 0,
             stats_track_id: None,
@@ -780,6 +784,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             target_ms,
         } => {
             client.session.client_buffer_ms = buffer_ms;
+            client.session.last_buffer_report = Instant::now();
             if let Some(target) = target_ms {
                 client.session.buffer_target_ms = target;
             }
@@ -963,6 +968,12 @@ fn allowed_prefetch_tracks(session: &SessionState) -> Vec<String> {
 
 fn should_prefetch(session: &SessionState) -> bool {
     session.buffer_target_ms > 0 && session.client_buffer_ms >= session.buffer_target_ms
+}
+
+fn active_backpressure_paused(session: &SessionState, now: Instant) -> bool {
+    session.buffer_target_ms > 0
+        && session.client_buffer_ms >= session.buffer_target_ms
+        && now.duration_since(session.last_buffer_report) <= BUFFER_REPORT_STALE_AFTER
 }
 
 fn report_active_buffer(state: &AppState, session: &SessionState) {
@@ -1314,11 +1325,13 @@ fn flush_control(session: &mut SessionState, conn: &mut quiche::Connection) {
 }
 
 fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
+    let now = Instant::now();
     let mut finished = Vec::new();
     let mut active_failures = Vec::new();
     let mut active_ids = Vec::new();
     let mut prefetch_ids = Vec::new();
     let prefetch_allowed = should_prefetch(session);
+    let active_paused = active_backpressure_paused(session, now);
     let active_track = session.active_track.clone();
     for (stream_id, outgoing) in session.outgoing.iter() {
         if outgoing.role == StreamRole::Active {
@@ -1339,11 +1352,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
         if !force_send && outgoing.role == StreamRole::Prefetch && !prefetch_allowed {
             continue;
         }
-        if !force_send
-            && outgoing.role == StreamRole::Active
-            && session.buffer_target_ms > 0
-            && session.client_buffer_ms >= session.buffer_target_ms
-        {
+        if !force_send && outgoing.role == StreamRole::Active && active_paused {
             continue;
         }
         outgoing.drain_incoming();
@@ -1441,13 +1450,13 @@ fn maybe_log_streams(session: &mut SessionState, conn: &quiche::Connection) {
     }
     session.last_debug = now;
     let path = conn.path_stats().next();
+    let buffer_report_age_ms = now.duration_since(session.last_buffer_report).as_millis();
+    let active_paused = active_backpressure_paused(session, now);
     for outgoing in session.outgoing.values() {
         let capacity = conn.stream_capacity(outgoing.stream_id).ok();
-        let paused = outgoing.role == StreamRole::Active
-            && session.buffer_target_ms > 0
-            && session.client_buffer_ms >= session.buffer_target_ms;
+        let paused = outgoing.role == StreamRole::Active && active_paused;
         tracing::info!(
-            "QUIC stream debug track={} role={:?} pending_chunks={} buffered_bytes={} finished={} sent_bytes={} since_last_send_ms={} since_last_drain_ms={} client_buffer_ms={} target_ms={} paused={} capacity={:?} established={} stats_sent={} stats_recv={} path={:?}",
+            "QUIC stream debug track={} role={:?} pending_chunks={} buffered_bytes={} finished={} sent_bytes={} since_last_send_ms={} since_last_drain_ms={} client_buffer_ms={} target_ms={} buffer_report_age_ms={} paused={} capacity={:?} established={} stats_sent={} stats_recv={} path={:?}",
             outgoing.track_id,
             outgoing.role,
             outgoing.pending.len(),
@@ -1458,6 +1467,7 @@ fn maybe_log_streams(session: &mut SessionState, conn: &quiche::Connection) {
             now.duration_since(outgoing.last_drain).as_millis(),
             session.client_buffer_ms,
             session.buffer_target_ms,
+            buffer_report_age_ms,
             paused,
             capacity,
             conn.is_established(),
