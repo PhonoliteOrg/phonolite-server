@@ -172,6 +172,7 @@ struct OutgoingStream {
     last_drain: Instant,
     last_send_log: Instant,
     last_send_err: Option<String>,
+    producer_failure: Option<String>,
 }
 
 impl OutgoingStream {
@@ -210,6 +211,7 @@ impl OutgoingStream {
             last_drain: now,
             last_send_log: now,
             last_send_err: None,
+            producer_failure: None,
         }
     }
 
@@ -230,7 +232,16 @@ impl OutgoingStream {
                     self.pending.push_back(bytes);
                     self.last_drain = Instant::now();
                 }
-                Ok(Err(_)) => {
+                Ok(Err(err)) => {
+                    let message = err.to_string();
+                    tracing::warn!(
+                        "QUIC stream producer failed track={} role={:?} stream_id={} err={}",
+                        self.track_id,
+                        self.role,
+                        self.stream_id,
+                        message
+                    );
+                    self.producer_failure = Some(message);
                     self.finished = true;
                     break;
                 }
@@ -1255,16 +1266,21 @@ fn reset_outgoing_seek_state(outgoing: &mut OutgoingStream) {
     outgoing.last_drain = now;
     outgoing.last_send_log = now;
     outgoing.last_send_err = None;
+    outgoing.producer_failure = None;
 }
 
-fn send_control(client: &mut ClientConn, message: ControlResponse<'_>) {
+fn enqueue_control(outbox: &mut ControlOutbox, message: ControlResponse<'_>) {
     let payload = match serde_json::to_string(&message) {
         Ok(value) => value,
         Err(_) => return,
     };
     let mut line = payload;
     line.push('\n');
-    client.session.control_outbox.enqueue(Bytes::from(line));
+    outbox.enqueue(Bytes::from(line));
+}
+
+fn send_control(client: &mut ClientConn, message: ControlResponse<'_>) {
+    enqueue_control(&mut client.session.control_outbox, message);
 }
 
 fn flush_control(session: &mut SessionState, conn: &mut quiche::Connection) {
@@ -1299,9 +1315,11 @@ fn flush_control(session: &mut SessionState, conn: &mut quiche::Connection) {
 
 fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     let mut finished = Vec::new();
+    let mut active_failures = Vec::new();
     let mut active_ids = Vec::new();
     let mut prefetch_ids = Vec::new();
     let prefetch_allowed = should_prefetch(session);
+    let active_track = session.active_track.clone();
     for (stream_id, outgoing) in session.outgoing.iter() {
         if outgoing.role == StreamRole::Active {
             active_ids.push(*stream_id);
@@ -1329,6 +1347,13 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
             continue;
         }
         outgoing.drain_incoming();
+        if let Some(failure) = outgoing.producer_failure.take() {
+            if outgoing.role == StreamRole::Active
+                && active_track.as_deref() == Some(outgoing.track_id.as_str())
+            {
+                active_failures.push((outgoing.track_id.clone(), failure));
+            }
+        }
         loop {
             let (send_result, data_len) = match outgoing.pending.front() {
                 Some(front) => {
@@ -1399,6 +1424,13 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     for (stream_id, track_id) in finished {
         session.outgoing.remove(&stream_id);
         session.track_streams.remove(&track_id);
+    }
+    for (track_id, failure) in active_failures {
+        let message = format!("stream failed for {}: {}", track_id, failure);
+        enqueue_control(
+            &mut session.control_outbox,
+            ControlResponse::Error { message: &message },
+        );
     }
 }
 
