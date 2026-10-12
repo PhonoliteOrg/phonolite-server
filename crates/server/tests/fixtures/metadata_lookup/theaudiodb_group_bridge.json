@@ -1,0 +1,401 @@
+{
+  "scope": "Captured TheAudioDB album-mb.php response replay, conditional on separately verified local MusicBrainz programme identity; not evidence of seventeen fresh runtime searches.",
+  "captured_date": "2026-10-05",
+  "description_placeholder": "Description present in captured provider response; text omitted.",
+  "sanitization": "Only provider artist, album, release-group ID, genre and style fields are retained. Description placeholders appear only where saved has_description was true. Side B reuses its verified parent-group capture.",
+  "cases": [
+    {
+      "case": "rubinstein",
+      "local_title": "Chopin : Nocturnes (1999 remastered)",
+      "requested_release_group_id": "edcd2dd7-356e-4f10-a904-e9b4ad17140e",
+      "captured_request_case": "rubinstein-chopin",
+      "captured_http_status": 200,
+      "expected_metadata_present": false,
+      "expected_description_present": false,
+      "expected_genres": [],
+      "payload": {
+        "album": []
+      }
+    },
+    {
+      "case": "bee-gees",
+      "local_title": "The Bee Gee's Sing & Play 14 Barry Gibb Songs",
+      "requested_release_group_id": "433dbc2c-16ec-3b99-9c49-d89bf01491b7",
+      "captured_request_case": "bee-gees",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": false,
+      "expected_genres": [
+        "Disco"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Bee Gees",
+            "strAlbum": "The Bee Gees Sing and Play 14 Barry Gibb Songs",
+            "strMusicBrainzID": "433dbc2c-16ec-3b99-9c49-d89bf01491b7",
+            "strGenre": "Disco",
+            "strStyle": ""
+          }
+        ]
+      }
+    },
+    {
+      "case": "eminem-lp2",
+      "local_title": "The Marshall Mathers LP2",
+      "requested_release_group_id": "b1fdc9cc-8680-44da-abab-59edca6b2ad3",
+      "captured_request_case": "eminem-lp2",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop",
+        "Urban",
+        "R&B"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Eminem",
+            "strAlbum": "The Marshall Mathers LP 2",
+            "strMusicBrainzID": "b1fdc9cc-8680-44da-abab-59edca6b2ad3",
+            "strGenre": "Hip-Hop",
+            "strStyle": "Urban/R&B",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "eminem-murdered",
+      "local_title": "Music To Be Murdered By (Explicit)",
+      "requested_release_group_id": "bc217c64-db43-4311-9b73-fca6d25c4ac5",
+      "captured_request_case": "eminem-murdered",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Eminem",
+            "strAlbum": "Music To Be Murdered By",
+            "strMusicBrainzID": "bc217c64-db43-4311-9b73-fca6d25c4ac5",
+            "strGenre": "Hip-Hop",
+            "strStyle": "",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "eminem-side-b",
+      "local_title": "Music To Be Murdered By - Side B (Deluxe Edition) (Explicit)",
+      "requested_release_group_id": "bc217c64-db43-4311-9b73-fca6d25c4ac5",
+      "captured_request_case": "eminem-murdered",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Eminem",
+            "strAlbum": "Music To Be Murdered By",
+            "strMusicBrainzID": "bc217c64-db43-4311-9b73-fca6d25c4ac5",
+            "strGenre": "Hip-Hop",
+            "strStyle": "",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "jansen",
+      "local_title": "Vivaldi: The Four Seasons",
+      "requested_release_group_id": "8d31a2ad-7fd3-3490-814a-d489dd46feee",
+      "captured_request_case": "jansen",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": false,
+      "expected_genres": [
+        "Composer",
+        "Classical"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Antonio Vivaldi",
+            "strAlbum": "The Four Seasons",
+            "strMusicBrainzID": "8d31a2ad-7fd3-3490-814a-d489dd46feee",
+            "strGenre": "Composer",
+            "strStyle": "Classical"
+          }
+        ]
+      }
+    },
+    {
+      "case": "watch-throne",
+      "local_title": "Watch The Throne",
+      "requested_release_group_id": "a96597aa-93b4-4e14-9e6e-03892ab24979",
+      "captured_request_case": "watch-throne",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop",
+        "Urban",
+        "R&B"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Jay-Z",
+            "strAlbum": "Watch the Throne",
+            "strMusicBrainzID": "a96597aa-93b4-4e14-9e6e-03892ab24979",
+            "strGenre": "Hip-Hop",
+            "strStyle": "Urban/R&B",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "korn",
+      "local_title": "Untitled (Deluxe)",
+      "requested_release_group_id": "4ee42fb0-056a-38bf-8a89-e4cf8e4a57ed",
+      "captured_request_case": "korn",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Nu Metal",
+        "Metal"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Korn",
+            "strAlbum": "[untitled]",
+            "strMusicBrainzID": "4ee42fb0-056a-38bf-8a89-e4cf8e4a57ed",
+            "strGenre": "Nu Metal",
+            "strStyle": "Metal",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "bernstein",
+      "local_title": "Gershwin: Rhapsody in Blue",
+      "requested_release_group_id": "d7582348-9d31-390a-88b5-a055d04b6264",
+      "captured_request_case": "bernstein-correct-program",
+      "captured_http_status": 200,
+      "expected_metadata_present": false,
+      "expected_description_present": false,
+      "expected_genres": [],
+      "payload": {
+        "album": []
+      }
+    },
+    {
+      "case": "linkin",
+      "local_title": "Minutes To Midnight (Explicit)",
+      "requested_release_group_id": "a4201f5c-f0d7-319c-ba9d-ba0bac38da7a",
+      "captured_request_case": "linkin",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Metal",
+        "Rock",
+        "Pop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Linkin Park",
+            "strAlbum": "Minutes to Midnight",
+            "strMusicBrainzID": "a4201f5c-f0d7-319c-ba9d-ba0bac38da7a",
+            "strGenre": "Metal",
+            "strStyle": "Rock/Pop",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "lugansky",
+      "local_title": "Rachmaninov : 24 Preludes",
+      "requested_release_group_id": "1f7e4423-831c-4734-9e15-7f87b3984dc2",
+      "captured_request_case": "lugansky",
+      "captured_http_status": 200,
+      "expected_metadata_present": false,
+      "expected_description_present": false,
+      "expected_genres": [],
+      "payload": {
+        "album": []
+      }
+    },
+    {
+      "case": "love-symbol",
+      "local_title": "[Love Symbol]",
+      "requested_release_group_id": "764f7332-b637-3a71-ae3c-934cdfff3b40",
+      "captured_request_case": "love-symbol",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Funk",
+        "Rock",
+        "Pop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Prince & The New Power Generation",
+            "strAlbum": "Symbol Album",
+            "strMusicBrainzID": "764f7332-b637-3a71-ae3c-934cdfff3b40",
+            "strGenre": "Funk",
+            "strStyle": "Rock/Pop",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "prince-around",
+      "local_title": "Around The World In A Day (Deluxe Expanded Edition)",
+      "requested_release_group_id": "10b61b06-5cd5-39ef-976e-aba8bc4fb51d",
+      "captured_request_case": "prince-around",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Funk",
+        "Rock",
+        "Pop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "The Revolution",
+            "strAlbum": "Around the World in a Day",
+            "strMusicBrainzID": "10b61b06-5cd5-39ef-976e-aba8bc4fb51d",
+            "strGenre": "Funk",
+            "strStyle": "Rock/Pop",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "kelly-best",
+      "local_title": "The Best Of Both Worlds",
+      "requested_release_group_id": "ab707828-0ec1-32ef-aada-fd1bc503da52",
+      "captured_request_case": "kelly-best",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop",
+        "Urban",
+        "R&B"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Jay\u2010Z",
+            "strAlbum": "The Best of Both Worlds",
+            "strMusicBrainzID": "ab707828-0ec1-32ef-aada-fd1bc503da52",
+            "strGenre": "Hip-Hop",
+            "strStyle": "Urban/R&B",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "kelly-unfinished",
+      "local_title": "Unfinished Business",
+      "requested_release_group_id": "1b97fe26-be57-3589-9138-1bd3611d166c",
+      "captured_request_case": "kelly-unfinished",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Hip-Hop",
+        "Urban",
+        "R&B"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Jay\u2010Z",
+            "strAlbum": "Unfinished Business",
+            "strMusicBrainzID": "1b97fe26-be57-3589-9138-1bd3611d166c",
+            "strGenre": "Hip-Hop",
+            "strStyle": "Urban/R&B",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "rhcp",
+      "local_title": "Red Hot Chili Peppers",
+      "requested_release_group_id": "cb453955-e748-31c2-91e6-db01681886a5",
+      "captured_request_case": "rhcp",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Alternative Rock",
+        "Rock",
+        "Pop"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Red Hot Chili Peppers",
+            "strAlbum": "The Red Hot Chili Peppers",
+            "strMusicBrainzID": "cb453955-e748-31c2-91e6-db01681886a5",
+            "strGenre": "Alternative Rock",
+            "strStyle": "Rock/Pop",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    },
+    {
+      "case": "flower-boy",
+      "local_title": "Flower Boy",
+      "requested_release_group_id": "e248e931-c26c-4c94-aba2-2f89ce583901",
+      "captured_request_case": "flower-boy",
+      "captured_http_status": 200,
+      "expected_metadata_present": true,
+      "expected_description_present": true,
+      "expected_genres": [
+        "Rap",
+        "Urban",
+        "R&B"
+      ],
+      "payload": {
+        "album": [
+          {
+            "strArtist": "Tyler, the Creator",
+            "strAlbum": "Scum Fuck Flower Boy",
+            "strMusicBrainzID": "e248e931-c26c-4c94-aba2-2f89ce583901",
+            "strGenre": "Rap",
+            "strStyle": "Urban/R&B",
+            "strDescription": "Description present in captured provider response; text omitted."
+          }
+        ]
+      }
+    }
+  ]
+}

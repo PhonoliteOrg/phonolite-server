@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod browse;
 pub mod download_v2;
+mod downloads;
 pub mod library;
 pub mod player;
 pub mod server;
@@ -20,13 +21,16 @@ use axum::{
     Json, Router,
 };
 
-use crate::admin::extract_token;
+use crate::http::extract_token;
+use crate::http::{json_error, json_error_response};
 use crate::state::{AppState, AuthContext, HealthResponse};
-use crate::utils::{json_error, json_error_response};
 
 pub fn api_router(state: AppState) -> Router {
     let auth = Router::new()
-        .route("/auth/login", post(auth::auth_login))
+        .route("/auth/opaque/start", post(crate::security::start))
+        .route("/auth/opaque/finish", post(crate::security::finish))
+        .layer(axum::extract::DefaultBodyLimit::max(4096))
+        .layer(middleware::from_fn(crate::security::deadline))
         .route("/auth/logout", post(auth::auth_logout));
 
     let protected = Router::new()
@@ -95,6 +99,10 @@ pub fn api_router(state: AppState) -> Router {
         .route("/browse/artists", get(browse::list_artists))
         .route("/browse/artists/:artist_id", get(browse::get_artist))
         .route(
+            "/browse/artists/:artist_id/releases",
+            get(browse::list_artist_releases),
+        )
+        .route(
             "/browse/artists/:artist_id/albums",
             get(browse::list_artist_albums),
         )
@@ -117,6 +125,14 @@ pub fn api_router(state: AppState) -> Router {
             get(library::get_album_cover),
         )
         .route("/stats", get(stats::get_stats))
+        .route("/stats/v2/state", get(stats::counter_state))
+        .route("/stats/v2/snapshot", get(stats::counter_snapshot))
+        .route("/stats/v2/batch", post(stats::ingest_counters))
+        .route("/stats/v2/activate", post(stats::activate_counters))
+        .route("/stats/sync", get(stats::sync_stats))
+        .route("/stats/events", post(stats::ingest_stats))
+        .route("/stats/preferences", post(stats::update_stats_preference))
+        .route("/stats/reset", post(stats::reset_stats))
         .route("/player/settings", get(player::get_playback_settings))
         .route("/player/settings", post(player::update_playback_settings))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));

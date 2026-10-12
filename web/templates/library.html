@@ -1,10 +1,9 @@
-<div class="stack">
-    <div id="library-message">{{message}}</div>
-    {{status_block}}
-    <div id="library-search-block">{{search_block}}</div>
-    <div id="library-content">
-        {{content}}
-        <div class="text-center muted" style="padding: 40px;">Loading library...</div>
-    </div>
-    <div id="library-pagination">{{pagination}}</div>
+<div class="page-title">
+  <div><h1>Library</h1><p class="muted">Explore the artists, albums, and tracks on your server.</p></div>
+</div>
+<div class="stack library-workspace" data-library-scanning="{{library_scanning}}">
+  <div id="library-message" aria-live="polite">{{message}}</div>
+  <div id="library-search-block">{{search_block}}</div>
+  <div id="library-content" aria-busy="false" tabindex="-1" aria-label="Library results">{{content}}</div>
+  <div id="library-pagination">{{pagination}}</div>
 </div>

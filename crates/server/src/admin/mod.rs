@@ -1,29 +1,35 @@
 // crates/server/src/admin/mod.rs
-pub mod activity;
+pub(crate) mod access;
 pub mod assets;
 pub mod auth;
+mod console;
 pub mod library;
 pub mod logs;
+pub(crate) mod presentation;
 pub mod settings;
 pub mod users;
 
-use std::time::Duration;
-
 use crate::state::LibraryStatus;
+use ::library::Library;
 use axum::{
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
+    middleware,
     response::Response,
     routing::{get, post},
     Router,
 };
-use library::Library;
 
-use crate::auth::{AuthError, AuthUser, SessionToken, UserRole};
+use crate::admin::presentation::html_error;
+use crate::auth::{AuthError, AuthUser, UserRole};
+use crate::http::{json_error_response, redirect_to, request_authority};
 use crate::state::AppState;
-use crate::utils::{escape_html, html_error, json_error_response, redirect_to};
+use access::AdminAccess;
 
-pub fn admin_router(state: AppState) -> Router {
+pub fn admin_router(state: AppState, address: std::net::SocketAddr) -> Router {
+    // Address changes are pending until restart. Check the actual listener,
+    // rather than the editable configuration.
+    let access = AdminAccess::new(address);
     Router::new()
         .route("/", get(admin_home))
         .route("/assets/*file", get(assets::admin_asset))
@@ -42,12 +48,10 @@ pub fn admin_router(state: AppState) -> Router {
             "/settings",
             get(settings::admin_settings).post(settings::admin_update_settings),
         )
-        .route("/activity", get(activity::admin_activity))
-        .route("/activity/clear", post(activity::admin_activity_clear))
-        .route("/status/activity", get(activity::admin_activity_status))
         .route("/logs", get(logs::admin_logs))
         .route("/logs/clear", post(logs::admin_logs_clear))
         .route("/logs/tail", get(logs::admin_logs_tail))
+        .route("/logs/issues", get(logs::admin_logs_issues))
         .route("/status/library", get(library::admin_library_status))
         .route(
             "/settings/metadata/add",
@@ -69,6 +73,7 @@ pub fn admin_router(state: AppState) -> Router {
             "/settings/metadata/test",
             post(settings::admin_test_metadata_source),
         )
+        .route("/settings/folders", get(settings::admin_browse_folders))
         .route(
             "/settings/music-roots/add",
             post(settings::admin_add_music_root),
@@ -101,7 +106,42 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/users/:user_id/update", post(users::admin_update_user))
         .route("/users/:user_id/password", post(users::admin_set_password))
         .route("/users/:user_id/delete", post(users::admin_delete_user))
+        .layer(middleware::from_fn(console::console_response))
+        .layer(middleware::from_fn_with_state(access, admin_origin))
         .with_state(state)
+}
+
+// Binding an interface alone does not stop DNS rebinding or cross-site forms.
+async fn admin_origin(
+    State(access): State<AdminAccess>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some((host, port)) = request_authority(&request, 443) else {
+        return json_error_response(StatusCode::FORBIDDEN, "valid administration host required");
+    };
+    if !access.allows(&host, port) {
+        return json_error_response(
+            StatusCode::FORBIDDEN,
+            "configured administration host required",
+        );
+    }
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
+        let origin = request
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        let with_port = format!("https://{host}:{port}");
+        let default_port_origin = format!("https://{host}");
+        if origin != with_port && !(port == 443 && origin == default_port_origin) {
+            return json_error_response(
+                StatusCode::FORBIDDEN,
+                "same-origin administration required",
+            );
+        }
+    }
+    next.run(request).await
 }
 
 async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -132,37 +172,10 @@ async fn admin_home(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if !is_admin(&user) {
         return html_error(&state, StatusCode::FORBIDDEN, "forbidden".to_string());
     }
-    users::admin_users_page(&state, &user, None)
+    redirect_to("/library")
 }
 
-pub fn extract_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        if let Ok(value) = value.to_str() {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                return Some(token.trim().to_string());
-            }
-        }
-    }
-    extract_session_cookie(headers)
-}
-
-pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    parse_cookie_value(cookie, "phonolite_session")
-}
-
-fn parse_cookie_value(cookie: &str, name: &str) -> Option<String> {
-    for part in cookie.split(';') {
-        let part = part.trim();
-        let mut iter = part.splitn(2, '=');
-        let key = iter.next()?.trim();
-        let value = iter.next()?.trim();
-        if key == name && !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
+use crate::http::extract_session_cookie;
 
 pub fn admin_user_from_headers(
     state: &AppState,
@@ -173,21 +186,6 @@ pub fn admin_user_from_headers(
         None => return Ok(None),
     };
     state.auth.user_from_token(&token)
-}
-
-pub fn session_cookie_header(session: &SessionToken, ttl: Duration) -> HeaderValue {
-    let value = format!(
-        "phonolite_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-        session.token,
-        ttl.as_secs()
-    );
-    HeaderValue::from_str(&value).unwrap_or_else(|_| {
-        HeaderValue::from_static("phonolite_session=invalid; Path=/; HttpOnly; SameSite=Strict")
-    })
-}
-
-pub fn clear_session_cookie() -> HeaderValue {
-    HeaderValue::from_static("phonolite_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 }
 
 pub fn is_admin(user: &AuthUser) -> bool {
@@ -227,25 +225,220 @@ pub(crate) fn library_status_message(status: &LibraryStatus) -> String {
     }
 }
 
-pub(crate) fn render_message(message: Option<String>) -> String {
-    match message {
-        Some(message) => {
-            let trimmed = message.trim_start();
-            let (class, text) = if let Some(rest) = trimmed.strip_prefix("info:") {
-                ("msg", rest.trim())
-            } else if let Some(rest) = trimmed.strip_prefix("ok:") {
-                ("msg", rest.trim())
-            } else if let Some(rest) = trimmed.strip_prefix("success:") {
-                ("msg", rest.trim())
-            } else {
-                ("msg error", trimmed)
-            };
-            format!(
-                r#"<div class="{}" data-autohide><span>{}</span><button type="button" class="msg-close" data-close-message>x</button></div>"#,
-                class,
-                escape_html(text)
-            )
+#[cfg(test)]
+mod admin_origin_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{header, Method, Request},
+        routing::any,
+    };
+    use tower::ServiceExt;
+
+    fn protected(address: &str) -> Router {
+        Router::new()
+            .route("/", any(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn_with_state(
+                AdminAccess::new(address.parse().unwrap()),
+                admin_origin,
+            ))
+    }
+
+    async fn response_status(
+        app: Router,
+        method: Method,
+        host: &str,
+        origin: Option<&str>,
+    ) -> StatusCode {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/")
+            .header(header::HOST, host);
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
         }
-        None => String::new(),
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn origin_checks_use_the_active_listener_port_for_reads_and_writes() {
+        // Exercise only the middleware with in-process requests; no listeners
+        // or real server actions are involved.
+        let app = protected("127.0.0.1:4002");
+        for (method, host, origin, expected) in [
+            (Method::GET, "localhost:4002", None, StatusCode::NO_CONTENT),
+            (Method::GET, "127.0.0.1:4002", None, StatusCode::NO_CONTENT),
+            (
+                Method::POST,
+                "localhost:4002",
+                Some("https://localhost:4002"),
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                Method::POST,
+                "127.0.0.1:4002",
+                Some("https://127.0.0.1:4002"),
+                StatusCode::NO_CONTENT,
+            ),
+            (Method::GET, "localhost:3002", None, StatusCode::FORBIDDEN),
+            (Method::GET, "localhost:4003", None, StatusCode::FORBIDDEN),
+            (
+                Method::GET,
+                "evil.example:4002",
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::POST,
+                "localhost:4002",
+                Some("https://localhost:4003"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::POST,
+                "localhost:4002",
+                Some("http://localhost:4002"),
+                StatusCode::FORBIDDEN,
+            ),
+            (Method::POST, "localhost:4002", None, StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(
+                response_status(app.clone(), method, host, origin).await,
+                expected,
+                "host={host} origin={origin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_access_accepts_selected_ipv4_and_ipv6_bindings_with_same_origin_writes() {
+        for (address, method, host, origin, allowed) in [
+            (
+                "192.168.1.10:4002",
+                Method::GET,
+                "192.168.1.10:4002",
+                None,
+                true,
+            ),
+            (
+                "192.168.1.10:4002",
+                Method::POST,
+                "192.168.1.10:4002",
+                Some("https://192.168.1.10:4002"),
+                true,
+            ),
+            (
+                "192.168.1.10:4002",
+                Method::GET,
+                "192.168.1.11:4002",
+                None,
+                false,
+            ),
+            (
+                "192.168.1.10:4002",
+                Method::GET,
+                "localhost:4002",
+                None,
+                false,
+            ),
+            (
+                "0.0.0.0:4002",
+                Method::POST,
+                "192.168.1.10:4002",
+                Some("https://192.168.1.10:4002"),
+                true,
+            ),
+            (
+                "0.0.0.0:4002",
+                Method::POST,
+                "192.168.1.10:4002",
+                Some("https://192.168.1.11:4002"),
+                false,
+            ),
+            (
+                "0.0.0.0:4002",
+                Method::POST,
+                "192.168.1.10:4002",
+                Some("http://192.168.1.10:4002"),
+                false,
+            ),
+            (
+                "0.0.0.0:4002",
+                Method::GET,
+                "evil.example:4002",
+                None,
+                false,
+            ),
+            ("0.0.0.0:4002", Method::GET, "[::1]:4002", None, false),
+            (
+                "[fd00::10]:4002",
+                Method::POST,
+                "[fd00::10]:4002",
+                Some("https://[fd00::10]:4002"),
+                true,
+            ),
+            (
+                "[fd00::10]:4002",
+                Method::GET,
+                "[fd00::11]:4002",
+                None,
+                false,
+            ),
+            ("[::1]:4002", Method::GET, "localhost:4002", None, true),
+            (
+                "[::]:4002",
+                Method::POST,
+                "[fd00::10]:4002",
+                Some("https://[fd00::10]:4002"),
+                true,
+            ),
+            ("[::]:4002", Method::GET, "192.168.1.10:4002", None, true),
+            (
+                "0.0.0.0:443",
+                Method::POST,
+                "192.168.1.10",
+                Some("https://192.168.1.10"),
+                true,
+            ),
+            (
+                "0.0.0.0:443",
+                Method::POST,
+                "192.168.1.10:443",
+                Some("https://192.168.1.10"),
+                true,
+            ),
+        ] {
+            let expected = if allowed {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(
+                response_status(protected(address), method, host, origin).await,
+                expected,
+                "bind={address} host={host} origin={origin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_access_rejects_ambiguous_host_headers() {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "192.168.1.10:4002")
+            .header(header::HOST, "192.168.1.11:4002")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            protected("0.0.0.0:4002")
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }

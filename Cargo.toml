@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+default-members = ["crates/server"]
 members = [
   "crates/common",
   "crates/metadata",

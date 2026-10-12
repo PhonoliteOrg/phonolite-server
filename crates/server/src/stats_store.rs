@@ -6,10 +6,17 @@ use redb::{
     TransactionError,
 };
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 use tracing::warn;
 
 const STATS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("stats");
+
+#[path = "stats_ledger.rs"]
+mod ledger;
+pub use ledger::counters::{CounterBatch, CounterCheckpoint, CounterSnapshot, CounterState};
+pub use ledger::{
+    DevicePreference, EventBatchResult, ListeningEvent, StatsResetResult, StatsSyncPage,
+    MAX_EVENT_BATCH,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UserPeriodStats {
@@ -40,53 +47,30 @@ impl StatsStore {
             let _ = write_txn.open_table(STATS_TABLE)?;
         }
         write_txn.commit()?;
-        Ok(())
-    }
-
-    pub fn record_listen(
-        &self,
-        user_id: &str,
-        track_id: &str,
-        artist_id: &str,
-        genres: &[String],
-        duration_ms: u64,
-        play_count: u64,
-    ) -> Result<(), StatsError> {
-        if duration_ms == 0 && play_count == 0 {
-            return Ok(());
-        }
-        let (year, month) = current_year_month();
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(STATS_TABLE)?;
-            update_period(
-                &mut table,
-                user_id,
-                year,
-                Some(month),
-                track_id,
-                artist_id,
-                genres,
-                duration_ms,
-                play_count,
-            )?;
-            update_period(
-                &mut table,
-                user_id,
-                year,
-                None,
-                track_id,
-                artist_id,
-                genres,
-                duration_ms,
-                play_count,
-            )?;
-        }
-        write_txn.commit()?;
+        self.init_ledger()?;
+        self.init_counters()?;
         Ok(())
     }
 
     pub fn get_period(
+        &self,
+        user_id: &str,
+        year: i32,
+        month: Option<u8>,
+    ) -> Result<Option<UserPeriodStats>, StatsError> {
+        let mut stats = self.get_legacy_period(user_id, year, month)?;
+        if let Some(ledger) = self.get_counter_period(user_id, year, month)? {
+            let combined = stats.get_or_insert_with(UserPeriodStats::default);
+            combined.total_ms = combined.total_ms.saturating_add(ledger.total_ms);
+            merge_counts(&mut combined.track_plays, ledger.track_plays);
+            merge_counts(&mut combined.track_ms, ledger.track_ms);
+            merge_counts(&mut combined.artist_ms, ledger.artist_ms);
+            merge_counts(&mut combined.genre_ms, ledger.genre_ms);
+        }
+        Ok(stats)
+    }
+
+    fn get_legacy_period(
         &self,
         user_id: &str,
         year: i32,
@@ -135,56 +119,16 @@ impl StatsStore {
     }
 }
 
-fn update_period(
-    table: &mut redb::Table<&str, &[u8]>,
-    user_id: &str,
-    year: i32,
-    month: Option<u8>,
-    track_id: &str,
-    artist_id: &str,
-    genres: &[String],
-    duration_ms: u64,
-    play_count: u64,
-) -> Result<(), StatsError> {
-    let key = stats_key(user_id, year, month);
-    let mut stats = match table.get(key.as_str())? {
-        Some(value) => match bincode::deserialize(value.value()) {
-            Ok(stats) => stats,
-            Err(err) => {
-                warn!("stats decode failed for key {}: {}; resetting", key, err);
-                UserPeriodStats::default()
-            }
-        },
-        None => UserPeriodStats::default(),
-    };
-    if duration_ms > 0 {
-        stats.total_ms = stats.total_ms.saturating_add(duration_ms);
-        *stats.track_ms.entry(track_id.to_string()).or_insert(0) += duration_ms;
-        *stats.artist_ms.entry(artist_id.to_string()).or_insert(0) += duration_ms;
-        for genre in genres {
-            let trimmed = genre.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            *stats.genre_ms.entry(trimmed.to_string()).or_insert(0) += duration_ms;
-        }
+fn merge_counts(target: &mut HashMap<String, u64>, source: HashMap<String, u64>) {
+    for (id, value) in source {
+        let total = target.entry(id).or_default();
+        *total = total.saturating_add(value);
     }
-    if play_count > 0 {
-        *stats.track_plays.entry(track_id.to_string()).or_insert(0) += play_count;
-    }
-    let bytes = bincode::serialize(&stats)?;
-    table.insert(key.as_str(), bytes.as_slice())?;
-    Ok(())
 }
 
 fn stats_key(user_id: &str, year: i32, month: Option<u8>) -> String {
     let month_value = month.unwrap_or(0);
     format!("{}:{}:{:02}", user_id, year, month_value)
-}
-
-fn current_year_month() -> (i32, u8) {
-    let now = OffsetDateTime::now_utc();
-    (now.year(), now.month() as u8)
 }
 
 #[derive(Debug)]
@@ -195,6 +139,12 @@ pub enum StatsError {
     Storage(StorageError),
     Commit(CommitError),
     Bincode(Box<bincode::ErrorKind>),
+    Json(serde_json::Error),
+    DeviceDisabled,
+    GenerationMismatch,
+    Conflict(String),
+    ProtocolRetired,
+    Invalid(String),
 }
 
 impl std::fmt::Display for StatsError {
@@ -206,7 +156,22 @@ impl std::fmt::Display for StatsError {
             StatsError::Storage(err) => write!(f, "redb storage error: {}", err),
             StatsError::Commit(err) => write!(f, "redb commit error: {}", err),
             StatsError::Bincode(err) => write!(f, "bincode error: {}", err),
+            StatsError::Json(err) => write!(f, "stats JSON error: {}", err),
+            StatsError::DeviceDisabled => write!(f, "stats collection disabled for device"),
+            StatsError::GenerationMismatch => write!(f, "stats history generation mismatch"),
+            StatsError::Conflict(reason) => write!(f, "{}", reason),
+            StatsError::ProtocolRetired => write!(
+                f,
+                "update this client to use listening statistics protocol v2"
+            ),
+            StatsError::Invalid(reason) => write!(f, "{}", reason),
         }
+    }
+}
+
+impl From<serde_json::Error> for StatsError {
+    fn from(err: serde_json::Error) -> Self {
+        StatsError::Json(err)
     }
 }
 

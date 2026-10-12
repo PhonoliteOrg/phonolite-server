@@ -1,0 +1,79 @@
+@font-face {
+  font-family: "Poppins";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/assets/fonts/Poppins-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Rajdhani";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/assets/fonts/Rajdhani-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Rajdhani";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/assets/fonts/Rajdhani-SemiBold.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Rajdhani";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/assets/fonts/Rajdhani-Bold.ttf") format("truetype");
+}
+
+:root {
+  color-scheme: dark;
+  /* Matches ObsidianPalette in the listening app. */
+  --bg: #050505;
+  --surface: #0a0a0d;
+  --glass: rgba(18, 18, 20, 0.6);
+  --ink: #f2f2f2;
+  --muted: #8a8a9a;
+  --accent: #ffd700;
+  --accent-hover: #ffe34d;
+  --accent-soft: rgba(255, 215, 0, 0.08);
+  --accent-border: rgba(255, 215, 0, 0.38);
+  /* Matches CardImageFrame and cardGlow constants in the listening app. */
+  --artwork-glow: 0 0 9px 1.5px rgba(255, 215, 0, 0.32);
+  --artwork-transition: 120ms ease;
+  --surface-raised: #121215;
+  --surface-hover: #1a1a1f;
+  --border: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.22);
+  --border-soft: rgba(255, 255, 255, 0.07);
+  --success: #78dba3;
+  --success-soft: rgba(120, 219, 163, 0.08);
+  --success-border: rgba(120, 219, 163, 0.28);
+  --warning: #ffc36b;
+  --warning-soft: rgba(255, 195, 107, 0.08);
+  --warning-border: rgba(255, 195, 107, 0.32);
+  --danger: #ff9292;
+  --danger-soft: rgba(255, 146, 146, 0.08);
+  --danger-border: rgba(255, 146, 146, 0.32);
+  --info: #b6c5f7;
+  --body-font: "Poppins", "Segoe UI", sans-serif;
+  --display-font: "Rajdhani", "Segoe UI", sans-serif;
+  --mono-font: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --radius: 4px;
+  --radius-sm: 2px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --sidebar-width: 232px;
+  --content-width: 1440px;
+  --shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  --transition: 140ms ease;
+}

@@ -1,17 +1,22 @@
-<div class="modal" id="modal-music-root-add">
+<div class="modal" id="modal-music-root-add" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="modal-music-root-add-title">
   <div class="modal-backdrop" data-close></div>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <div class="modal-header">
-      <h3>Add music folder</h3>
+      <h2 id="modal-music-root-add-title">Add music folder</h2>
     </div>
     <form class="stack" id="form-music-root-add">
-      <label>Folder path</label>
-      <input name="path" type="text" placeholder="Music/Library or D:/Music" />
-      <p class="hint">Paths are relative to the config file if not absolute.</p>
-      <div class="inline-error" id="music-root-add-error"></div>
+      <label for="music-root-add-path">Folder path</label>
+      <input id="music-root-add-path" type="text" autocomplete="off" spellcheck="false" aria-describedby="music-root-browser-hint" placeholder="Enter a folder path" />
+      <input id="music-root-add-selection" name="path" type="hidden" />
+      <p class="hint" id="music-root-browser-hint">Type a folder path to open it automatically, or browse below.</p>
+      <div class="folder-browser" aria-label="Folder browser">
+        <span class="muted folder-browser-status" id="music-root-browser-status" role="status" aria-live="polite"></span>
+        <ul class="folder-browser-list" id="music-root-browser-list" aria-label="Folders"></ul>
+      </div>
+      <div class="inline-error" id="music-root-add-error" role="alert"></div>
       <div class="row">
         <button class="button ghost" type="button" data-close>Cancel</button>
-        <button class="button" type="submit">Add folder</button>
+        <button class="button" id="music-root-add-submit" type="submit" disabled>Add this folder</button>
       </div>
     </form>
   </div>

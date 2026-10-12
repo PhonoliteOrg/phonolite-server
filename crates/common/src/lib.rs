@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+
+mod genres;
+pub use genres::genre_display_label;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -13,6 +16,38 @@ pub struct Artist {
     pub logo_ref: Option<String>,
     #[serde(default)]
     pub banner_ref: Option<String>,
+}
+
+/// Ordered, independently addressable artist identity in a source credit.
+/// Kept outside Album/Track so existing persisted media records remain compatible.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistCredit {
+    pub artist_id: String,
+    pub name: String,
+    pub credited_name: String,
+    pub role: String,
+    pub join_phrase: String,
+    pub source: String,
+}
+
+impl ArtistCredit {
+    pub fn is_album_artist(&self) -> bool {
+        self.role == "album_artist"
+    }
+
+    /// Artist billing, as opposed to a production or session credit.
+    pub fn is_billed_artist(&self) -> bool {
+        matches!(
+            self.role.as_str(),
+            "album_artist" | "track_artist" | "featured_artist"
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistCredits {
+    pub display_name: String,
+    pub credits: Vec<ArtistCredit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +69,14 @@ pub struct Album {
 }
 
 impl Album {
+    /// The description and genres required by album metadata enrichment are stored.
+    pub fn has_enriched_metadata(&self) -> bool {
+        self.summary
+            .as_ref()
+            .is_some_and(|summary| !summary.trim().is_empty())
+            && !self.genres.is_empty()
+    }
+
     pub fn all_artist_ids(&self) -> &[String] {
         if self.artist_ids.is_empty() {
             std::slice::from_ref(&self.artist_id)
@@ -111,7 +154,7 @@ pub fn artist_identity_key(name: &str) -> String {
     for ch in name.trim().chars() {
         for lower in ch.to_lowercase() {
             let mapped = fold_identity_char(lower);
-            if mapped.is_ascii_alphanumeric() {
+            if mapped.is_alphanumeric() {
                 out.push(mapped);
                 last_space = false;
             } else if !last_space {
@@ -120,7 +163,14 @@ pub fn artist_identity_key(name: &str) -> String {
             }
         }
     }
-    out.trim().to_string()
+    let normalized = out.trim();
+    if normalized.is_empty() {
+        // Some real artist names consist entirely of symbols. They must not
+        // all share the empty catalog identity either.
+        name.trim().to_lowercase()
+    } else {
+        normalized.to_string()
+    }
 }
 
 pub fn artist_identity_id(name: &str) -> String {
@@ -216,6 +266,17 @@ mod tests {
             artist_identity_id("System Of A Down"),
             artist_identity_id("System of a Down")
         );
+    }
+
+    #[test]
+    fn artist_identity_preserves_non_latin_letters() {
+        assert_ne!(artist_identity_id("東京"), artist_identity_id("大阪"));
+        assert_ne!(
+            artist_identity_id("Artist 東京"),
+            artist_identity_id("Artist 大阪")
+        );
+        assert_ne!(artist_identity_key("東京"), "");
+        assert_ne!(artist_identity_key("!!!"), artist_identity_key("???"));
     }
 
     #[test]

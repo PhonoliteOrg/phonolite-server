@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::http::json_error;
 use crate::state::{AppState, AuthContext, JsonResult};
 use crate::user_data::PlaybackSettings;
-use crate::utils::json_error;
 
 const DEFAULT_REPEAT_MODE: &str = "off";
 

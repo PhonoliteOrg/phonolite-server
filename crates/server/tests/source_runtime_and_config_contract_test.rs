@@ -1,10 +1,13 @@
 mod support;
 
-use support::{assert_contains_all, read_repo_file};
+use support::{assert_contains_all, read_repo_file, read_repo_files};
 
 #[test]
 fn main_bootstrap_wires_startup_state_and_http_stack() {
-    let main_rs = read_repo_file("crates/server/src/main.rs");
+    let main_rs = read_repo_files(&[
+        "crates/server/src/main.rs",
+        "crates/server/src/performance.rs",
+    ]);
 
     assert_contains_all(
         &main_rs,
@@ -18,7 +21,9 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
             "StatsStore::new(Arc::clone(&stats_db))",
             "StreamCache::new(stream_cache_dir, config.stream_cache_enabled)",
             ".nest(\"/api/v1\", api_router(state.clone()))",
-            ".merge(admin_router(state.clone()))",
+            "let admin_app = admin_router(state.clone(), admin_address);",
+            "tls::Endpoint::Admin",
+            "tls::Endpoint::Api",
             "SetRequestIdLayer::x_request_id(MakeRequestUuid)",
             "TraceLayer::new_for_http()",
             "LatencyUnit::Millis",
@@ -28,7 +33,10 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
 
 #[test]
 fn main_handles_music_root_state_quic_launch_and_graceful_shutdown() {
-    let main_rs = read_repo_file("crates/server/src/main.rs");
+    let main_rs = read_repo_files(&[
+        "crates/server/src/main.rs",
+        "crates/server/src/process_control.rs",
+    ]);
 
     assert_contains_all(
         &main_rs,
@@ -51,7 +59,7 @@ fn config_defaults_migrations_and_bind_normalization_are_encoded_in_source() {
     assert_contains_all(
         &config_rs,
         &[
-            "pub const CONFIG_VERSION: u32 = 8;",
+            "pub const CONFIG_VERSION: u32 = 9;",
             "port: 3000",
             "bind_addr: None",
             "quic_enabled: true",
@@ -68,7 +76,8 @@ fn config_defaults_migrations_and_bind_normalization_are_encoded_in_source() {
             "match env::var(\"PHONOLITE_CONFIG\")",
             "if config.external_metadata_sources.is_empty()",
             "config.quic_port = config.port.saturating_add(1);",
-            "if config.quic_port == config.port {",
+            "validate_ports(config.port, config.admin_port, config.quic_port)",
+            ".map_err(ConfigError::InvalidPorts)?;",
             "normalize_music_roots(&mut config);",
             "format!(\"root-{}\", source_id_suffix())",
             "\"0.0.0.0\".to_string()",

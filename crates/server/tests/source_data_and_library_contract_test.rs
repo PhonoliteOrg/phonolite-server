@@ -1,6 +1,6 @@
 mod support;
 
-use support::{assert_contains_all, read_repo_file};
+use support::{assert_contains_all, read_repo_file, read_repo_files};
 
 #[test]
 fn shared_models_define_catalog_cover_and_seek_shapes() {
@@ -37,7 +37,12 @@ fn shared_models_define_catalog_cover_and_seek_shapes() {
 
 #[test]
 fn library_persistence_declares_tables_codecs_and_search_entrypoints() {
-    let library_rs = read_repo_file("crates/library/src/lib.rs");
+    let library_rs = read_repo_files(&[
+        "crates/library/src/lib.rs",
+        "crates/library/src/storage.rs",
+        "crates/library/src/queries.rs",
+        "crates/library/src/indexing/catalog.rs",
+    ]);
 
     assert_contains_all(
         &library_rs,
@@ -67,13 +72,17 @@ fn library_persistence_declares_tables_codecs_and_search_entrypoints() {
 
 #[test]
 fn library_scanning_sidecars_covers_and_rooted_relpaths_are_encoded() {
-    let library_rs = read_repo_file("crates/library/src/lib.rs");
+    let library_rs = read_repo_files(&[
+        "crates/library/src/lib.rs",
+        "crates/library/src/storage.rs",
+        "crates/library/src/indexing/catalog.rs",
+        "crates/library/src/tests.rs",
+    ]);
 
     assert_contains_all(
         &library_rs,
         &[
-            ".min_depth(1)",
-            ".max_depth(2)",
+            "path.ancestors().skip(1).take(2)",
             "let album_sidecar = read_sidecar_info(&album_dir.join(\"album.json\"));",
             "load_sidecar_info(&mut artist_sidecar_cache, parent.join(\"artist.json\"))",
             "if tag.has_embedded_cover && album_cover.is_none()",

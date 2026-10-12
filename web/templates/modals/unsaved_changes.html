@@ -1,8 +1,8 @@
-<div class="modal" id="modal-unsaved">
+<div class="modal" id="modal-unsaved" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="modal-unsaved-title">
   <div class="modal-backdrop" data-close-unsaved></div>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <div class="modal-header">
-      <h3>Discard changes?</h3>
+      <h2 id="modal-unsaved-title">Discard changes?</h2>
       <button class="modal-close" type="button" data-close-unsaved aria-label="Close">
         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <path d="M18 6 6 18M6 6l12 12" />

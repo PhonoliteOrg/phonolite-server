@@ -5,6 +5,10 @@ use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod legacy;
+
+const RECORD_JSON_PREFIX: &[u8] = b"phonolite-download-json-v1\0";
+
 const DOWNLOAD_JOBS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("download_jobs_v2");
 const DOWNLOAD_JOB_REQUEST_INDEX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("download_job_request_index_v2");
@@ -401,7 +405,7 @@ pub struct DownloadJobItem {
     #[serde(default)]
     pub download_url: Option<String>,
     #[serde(default)]
-    pub offline_metadata: Option<crate::api::library::OfflineTrackMetadata>,
+    pub offline_metadata: Option<crate::offline_metadata::OfflineTrackMetadata>,
     #[serde(default)]
     pub byte_length: Option<u64>,
     #[serde(default)]
@@ -480,11 +484,35 @@ fn job_event_key(job_id: &str, cursor: u64) -> String {
 }
 
 fn encode_value<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
-    bincode::serialize(value).map_err(|err| err.to_string())
+    let payload = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+    let mut bytes = Vec::with_capacity(RECORD_JSON_PREFIX.len() + payload.len());
+    bytes.extend_from_slice(RECORD_JSON_PREFIX);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
 }
 
-fn decode_value<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
-    bincode::deserialize(bytes).map_err(|err| err.to_string())
+trait StoredRecord: for<'de> Deserialize<'de> {
+    fn read_legacy(bytes: &[u8]) -> Result<Self, String>;
+}
+
+impl StoredRecord for DownloadJob {
+    fn read_legacy(bytes: &[u8]) -> Result<Self, String> {
+        legacy::decode_job(bytes)
+    }
+}
+
+impl StoredRecord for DownloadJobEvent {
+    fn read_legacy(bytes: &[u8]) -> Result<Self, String> {
+        legacy::decode_event(bytes)
+    }
+}
+
+fn decode_value<T: StoredRecord>(bytes: &[u8]) -> Result<T, String> {
+    if let Some(payload) = bytes.strip_prefix(RECORD_JSON_PREFIX) {
+        serde_json::from_slice(payload).map_err(|err| err.to_string())
+    } else {
+        T::read_legacy(bytes)
+    }
 }
 
 fn now_millis() -> u64 {

@@ -2,17 +2,18 @@
 use axum::{
     extract::{Form, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 
+use crate::admin::presentation::{
+    apply_template, escape_html, html_error, load_template, render_admin_response, PageLayout,
+};
 use crate::auth::{self, AuthUser, UserRole};
+use crate::http::{json_error_response, redirect_to, wants_json};
 use crate::state::{AppState, BulkDeleteForm, NewUserForm, PasswordForm, UpdateUserForm};
-use crate::utils::{
-    apply_template, escape_html, html_error, html_response, json_error_response, json_ok_response,
-    load_template, redirect_to, render_admin_page, wants_json, PageLayout,
-};
 
-use super::{admin_user_from_headers, is_admin, render_message};
+use super::{admin_user_from_headers, is_admin};
 
 pub async fn admin_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.auth.has_admin().unwrap_or(false) {
@@ -74,9 +75,9 @@ pub async fn admin_create_user(
     match state.auth.create_user(&form.username, &form.password, role) {
         Ok(_) => {
             if wants_json(&headers) {
-                json_ok_response()
+                users_update_response(&state, &user)
             } else {
-                redirect_to("/")
+                redirect_to("/users")
             }
         }
         Err(err) => {
@@ -162,9 +163,9 @@ pub async fn admin_set_password(
     match state.auth.update_password(&user_id, &form.password) {
         Ok(_) => {
             if wants_json(&headers) {
-                json_ok_response()
+                users_update_response(&state, &user)
             } else {
-                redirect_to("/")
+                redirect_to("/users")
             }
         }
         Err(err) => {
@@ -207,9 +208,9 @@ pub async fn admin_delete_user(
     match state.auth.delete_user(&user_id) {
         Ok(_) => {
             if wants_json(&headers) {
-                json_ok_response()
+                users_update_response(&state, &user)
             } else {
-                redirect_to("/")
+                redirect_to("/users")
             }
         }
         Err(err) => {
@@ -322,9 +323,9 @@ pub async fn admin_update_user(
     {
         Ok(_) => {
             if wants_json(&headers) {
-                json_ok_response()
+                users_update_response(&state, &actor)
             } else {
-                redirect_to("/")
+                redirect_to("/users")
             }
         }
         Err(err) => {
@@ -399,9 +400,9 @@ pub async fn admin_bulk_delete(
     }
 
     if wants_json(&headers) {
-        json_ok_response()
+        users_update_response(&state, &actor)
     } else {
-        redirect_to("/")
+        redirect_to("/users")
     }
 }
 
@@ -410,9 +411,9 @@ pub(crate) fn admin_users_page(
     current_user: &AuthUser,
     message: Option<String>,
 ) -> Response {
-    let users = match state.auth.list_users() {
-        Ok(users) => users,
-        Err(err) => return html_error(state, StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    let user_rows = match render_user_rows(state, current_user) {
+        Ok(rows) => rows,
+        Err(error) => return html_error(state, StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let template = match load_template(state, "templates/users.html") {
         Ok(template) => template,
@@ -424,7 +425,7 @@ pub(crate) fn admin_users_page(
             )
         }
     };
-    let row_template = load_template(state, "templates/partials/user_row.html").unwrap_or_default();
+
     let modals = [
         load_template(state, "templates/modals/user_add.html").unwrap_or_default(),
         load_template(state, "templates/modals/user_edit.html").unwrap_or_default(),
@@ -432,8 +433,56 @@ pub(crate) fn admin_users_page(
     ]
     .join("");
 
-    let message_html = render_message(message);
+    let error = message.as_deref().unwrap_or_default();
 
+    let body = apply_template(
+        template,
+        &[
+            ("error", escape_html(error)),
+            (
+                "error_class",
+                if error.is_empty() { "" } else { " visible" }.to_string(),
+            ),
+            ("current_user_id", escape_html(&current_user.id)),
+            (
+                "current_user_role",
+                escape_html(match current_user.role {
+                    UserRole::SuperAdmin => "superadmin",
+                    UserRole::Admin => "admin",
+                    UserRole::User => "user",
+                }),
+            ),
+            ("user_rows", user_rows),
+            ("modals", modals),
+        ],
+    );
+    render_admin_response(
+        state,
+        StatusCode::OK,
+        "Users",
+        &body,
+        PageLayout::standard(),
+    )
+}
+
+fn users_update_response(state: &AppState, current_user: &AuthUser) -> Response {
+    match render_user_rows(state, current_user) {
+        Ok(html) => Json(serde_json::json!({ "status": "ok", "html": html })).into_response(),
+        Err(error) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+fn render_user_rows(state: &AppState, current_user: &AuthUser) -> Result<String, String> {
+    let users = state.auth.list_users().map_err(|error| error.to_string())?;
+    let row_template = load_template(state, "templates/partials/user_row.html")?;
+    Ok(render_user_rows_html(&row_template, &users, current_user))
+}
+
+fn render_user_rows_html(
+    row_template: &str,
+    users: &[AuthUser],
+    current_user: &AuthUser,
+) -> String {
     let mut user_rows = String::new();
     for user in users {
         let username = escape_html(&user.username);
@@ -443,14 +492,19 @@ pub(crate) fn admin_users_page(
             UserRole::User => "user",
         };
         let role_label = escape_html(role);
-        let status = if user.disabled { "disabled" } else { "active" };
         let is_superadmin = matches!(user.role, UserRole::SuperAdmin);
         let can_edit = !is_superadmin || user.id == current_user.id;
         let can_delete = !is_superadmin;
         let checkbox = if can_delete {
-            r#"<input class="row-select" type="checkbox" />"#.to_string()
+            format!(
+                r#"<input class="row-select" type="checkbox" aria-label="Select {}" />"#,
+                username
+            )
         } else {
-            r#"<input class="row-select" type="checkbox" disabled />"#.to_string()
+            format!(
+                r#"<input class="row-select" type="checkbox" aria-label="Select {} (protected)" disabled />"#,
+                username
+            )
         };
         let edit_icon = r#"<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm2.92 2.83H5v-.92l9.06-9.06.92.92L5.92 20.08zM20.71 7.04a1.003 1.003 0 0 0 0-1.42l-2.34-2.34a1.003 1.003 0 0 0-1.42 0l-1.83 1.83 3.75 3.75 1.84-1.82z"/></svg>"#;
         let delete_icon = r#"<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 3h6l1 2h4v2h-2v12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9z"/></svg>"#;
@@ -478,7 +532,7 @@ pub(crate) fn admin_users_page(
         };
 
         user_rows.push_str(&apply_template(
-            row_template.clone(),
+            row_template.to_string(),
             &[
                 ("id", escape_html(&user.id)),
                 ("username_raw", escape_html(&user.username)),
@@ -502,7 +556,6 @@ pub(crate) fn admin_users_page(
                 ("checkbox", checkbox),
                 ("username", username),
                 ("role_label", role_label),
-                ("status", status.to_string()),
                 ("edit_button", edit_button),
                 ("delete_button", delete_button),
             ],
@@ -510,28 +563,55 @@ pub(crate) fn admin_users_page(
     }
 
     if user_rows.is_empty() {
-        user_rows.push_str("<tr><td colspan=\"5\">No users found.</td></tr>");
+        user_rows.push_str("<tr><td colspan=\"4\">No users found.</td></tr>");
     }
 
-    let body = apply_template(
-        template,
-        &[
-            ("message", message_html),
-            ("current_user_id", escape_html(&current_user.id)),
-            (
-                "current_user_role",
-                escape_html(match current_user.role {
-                    UserRole::SuperAdmin => "superadmin",
-                    UserRole::Admin => "admin",
-                    UserRole::User => "user",
-                }),
-            ),
-            ("user_rows", user_rows),
-            ("modals", modals),
-        ],
-    );
-    html_response(
-        StatusCode::OK,
-        render_admin_page(state, "Users", &body, PageLayout::standard()),
-    )
+    user_rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROW_TEMPLATE: &str = include_str!("../../../../web/templates/partials/user_row.html");
+
+    fn user(id: &str, username: &str, role: UserRole) -> AuthUser {
+        AuthUser {
+            id: id.to_string(),
+            username: username.to_string(),
+            role,
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn refreshed_rows_preserve_protection_and_escape_account_fields() {
+        let actor = user("actor", "Current admin", UserRole::Admin);
+        let protected = user("super", "Superadmin", UserRole::SuperAdmin);
+        let mut ordinary = user("user<&", "A \"B\" & <C>", UserRole::User);
+        ordinary.disabled = true;
+        let html = render_user_rows_html(ROW_TEMPLATE, &[protected, ordinary], &actor);
+        assert_eq!(html.matches("class=\"user-row\"").count(), 2);
+        assert!(html.contains("data-user-id=\"user&lt;&amp;\""));
+        assert!(html.contains("data-username=\"A &quot;B&quot; &amp; &lt;C&gt;\""));
+        assert!(html.contains("data-protected=\"1\""));
+        assert!(html.contains("aria-label=\"Edit user (locked)\" disabled"));
+        assert!(html.contains("aria-label=\"Delete user (protected)\" disabled"));
+        assert!(html.contains("data-disabled=\"1\""));
+        assert!(!html.contains("user-status"));
+        assert!(!html.contains("private-password-hash"));
+    }
+
+    #[test]
+    fn refreshed_superadmin_rows_allow_self_edit_and_empty_lists_have_a_table_row() {
+        let actor = user("super", "Superadmin", UserRole::SuperAdmin);
+        let html = render_user_rows_html(ROW_TEMPLATE, std::slice::from_ref(&actor), &actor);
+        assert!(html.contains("aria-label=\"Edit user\""));
+        assert!(!html.contains("Edit user (locked)"));
+        assert!(html.contains("Delete user (protected)"));
+        let empty = render_user_rows_html(ROW_TEMPLATE, &[], &actor);
+        assert!(empty.starts_with("<tr>"));
+        assert!(empty.contains("No users found."));
+        assert!(empty.contains("colspan=\"4\""));
+    }
 }

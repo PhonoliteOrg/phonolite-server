@@ -1,21 +1,18 @@
 <div class="detail-shell">
+    <a class="button ghost detail-back" data-library-link href="{{back_link}}">Back to artists</a>
     <div style="{{header_style}}" class="{{header_class}} detail-hero">
         <div class="artist-header-content">
             {{logo_img}}
-            <h1 class="artist-name-large">{{name}}</h1>
+            <h2 class="artist-name-large">{{name}}</h2>
             <p class="artist-subtitle">{{genres}}</p>
         </div>
     </div>
     <div class="card detail-bio">
         <div class="detail-section-title">
-            <h3>Biography</h3>
+            <h2>Biography</h2>
         </div>
         <p class="detail-text">{{summary}}</p>
     </div>
-    <div class="card detail-discography">
-        <div class="detail-section-title">
-            <h3>Discography</h3>
-        </div>
-        {{albums_html}}
-    </div>
+    {{albums_html}}
+    {{contributions_html}}
 </div>

@@ -1,11 +1,11 @@
-<div class="modal" id="modal-delete">
+<div class="modal" id="modal-delete" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="modal-delete-title">
   <div class="modal-backdrop" data-close></div>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <div class="modal-header">
-      <h3>Delete User</h3>
+      <h2 id="modal-delete-title">Delete user</h2>
     </div>
     <p id="delete-message">Are you sure?</p>
-    <div id="delete-user-error" class="inline-error"></div>
+    <div id="delete-user-error" class="inline-error" role="alert"></div>
     <div class="row right">
       <button type="button" class="button ghost" data-close>Cancel</button>
       <button type="button" id="confirm-delete" class="button danger">Delete</button>

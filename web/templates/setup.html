@@ -1,18 +1,14 @@
-<div class="card auth-card">
-  <div class="page-title">
-    <div>
-      <h2>Initial setup</h2>
-      <p class="muted">Create the first admin account to unlock the console.</p>
-    </div>
-  </div>
-  {{message}}
+<section class="auth-card" aria-labelledby="auth-title">
+  <div class="auth-brand"><img src="/assets/img/phonolite-logo-nobackground.png" alt="" /><span>Phonolite</span></div>
+  <div class="page-title"><div>
+    <h1 id="auth-title">Make it yours</h1>
+    <p class="muted">Create the first admin account to set up your server.</p>
+  </div></div>
   <form method="post" action="/setup" class="stack">
-    <label>Username</label>
-    <input name="username" type="text" required />
-    <label>Password</label>
-    <input name="password" type="password" minlength="4" required />
-    <label>Confirm password</label>
-    <input name="confirm" type="password" minlength="4" required />
-    <button type="submit">Create admin</button>
+    <div class="form-group"><label for="setup-username">Username</label><input id="setup-username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required /></div>
+    <div class="form-group"><label for="setup-password">Password</label><input id="setup-password" name="password" type="password" minlength="4" autocomplete="new-password" required /></div>
+    <div class="form-group"><label for="setup-confirm">Confirm password</label><input id="setup-confirm" name="confirm" type="password" minlength="4" autocomplete="new-password" required /></div>
+    <div id="auth-error" class="inline-error{{error_class}}" role="alert">{{error}}</div>
+    <button class="button primary" type="submit">Create admin</button>
   </form>
-</div>
+</section>

@@ -1,13 +1,15 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
-use redb::{Database, ReadableTable, StorageError, TableDefinition};
+use redb::{Database, ReadableTable, StorageError, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
-const SESSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
+const USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_users_v1");
+const SESSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_sessions_v1");
+const SECURITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_security_v1");
+const OPAQUE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("auth_opaque_credentials_v1");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,7 +23,6 @@ pub enum UserRole {
 pub struct AuthUser {
     pub id: String,
     pub username: String,
-    pub password_hash: String,
     pub role: UserRole,
     pub disabled: bool,
 }
@@ -31,6 +32,12 @@ pub struct SessionToken {
     pub token: String,
     pub user_id: String,
     pub expires_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    user_id: String,
+    expires_at: u64,
 }
 
 #[derive(Debug)]
@@ -44,11 +51,15 @@ pub enum AuthError {
     SuperAdminProtected,
     LastAdmin,
     InvalidUsername,
+    IncompatibleSchema,
 }
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Self::IncompatibleSchema => write!(f, "unsupported authentication database; use a fresh index database and create new accounts (migration is not supported)"),
+            _ => write!(f, "{:?}", self),
+        }
     }
 }
 
@@ -70,13 +81,68 @@ impl AuthStore {
             .db
             .begin_write()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        // This is a new authentication schema. Never deserialize or convert
+        // accounts, credentials, or sessions from a previous implementation.
+        if write_txn.list_tables().map_err(db_error)?.any(|table| {
+            matches!(
+                table.name(),
+                "users" | "sessions" | "security_v1" | "opaque_credentials_v1"
+            )
+        }) {
+            return Err(AuthError::IncompatibleSchema);
+        }
         {
-            let _users = write_txn
+            let users = write_txn
                 .open_table(USERS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            let _sessions = write_txn
+            let sessions = write_txn
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
+            let records = write_txn.open_table(OPAQUE_TABLE).map_err(db_error)?;
+            let mut security = write_txn.open_table(SECURITY_TABLE).map_err(db_error)?;
+            let profile = security
+                .get("profile")
+                .map_err(db_error)?
+                .map(|v| v.value().to_vec());
+            match profile.as_deref() {
+                Some(value) if value == crate::security_protocol::PROFILE.as_bytes() => {
+                    let setup =
+                        security
+                            .get("opaque_setup")
+                            .map_err(db_error)?
+                            .ok_or_else(|| {
+                                db_error("OPAQUE setup is missing; restore a security backup")
+                            })?;
+                    opaque_ke::ServerSetup::<crate::security_protocol::Suite>::deserialize(
+                        setup.value(),
+                    )
+                    .map_err(|_| db_error("corrupt OPAQUE setup; restore a security backup"))?;
+                }
+                Some(_) => return Err(AuthError::IncompatibleSchema),
+                None => {
+                    if security.len().map_err(db_error)? != 0
+                        || users.len().map_err(db_error)? != 0
+                        || records.len().map_err(db_error)? != 0
+                        || sessions.len().map_err(db_error)? != 0
+                    {
+                        return Err(AuthError::IncompatibleSchema);
+                    }
+                    let setup = opaque_ke::ServerSetup::<crate::security_protocol::Suite>::new(
+                        &mut rand08::rngs::OsRng,
+                    );
+                    security
+                        .insert("opaque_setup", setup.serialize().as_slice())
+                        .map_err(db_error)?;
+                    security
+                        .insert("profile", crate::security_protocol::PROFILE.as_bytes())
+                        .map_err(db_error)?;
+                }
+            }
+            if users.len().map_err(db_error)? != records.len().map_err(db_error)? {
+                return Err(db_error(
+                    "OPAQUE credential records are incomplete; restore a security backup",
+                ));
+            }
         }
         write_txn
             .commit()
@@ -165,7 +231,8 @@ impl AuthStore {
         password: &str,
         role: UserRole,
     ) -> Result<AuthUser, AuthError> {
-        if username.trim().is_empty() {
+        let username = username.trim();
+        if username.is_empty() || username.len() > 128 {
             return Err(AuthError::InvalidUsername);
         }
 
@@ -191,11 +258,22 @@ impl AuthStore {
             }
 
             let id = uuid::Uuid::new_v4().to_string();
-            let password_hash = hash_password(password);
+            if password.is_empty() || password.len() > 1024 {
+                return Err(AuthError::InvalidPassword);
+            }
+            let record = crate::security_protocol::enroll(
+                &self.opaque_setup()?,
+                id.as_bytes(),
+                password.as_bytes(),
+            )
+            .map_err(db_error)?;
+            txn.open_table(OPAQUE_TABLE)
+                .map_err(db_error)?
+                .insert(id.as_str(), record.as_slice())
+                .map_err(db_error)?;
             let user = AuthUser {
                 id: id.clone(),
                 username: username.to_string(),
-                password_hash,
                 role,
                 disabled: false,
             };
@@ -226,14 +304,30 @@ impl AuthStore {
             return Ok(None);
         }
 
-        if verify_password(password, &user.password_hash) {
-            Ok(Some(user))
+        Ok(if self.verify_opaque_password(&user.id, password)? {
+            Some(user)
         } else {
-            Ok(None)
-        }
+            None
+        })
     }
 
     pub fn create_session(&self, user_id: &str) -> Result<SessionToken, AuthError> {
+        self.create_session_inner(user_id, None)
+    }
+
+    pub fn create_bound_session(
+        &self,
+        user_id: &str,
+        record_hash: &[u8],
+    ) -> Result<SessionToken, AuthError> {
+        self.create_session_inner(user_id, Some(record_hash))
+    }
+
+    fn create_session_inner(
+        &self,
+        user_id: &str,
+        record_hash: Option<&[u8]>,
+    ) -> Result<SessionToken, AuthError> {
         let token_str = generate_token();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -252,13 +346,37 @@ impl AuthStore {
             .begin_write()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         {
+            // Validate under the same write transaction that creates the session.
+            // A concurrent password reset cannot mint a session from an old proof.
+            let users = txn.open_table(USERS_TABLE).map_err(db_error)?;
+            let value = users
+                .get(user_id)
+                .map_err(db_error)?
+                .ok_or(AuthError::UserNotFound)?;
+            let user: AuthUser = bincode::deserialize(value.value()).map_err(db_error)?;
+            if user.disabled {
+                return Err(AuthError::InvalidPassword);
+            }
+            if let Some(expected) = record_hash {
+                let records = txn.open_table(OPAQUE_TABLE).map_err(db_error)?;
+                let current = records
+                    .get(user_id)
+                    .map_err(db_error)?
+                    .ok_or(AuthError::InvalidPassword)?;
+                if Sha256::digest(current.value()).as_slice() != expected {
+                    return Err(AuthError::InvalidPassword);
+                }
+            }
             let mut table = txn
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            let bytes =
-                bincode::serialize(&session).map_err(|e| AuthError::DbError(e.to_string()))?;
+            let bytes = bincode::serialize(&StoredSession {
+                user_id: session.user_id.clone(),
+                expires_at,
+            })
+            .map_err(|e| AuthError::DbError(e.to_string()))?;
             table
-                .insert(token_str.as_str(), bytes.as_slice())
+                .insert(token_digest(&token_str).as_str(), bytes.as_slice())
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
         }
         txn.commit()
@@ -277,7 +395,7 @@ impl AuthStore {
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
             table
-                .remove(token)
+                .remove(token_digest(token).as_str())
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
         }
         txn.commit()
@@ -291,15 +409,10 @@ impl AuthStore {
             .begin_write()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         {
-            let _table = txn
+            let mut table = txn
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            // redb doesn't have clear(), so we iterate and delete? Or delete table.
-            // Deleting table is safer/faster if we recreate it, but here we just iterate keys.
-            // Actually, let's just drop the table and recreate.
-            // But redb table deletion is tricky inside transaction if we want to use it again.
-            // Let's just leave it for now or implement if needed.
-            // For shutdown, we might not strictly need to clear sessions unless requested.
+            remove_sessions(&mut table, None)?;
         }
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
@@ -316,11 +429,11 @@ impl AuthStore {
             .map_err(|e| AuthError::DbError(e.to_string()))?;
 
         let session = match sessions
-            .get(token)
+            .get(token_digest(token).as_str())
             .map_err(|e: StorageError| AuthError::DbError(e.to_string()))?
         {
             Some(v) => {
-                let s: SessionToken = bincode::deserialize(v.value())
+                let s: StoredSession = bincode::deserialize(v.value())
                     .map_err(|e: Box<bincode::ErrorKind>| AuthError::DbError(e.to_string()))?;
                 s
             }
@@ -331,7 +444,7 @@ impl AuthStore {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        if session.expires_at < now {
+        if session.expires_at <= now {
             // Expired
             return Ok(None);
         }
@@ -375,7 +488,7 @@ impl AuthStore {
         }
     }
 
-    fn get_user_by_username(&self, username: &str) -> Result<Option<AuthUser>, AuthError> {
+    pub fn get_user_by_username(&self, username: &str) -> Result<Option<AuthUser>, AuthError> {
         let read_txn = self
             .db
             .begin_read()
@@ -425,6 +538,10 @@ impl AuthStore {
         password: Option<&str>,
         role: UserRole,
     ) -> Result<(), AuthError> {
+        let username = username.trim();
+        if username.is_empty() || username.len() > 128 {
+            return Err(AuthError::InvalidUsername);
+        }
         let txn = self
             .db
             .begin_write()
@@ -462,7 +579,19 @@ impl AuthStore {
             user.username = username.to_string();
             user.role = role;
             if let Some(pw) = password {
-                user.password_hash = hash_password(pw);
+                if pw.is_empty() || pw.len() > 1024 {
+                    return Err(AuthError::InvalidPassword);
+                }
+                let record = crate::security_protocol::enroll(
+                    &self.opaque_setup()?,
+                    id.as_bytes(),
+                    pw.as_bytes(),
+                )
+                .map_err(db_error)?;
+                txn.open_table(OPAQUE_TABLE)
+                    .map_err(db_error)?
+                    .insert(id, record.as_slice())
+                    .map_err(db_error)?;
             }
 
             let bytes = bincode::serialize(&user).map_err(|e| AuthError::DbError(e.to_string()))?;
@@ -470,37 +599,39 @@ impl AuthStore {
                 .insert(id, bytes.as_slice())
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
         }
+        self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         Ok(())
     }
 
     pub fn update_password(&self, id: &str, password: &str) -> Result<(), AuthError> {
+        if password.is_empty() || password.len() > 1024 {
+            return Err(AuthError::InvalidPassword);
+        }
+        let record = crate::security_protocol::enroll(
+            &self.opaque_setup()?,
+            id.as_bytes(),
+            password.as_bytes(),
+        )
+        .map_err(db_error)?;
         let txn = self
             .db
             .begin_write()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         {
-            let mut table = txn
+            let table = txn
                 .open_table(USERS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            let mut user: AuthUser = {
-                let user_result = table
-                    .get(id)
-                    .map_err(|e: StorageError| AuthError::DbError(e.to_string()))?;
-                match user_result {
-                    Some(v) => bincode::deserialize(v.value())
-                        .map_err(|e: Box<bincode::ErrorKind>| AuthError::DbError(e.to_string()))?,
-                    None => return Err(AuthError::UserNotFound),
-                }
-            };
-
-            user.password_hash = hash_password(password);
-            let bytes = bincode::serialize(&user).map_err(|e| AuthError::DbError(e.to_string()))?;
-            table
-                .insert(id, bytes.as_slice())
-                .map_err(|e| AuthError::DbError(e.to_string()))?;
+            if table.get(id).map_err(db_error)?.is_none() {
+                return Err(AuthError::UserNotFound);
+            }
+            txn.open_table(OPAQUE_TABLE)
+                .map_err(db_error)?
+                .insert(id, record.as_slice())
+                .map_err(db_error)?;
         }
+        self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         Ok(())
@@ -541,33 +672,136 @@ impl AuthStore {
             table
                 .remove(id)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
+            txn.open_table(OPAQUE_TABLE)
+                .map_err(db_error)?
+                .remove(id)
+                .map_err(db_error)?;
         }
+        self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
         Ok(())
     }
+
+    pub fn opaque_setup(
+        &self,
+    ) -> Result<opaque_ke::ServerSetup<crate::security_protocol::Suite>, AuthError> {
+        let txn = self.db.begin_read().map_err(db_error)?;
+        let table = txn.open_table(SECURITY_TABLE).map_err(db_error)?;
+        let value = table
+            .get("opaque_setup")
+            .map_err(db_error)?
+            .ok_or_else(|| db_error("OPAQUE setup missing"))?;
+        opaque_ke::ServerSetup::deserialize(value.value())
+            .map_err(|_| db_error("corrupt OPAQUE setup; restore backup"))
+    }
+
+    pub fn opaque_record(&self, id: &str) -> Result<Option<Vec<u8>>, AuthError> {
+        let txn = self.db.begin_read().map_err(db_error)?;
+        let table = txn.open_table(OPAQUE_TABLE).map_err(db_error)?;
+        let value = table.get(id).map_err(db_error)?.map(|v| v.value().to_vec());
+        Ok(value)
+    }
+
+    fn verify_opaque_password(&self, id: &str, password: &str) -> Result<bool, AuthError> {
+        use crate::security_protocol::{ksf, Suite, SERVER_IDENTITY};
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, Identifiers, ServerLogin,
+            ServerLoginParameters, ServerRegistration,
+        };
+        let Some(record) = self.opaque_record(id)? else {
+            return Ok(false);
+        };
+        let setup = self.opaque_setup()?;
+        let mut rng = rand08::rngs::OsRng;
+        let first = ClientLogin::<Suite>::start(&mut rng, password.as_bytes()).map_err(db_error)?;
+        let response = ServerLogin::start(
+            &mut rng,
+            &setup,
+            Some(ServerRegistration::deserialize(&record).map_err(db_error)?),
+            first.message,
+            id.as_bytes(),
+            ServerLoginParameters {
+                context: Some(b"phonolite-local-admin-v1"),
+                identifiers: Identifiers {
+                    client: None,
+                    server: Some(SERVER_IDENTITY),
+                },
+            },
+        )
+        .map_err(db_error)?;
+        let hash = ksf();
+        let proof = first.state.finish(
+            &mut rng,
+            password.as_bytes(),
+            response.message,
+            ClientLoginFinishParameters::new(
+                Some(b"phonolite-local-admin-v1"),
+                Identifiers {
+                    client: None,
+                    server: Some(SERVER_IDENTITY),
+                },
+                Some(&hash),
+            ),
+        );
+        Ok(proof.is_ok_and(|p| {
+            response
+                .state
+                .finish(
+                    p.message,
+                    ServerLoginParameters {
+                        context: Some(b"phonolite-local-admin-v1"),
+                        identifiers: Identifiers {
+                            client: None,
+                            server: Some(SERVER_IDENTITY),
+                        },
+                    },
+                )
+                .is_ok()
+        }))
+    }
+
+    fn revoke_user_sessions_in(
+        &self,
+        txn: &redb::WriteTransaction,
+        id: &str,
+    ) -> Result<(), AuthError> {
+        let mut sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+        remove_sessions(&mut sessions, Some(id))
+    }
 }
 
-fn hash_password(password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(password);
-    format!("{:x}", hasher.finalize())
+fn db_error(error: impl std::fmt::Display) -> AuthError {
+    AuthError::DbError(error.to_string())
 }
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    hash_password(password) == hash
+fn remove_sessions(
+    table: &mut redb::Table<&str, &[u8]>,
+    user_id: Option<&str>,
+) -> Result<(), AuthError> {
+    let mut keys = Vec::new();
+    for entry in table.iter().map_err(db_error)? {
+        let (key, value) = entry.map_err(db_error)?;
+        if user_id.is_none()
+            || bincode::deserialize::<StoredSession>(value.value())
+                .map_or(true, |s| Some(s.user_id.as_str()) == user_id)
+        {
+            keys.push(key.value().to_string());
+        }
+    }
+    for key in keys {
+        table.remove(key.as_str()).map_err(db_error)?;
+    }
+    Ok(())
+}
+fn token_digest(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 fn generate_token() -> String {
-    let mut rng = rand::rng();
-    let token: String = (0..32)
-        .map(|_| {
-            let idx = rng.random_range(0..62);
-            let chars = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-            chars[idx] as char
-        })
-        .collect();
-    token
+    use rand08::RngCore;
+    let mut bytes = [0u8; 32];
+    rand08::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -699,5 +933,129 @@ mod tests {
         store.revoke_session(&session.token).unwrap();
 
         assert!(store.user_from_token(&session.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_storage_contains_only_a_token_digest_and_bulk_logout_works() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("root", "secret").unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        let read = store.db.begin_read().unwrap();
+        let table = read.open_table(super::SESSIONS_TABLE).unwrap();
+        assert!(table.get(session.token.as_str()).unwrap().is_none());
+        let stored = table
+            .get(super::token_digest(&session.token).as_str())
+            .unwrap()
+            .unwrap();
+        let decoded: super::StoredSession = bincode::deserialize(stored.value()).unwrap();
+        assert_eq!(decoded.user_id, user.id);
+        assert!(!stored
+            .value()
+            .windows(session.token.len())
+            .any(|bytes| bytes == session.token.as_bytes()));
+        drop(stored);
+        drop(table);
+        drop(read);
+        store.clear_sessions().unwrap();
+        assert!(store.user_from_token(&session.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn previous_authentication_tables_are_rejected_without_modification() {
+        for name in ["users", "sessions", "security_v1", "opaque_credentials_v1"] {
+            let path = std::env::temp_dir().join(format!(
+                "phonolite-incompatible-auth-{}.redb",
+                uuid::Uuid::new_v4()
+            ));
+            let _cleanup = TestDb { path: path.clone() };
+            let db = Arc::new(Database::create(&path).unwrap());
+            let old: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+            let write = db.begin_write().unwrap();
+            {
+                write
+                    .open_table(old)
+                    .unwrap()
+                    .insert("account", &b"unsupported data"[..])
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            let store = AuthStore::new(db, Duration::from_secs(60));
+            let error = store.init_tables().unwrap_err();
+            assert!(matches!(error, super::AuthError::IncompatibleSchema));
+            assert!(error.to_string().contains("fresh index database"));
+            let read = store.db.begin_read().unwrap();
+            assert_eq!(
+                read.open_table(old)
+                    .unwrap()
+                    .get("account")
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                b"unsupported data"
+            );
+            assert!(read.open_table(super::USERS_TABLE).is_err());
+            assert!(read.open_table(super::SECURITY_TABLE).is_err());
+        }
+    }
+
+    #[test]
+    fn new_schema_reopens_without_converting_or_clearing_sessions() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("root", "secret").unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        let setup = store.opaque_setup().unwrap().serialize();
+        store.init_tables().unwrap();
+        assert_eq!(store.opaque_setup().unwrap().serialize(), setup);
+        assert_eq!(
+            store.user_from_token(&session.token).unwrap().unwrap().id,
+            user.id
+        );
+    }
+
+    #[test]
+    fn missing_or_unknown_profile_is_rejected_without_regeneration() {
+        let (store, _db) = test_store();
+        let write = store.db.begin_write().unwrap();
+        {
+            write
+                .open_table(super::SECURITY_TABLE)
+                .unwrap()
+                .remove("profile")
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert!(matches!(
+            store.init_tables(),
+            Err(super::AuthError::IncompatibleSchema)
+        ));
+        let write = store.db.begin_write().unwrap();
+        {
+            write
+                .open_table(super::SECURITY_TABLE)
+                .unwrap()
+                .insert("profile", &b"unsupported"[..])
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert!(matches!(
+            store.init_tables(),
+            Err(super::AuthError::IncompatibleSchema)
+        ));
+    }
+
+    #[test]
+    fn missing_setup_is_never_silently_regenerated_for_enrolled_users() {
+        let (store, _db) = test_store();
+        store.create_superadmin("root", "secret").unwrap();
+        let write = store.db.begin_write().unwrap();
+        {
+            write
+                .open_table(super::SECURITY_TABLE)
+                .unwrap()
+                .remove("opaque_setup")
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert!(store.init_tables().is_err());
     }
 }

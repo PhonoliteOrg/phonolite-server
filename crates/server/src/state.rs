@@ -16,16 +16,17 @@ use crate::config::ServerConfig;
 use crate::download_jobs::DownloadJobStore;
 use crate::logging::LogControl;
 use crate::metadata_events::MetadataEventBus;
+use crate::metadata_progress::{MetadataPhase, MetadataProgress, MetadataWork};
 use crate::stats_store::StatsStore;
 use crate::stream_cache::StreamCache;
-use crate::stream_sessions::StreamSessions;
 use crate::user_data::UserDataStore;
-use library::{Library, LibraryStats};
+use library::{Library, LibraryStats, ScanProgress};
 
 #[derive(Clone)]
 pub struct AppState {
     pub library_state: Arc<RwLock<LibraryState>>,
     pub auth: AuthStore,
+    pub security: Arc<crate::security::SecurityState>,
     pub config_path: PathBuf,
     pub config: Arc<RwLock<ServerConfig>>,
     pub db: Arc<Database>,
@@ -35,7 +36,6 @@ pub struct AppState {
     pub log_control: LogControl,
     pub watcher: Arc<RwLock<Option<RecommendedWatcher>>>,
     pub external_client: Client,
-    pub stream_sessions: StreamSessions,
     pub stream_cache: StreamCache,
     pub metadata_events: MetadataEventBus,
     pub download_jobs: DownloadJobStore,
@@ -45,13 +45,17 @@ pub struct AppState {
 pub struct LibraryState {
     pub library: Option<Library>,
     pub status: LibraryStatus,
+    pub metadata_work: Arc<MetadataWork>,
 }
 
 #[derive(Clone, Debug)]
 pub enum LibraryStatus {
     Unconfigured,
     Missing(PathBuf),
-    Scanning { started: SystemTime },
+    Scanning {
+        started: SystemTime,
+        progress: Arc<RwLock<ScanProgress>>,
+    },
     Ready(LibraryStats),
     Error(String),
 }
@@ -86,6 +90,16 @@ pub struct LibraryStatusResponse {
     pub artists: Option<usize>,
     pub albums: Option<usize>,
     pub tracks: Option<usize>,
+    pub progress: Option<ScanProgress>,
+    pub metadata: Option<AlbumMetadataStatus>,
+}
+
+#[derive(Serialize)]
+pub struct AlbumMetadataStatus {
+    pub phase: Option<MetadataPhase>,
+    pub completed: usize,
+    pub total: usize,
+    pub progress: Option<MetadataProgress>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +107,8 @@ pub struct ArtistQuery {
     pub search: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub include_contributors: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +133,8 @@ pub struct SearchResult {
     pub title: String,
     pub subtitle: Option<String>,
     pub score: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,19 +168,6 @@ pub struct UpdatePlaylistRequest {
 #[derive(Clone)]
 pub struct AuthContext {
     pub user: AuthUser,
-}
-
-#[derive(Deserialize)]
-pub struct LoginRequest {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Serialize)]
-pub struct LoginResponse {
-    pub token: String,
-    pub expires_at: u64,
-    pub token_type: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +213,8 @@ pub struct SettingsForm {
     pub metadata_path: String,
     pub log_dir: String,
     pub port: String,
+    pub admin_port: String,
+    pub admin_bind_addr: String,
     pub quic_port: String,
     pub watch_music: Option<String>,
     pub watch_debounce_secs: String,
@@ -234,6 +241,8 @@ pub struct AdminLibraryQuery {
     pub offset: Option<usize>,
     pub album_id: Option<String>,
     pub artist_id: Option<String>,
+    #[serde(default)]
+    pub include_contributors: bool,
 }
 
 #[derive(Deserialize)]

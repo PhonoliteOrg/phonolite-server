@@ -1,22 +1,23 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Phonolite admin - {{title}}</title>
+  <meta name="theme-color" content="#050505" />
+  <script>document.documentElement.classList.add("js");</script>
+  <title>{{title}} · Phonolite</title>
   <link rel="icon" href="/assets/img/favicon.ico" type="image/x-icon" />
-  <link rel="stylesheet" href="/assets/css/admin.css" />
+  <link rel="stylesheet" href="/assets/css/admin.css?v=20261011-borderless-banner" />
 </head>
-<body class="{{page_class}}">
+<body class="{{page_class}}" data-page="{{page}}">
+  <a class="skip-link" href="#main">Skip to content</a>
   <div class="shell">
-    {{nav}}
-    <main class="content">
+    <div id="console-navigation">{{nav}}</div>
+    <main class="content" id="main" tabindex="-1">
       {{content}}
     </main>
-    {{footer}}
+    <div id="console-footer">{{footer}}</div>
   </div>
-  {{artist_detail}}
-
-  <script src="/assets/js/app.js" defer></script>
+  <script type="module" src="/assets/js/app.js"></script>
 </body>
 </html>

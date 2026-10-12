@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::external::Provider;
 
-pub const CONFIG_VERSION: u32 = 8;
+pub const CONFIG_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(default)]
@@ -82,6 +82,9 @@ pub struct ServerConfig {
     pub log_dir: String,
     pub log_debug_enabled: bool,
     pub port: u16,
+    #[serde(default = "default_admin_port")]
+    pub admin_port: u16,
+    pub admin_bind_addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
     pub quic_enabled: bool,
@@ -108,6 +111,10 @@ pub struct ServerConfig {
     pub stream_cache_dir: String,
 }
 
+fn default_admin_port() -> u16 {
+    3002
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -119,6 +126,8 @@ impl Default for ServerConfig {
             log_dir: "logs".to_string(),
             log_debug_enabled: false,
             port: 3000,
+            admin_port: default_admin_port(),
+            admin_bind_addr: "127.0.0.1".to_string(),
             bind_addr: None,
             quic_enabled: true,
             quic_port: 3001,
@@ -148,6 +157,8 @@ impl Default for ServerConfig {
 pub enum ConfigError {
     Io(std::io::Error),
     Yaml(serde_yaml::Error),
+    InvalidPorts(&'static str),
+    InvalidAdminBind(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -155,6 +166,8 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(err) => write!(f, "io error: {}", err),
             ConfigError::Yaml(err) => write!(f, "yaml error: {}", err),
+            ConfigError::InvalidPorts(err) => f.write_str(err),
+            ConfigError::InvalidAdminBind(err) => f.write_str(err),
         }
     }
 }
@@ -171,6 +184,39 @@ impl From<serde_yaml::Error> for ConfigError {
     fn from(err: serde_yaml::Error) -> Self {
         ConfigError::Yaml(err)
     }
+}
+
+pub fn validate_ports(port: u16, admin_port: u16, quic_port: u16) -> Result<(), &'static str> {
+    if port == 0 {
+        return Err("port must be between 1 and 65535");
+    }
+    if admin_port == 0 {
+        return Err("admin_port must be between 1 and 65535");
+    }
+    if quic_port == 0 {
+        return Err("quic_port must be between 1 and 65535");
+    }
+    if quic_port == port {
+        return Err("quic_port must be different from port");
+    }
+    if port == admin_port {
+        return Err("port must be different from admin_port");
+    }
+    if quic_port == admin_port {
+        return Err("quic_port must be different from admin_port");
+    }
+    Ok(())
+}
+
+pub fn parse_admin_bind_addr(value: &str) -> Result<IpAddr, &'static str> {
+    let ip = value
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| "admin_bind_addr must be a valid IPv4 or IPv6 address")?;
+    if ip.is_multicast() || ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+        return Err("admin_bind_addr must be a local interface or wildcard IP address");
+    }
+    Ok(ip)
 }
 
 pub fn config_path_from_env() -> PathBuf {
@@ -244,15 +290,6 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         if config.quic_port == 0 {
             config.quic_port = config.port.saturating_add(1);
         }
-        if config.quic_port == config.port {
-            config.quic_port = if config.port < u16::MAX {
-                config.port + 1
-            } else if config.port > 1 {
-                config.port - 1
-            } else {
-                3001
-            };
-        }
         if config.quic_cert_path.trim().is_empty() {
             config.quic_cert_path = "quic_cert.pem".to_string();
         }
@@ -261,6 +298,11 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         }
         normalize_music_roots(&mut config);
         config.bind_addr = normalize_bind_addr(legacy_bind_addr);
+        validate_ports(config.port, config.admin_port, config.quic_port)
+            .map_err(ConfigError::InvalidPorts)?;
+        config.admin_bind_addr = parse_admin_bind_addr(&config.admin_bind_addr)
+            .map_err(ConfigError::InvalidAdminBind)?
+            .to_string();
         return Ok((config, false));
     }
 
@@ -270,6 +312,9 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
 }
 
 pub fn save_config(path: &Path, config: &ServerConfig) -> Result<(), ConfigError> {
+    validate_ports(config.port, config.admin_port, config.quic_port)
+        .map_err(ConfigError::InvalidPorts)?;
+    parse_admin_bind_addr(&config.admin_bind_addr).map_err(ConfigError::InvalidAdminBind)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -445,9 +490,148 @@ fn format_bind_target(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_target, normalize_music_roots, parse_port, split_bind_addr, MusicRootConfig,
-        ServerConfig,
+        bind_target, load_or_create_config, normalize_music_roots, parse_port, save_config,
+        split_bind_addr, validate_ports, ConfigError, MusicRootConfig, ServerConfig,
     };
+
+    struct TemporaryConfig(std::path::PathBuf);
+
+    impl TemporaryConfig {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "phonolite-config-test-{}.yaml",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TemporaryConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn duplicate_ports_are_rejected_on_load_and_save_even_when_quic_is_disabled() {
+        let file = TemporaryConfig::new();
+        let valid = serde_yaml::to_string(&ServerConfig::default()).unwrap();
+        for quic_enabled in [true, false] {
+            for (port, admin_port, quic_port, message) in [
+                (3000, 3000, 3001, "port must be different from admin_port"),
+                (3000, 3002, 3000, "quic_port must be different from port"),
+                (
+                    3000,
+                    3001,
+                    3001,
+                    "quic_port must be different from admin_port",
+                ),
+                (3000, 3000, 3000, "quic_port must be different from port"),
+            ] {
+                let config = ServerConfig {
+                    port,
+                    admin_port,
+                    quic_port,
+                    quic_enabled,
+                    ..ServerConfig::default()
+                };
+                let invalid = serde_yaml::to_string(&config).unwrap();
+                std::fs::write(&file.0, &invalid).unwrap();
+                let error = load_or_create_config(&file.0).unwrap_err();
+                assert!(matches!(error, ConfigError::InvalidPorts(_)));
+                assert_eq!(error.to_string(), message);
+                assert_eq!(std::fs::read_to_string(&file.0).unwrap(), invalid);
+
+                std::fs::write(&file.0, &valid).unwrap();
+                let error = save_config(&file.0, &config).unwrap_err();
+                assert!(matches!(error, ConfigError::InvalidPorts(_)));
+                assert_eq!(error.to_string(), message);
+                assert_eq!(
+                    std::fs::read_to_string(&file.0).unwrap(),
+                    valid,
+                    "invalid settings must not overwrite the saved configuration"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_ports_are_persisted_without_reassignment() {
+        let file = TemporaryConfig::new();
+        let config = ServerConfig {
+            port: 1,
+            admin_port: u16::MAX,
+            quic_port: 3000,
+            ..ServerConfig::default()
+        };
+        save_config(&file.0, &config).unwrap();
+        let (loaded, created) = load_or_create_config(&file.0).unwrap();
+        assert!(!created);
+        assert_eq!(
+            (loaded.port, loaded.admin_port, loaded.quic_port),
+            (1, u16::MAX, 3000)
+        );
+    }
+
+    #[test]
+    fn admin_bind_addresses_are_validated_on_load_and_save() {
+        let file = TemporaryConfig::new();
+        let valid = serde_yaml::to_string(&ServerConfig::default()).unwrap();
+        for address in [
+            "127.0.0.1",
+            "192.168.1.10",
+            " 0.0.0.0 ",
+            "::1",
+            "::",
+            "fd00::10",
+        ] {
+            let config = ServerConfig {
+                admin_bind_addr: address.into(),
+                ..ServerConfig::default()
+            };
+            save_config(&file.0, &config).unwrap();
+            let (loaded, _) = load_or_create_config(&file.0).unwrap();
+            assert_eq!(loaded.admin_bind_addr, address.trim());
+        }
+        for address in [
+            "",
+            "example.invalid",
+            "192.168.1.10:3002",
+            "[::1]:3002",
+            "999.0.0.1",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            let config = ServerConfig {
+                admin_bind_addr: address.into(),
+                ..ServerConfig::default()
+            };
+            std::fs::write(&file.0, serde_yaml::to_string(&config).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    load_or_create_config(&file.0),
+                    Err(ConfigError::InvalidAdminBind(_))
+                ),
+                "{address}"
+            );
+            std::fs::write(&file.0, &valid).unwrap();
+            assert!(
+                matches!(
+                    save_config(&file.0, &config),
+                    Err(ConfigError::InvalidAdminBind(_))
+                ),
+                "{address}"
+            );
+            assert_eq!(std::fs::read_to_string(&file.0).unwrap(), valid);
+        }
+    }
+
+    #[test]
+    fn no_port_can_be_zero() {
+        for (port, admin_port, quic_port) in [(0, 3002, 3001), (3000, 0, 3001), (3000, 3002, 0)] {
+            assert!(validate_ports(port, admin_port, quic_port).is_err());
+        }
+    }
 
     #[test]
     fn parse_legacy_ipv4_bind_addr() {

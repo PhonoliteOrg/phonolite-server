@@ -16,19 +16,19 @@ use tokio_util::io::ReaderStream;
 use crate::download_jobs::{
     DownloadJob, DownloadJobItem, DownloadJobItemStatus, DownloadJobScope, DownloadJobStatus,
 };
+use crate::http::{json_error, json_error_response};
 use crate::range::{parse_range_header, ByteRange};
 use crate::state::{AppState, AuthContext, JsonResult};
-use crate::utils::{json_error, json_error_response};
 
 use super::{
-    library::{
-        checksum_for_file, download_content_disposition, download_content_type,
-        download_etag_from_metadata, liked_set, offline_metadata_for_track,
-        percent_encode_path_component, playlist_set, range_error_response,
-    },
     library_or_json_error, library_or_response,
-    views::{build_album_view, build_artist_view},
+    views::{build_album_view, build_artist_view, liked_set, playlist_set},
 };
+use crate::download_files::{
+    checksum_for_file, download_content_disposition, download_content_type,
+    download_etag_from_metadata, percent_encode_path_component, range_error_response,
+};
+use crate::offline_metadata::{offline_metadata_for_track, OFFLINE_METADATA_SCHEMA_VERSION};
 
 #[derive(Serialize)]
 pub struct ServerCapabilitiesResponse {
@@ -339,7 +339,7 @@ pub async fn metadata_snapshot(
         }
     };
     Ok(Json(MetadataSnapshotResponse {
-        schema_version: 4,
+        schema_version: OFFLINE_METADATA_SCHEMA_VERSION,
         kind,
         id,
         snapshot,
@@ -547,33 +547,20 @@ fn expand_scope(
             }
             "artist" => {
                 let artist_id = required_scope_id(scope, "artist")?;
-                let mut ids = Vec::new();
-                let albums = library.list_artist_albums(&artist_id).map_err(|err| {
-                    json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("library error: {}", err),
-                    )
-                })?;
-                if albums.is_empty() {
-                    return Err(json_error(StatusCode::NOT_FOUND, "artist not found"));
-                }
-                for album in albums {
-                    let mut tracks = library.get_album_tracks(&album.id).map_err(|err| {
+                let tracks =
+                    crate::shuffle::artist_album_tracks(library, &artist_id).map_err(|err| {
                         json_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("library error: {}", err),
                         )
                     })?;
-                    tracks.sort_by(|a, b| {
-                        a.disc_no
-                            .unwrap_or(0)
-                            .cmp(&b.disc_no.unwrap_or(0))
-                            .then_with(|| a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0)))
-                            .then_with(|| a.title.cmp(&b.title))
-                    });
-                    ids.extend(tracks.into_iter().map(|track| track.id));
+                if tracks.is_empty() {
+                    return Err(json_error(
+                        StatusCode::NOT_FOUND,
+                        "artist has no headline albums",
+                    ));
                 }
-                ids
+                tracks.into_iter().map(|track| track.id).collect()
             }
             "playlist" => {
                 let playlist_id = required_scope_id(scope, "playlist")?;

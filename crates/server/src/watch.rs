@@ -8,7 +8,7 @@ use notify::{
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
-use crate::scan::start_rescan;
+use crate::scan::start_changed_scan;
 use crate::state::AppState;
 
 pub fn configure_watcher(state: &AppState, library: &Library) {
@@ -105,21 +105,27 @@ async fn watch_loop(
             continue;
         }
 
+        let mut changed_paths = std::collections::HashSet::new();
+        let mut full_scan = event.need_rescan() || event.paths.is_empty();
+        changed_paths.extend(event.paths);
+        let mut deadline = tokio::time::Instant::now() + debounce;
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(debounce) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     let _ = state
                         .activity
                         .add_activity("Library auto-scan started.");
-                    info!("Library auto-scan dispatching full rescan for correctness");
-                    start_rescan(state.clone(), library.clone(), false);
+                    info!("Library auto-scan reconciling changed files");
+                    let paths = if full_scan { None } else { Some(changed_paths.into_iter().collect()) };
+                    let _ = start_changed_scan(state.clone(), library.clone(), paths).await;
                     break;
                 }
                 maybe_event = rx.recv() => {
                     if let Some(event) = maybe_event {
-                        if !is_relevant_event(&event) {
-                            continue;
-                        }
+                        if !is_relevant_event(&event) { continue; }
+                        full_scan |= event.need_rescan() || event.paths.is_empty();
+                        changed_paths.extend(event.paths);
+                        deadline = tokio::time::Instant::now() + debounce;
                     } else {
                         return;
                     }
@@ -130,8 +136,9 @@ async fn watch_loop(
 }
 
 fn is_relevant_event(event: &Event) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    )
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        )
 }

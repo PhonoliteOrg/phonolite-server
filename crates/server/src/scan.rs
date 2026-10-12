@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -11,21 +12,30 @@ use crate::assets::{
     clear_metadata_assets, image_ext_from_mime, image_ext_from_url, metadata_root_path,
     prune_stale_metadata_assets, resolve_cover_source, warm_cover_cache, CoverCacheKey,
 };
-use crate::config::{resolve_music_roots, resolve_path, MusicRootConfig, ServerConfig};
+use crate::config::{resolve_music_roots, resolve_path, MusicRootConfig};
 use crate::external::{self, ExternalConfig, ExternalSource, Provider};
 use crate::metadata_events::MetadataEventBus;
-use crate::musicbrainz_album_artists::{MusicBrainzAlbumArtistResolver, ResolveOptions};
+use crate::metadata_progress::{MetadataPhase, MetadataWorkHandle};
+use crate::metadata_sources::external_config_from_settings;
+use crate::musicbrainz_album_artists::{
+    identity_source_fingerprint, AlbumIdentityOutcome, MusicBrainzAlbumArtistResolver,
+    ResolveOptions,
+};
+use crate::performance::MetadataTiming;
 use crate::state::{AppState, LibraryStatus};
 use crate::watch::configure_watcher;
 use common::{Album, Artist};
-use library::{Library, LibraryRoot, LibraryStats};
+use library::{AlbumSourceIdentity, Library, LibraryRoot, LibraryStats, ScanProgress};
 
 pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool) {
+    let progress = Arc::new(parking_lot::RwLock::new(ScanProgress::Discovering));
     {
         let mut guard = state.library_state.write();
         guard.library = None;
+        guard.metadata_work = Default::default();
         guard.status = LibraryStatus::Scanning {
             started: SystemTime::now(),
+            progress: Arc::clone(&progress),
         };
     }
     *state.watcher.write() = None;
@@ -41,10 +51,16 @@ pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool)
         let db = Arc::clone(&state.db);
         let roots_clone = roots.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (library, mut scanned) = Library::load_or_scan_with_db(roots_clone, db)?;
+            let update_progress = |value| {
+                *progress.write() = value;
+            };
+            let (library, mut scanned) =
+                Library::load_or_scan_with_db_and_progress(roots_clone, db, &update_progress)?;
+            // Policy repairs reparse unchanged source tags. An explicit reindex
+            // also resets provider metadata and must reread every source file.
             let stats = if force_rescan {
                 scanned = true;
-                library.rescan()?
+                library.scan_with_progress(true, None, &update_progress)?
             } else {
                 library.stats()?
             };
@@ -81,7 +97,10 @@ pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool)
                     }
                 }
                 if scanned {
-                    start_enrichment_sweep(state.clone(), library.clone(), true);
+                    // Startup policy repairs rebuild from local metadata. Use
+                    // normal enrichment so source descriptions survive; only
+                    // an explicitly requested reindex uses replacement mode.
+                    start_enrichment_sweep(state.clone(), library.clone(), force_rescan);
                 } else {
                     info!("External metadata sweep skipped (no new scan)");
                 }
@@ -115,11 +134,35 @@ pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool)
     });
 }
 
-pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
+pub fn start_rescan(
+    state: AppState,
+    library: Library,
+    replace_complete: bool,
+) -> tokio::task::JoinHandle<()> {
+    start_rescan_inner(state, library, replace_complete, None)
+}
+
+pub fn start_changed_scan(
+    state: AppState,
+    library: Library,
+    paths: Option<Vec<PathBuf>>,
+) -> tokio::task::JoinHandle<()> {
+    start_rescan_inner(state, library, false, paths)
+}
+
+fn start_rescan_inner(
+    state: AppState,
+    library: Library,
+    replace_complete: bool,
+    changed_paths: Option<Vec<PathBuf>>,
+) -> tokio::task::JoinHandle<()> {
+    let progress = Arc::new(parking_lot::RwLock::new(ScanProgress::Discovering));
     {
         let mut guard = state.library_state.write();
+        guard.metadata_work = Default::default();
         guard.status = LibraryStatus::Scanning {
             started: SystemTime::now(),
+            progress: Arc::clone(&progress),
         };
     }
     let library_clone = library.clone();
@@ -130,7 +173,12 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                 warn!("Failed to clear metadata: {}", e);
             }
         }
-        let result = tokio::task::spawn_blocking(move || library.rescan()).await;
+        let result = tokio::task::spawn_blocking(move || {
+            library.scan_with_progress(replace_complete, changed_paths.as_deref(), &|value| {
+                *progress.write() = value;
+            })
+        })
+        .await;
         match result {
             Ok(Ok(stats)) => {
                 {
@@ -179,12 +227,13 @@ pub fn start_rescan(state: AppState, library: Library, replace_complete: bool) {
                     .add_event("ERROR", format!("Library scan failed: {}", message));
             }
         }
-    });
+    })
 }
 
 pub fn set_library_missing(state: &AppState, path: PathBuf) {
     let mut guard = state.library_state.write();
     guard.library = None;
+    guard.metadata_work = Default::default();
     guard.status = LibraryStatus::Missing(path);
     *state.watcher.write() = None;
 }
@@ -192,6 +241,7 @@ pub fn set_library_missing(state: &AppState, path: PathBuf) {
 pub fn set_library_unconfigured(state: &AppState) {
     let mut guard = state.library_state.write();
     guard.library = None;
+    guard.metadata_work = Default::default();
     guard.status = LibraryStatus::Unconfigured;
     *state.watcher.write() = None;
 }
@@ -219,9 +269,10 @@ pub fn start_cover_sweep(state: AppState, library: Library) {
 async fn run_cover_sweep(state: AppState, library: Library) {
     let page_size = 50;
     let mut offset = 0;
+    let mut cursor = None;
     let mut count = 0;
     loop {
-        let (albums, total) = match library.list_albums(None, page_size, offset) {
+        let (albums, total) = match library.page_albums(&mut cursor, page_size) {
             Ok(res) => res,
             Err(e) => {
                 warn!("Cover sweep failed to list albums: {}", e);
@@ -284,6 +335,11 @@ pub fn start_enrichment_sweep(state: AppState, library: Library, replace_complet
     let activity = state.activity.clone();
     let metadata_events = state.metadata_events.clone();
     let _ = activity.add_activity("Metadata scan started.");
+    let progress = state
+        .library_state
+        .read()
+        .metadata_work
+        .start(MetadataPhase::Artists);
     tokio::spawn(async move {
         run_enrichment_sweep(
             library,
@@ -296,6 +352,7 @@ pub fn start_enrichment_sweep(state: AppState, library: Library, replace_complet
             replace_complete,
             activity,
             metadata_events,
+            progress,
         )
         .await;
     });
@@ -457,6 +514,7 @@ async fn run_enrichment_sweep(
     replace_complete: bool,
     activity: ActivityStore,
     metadata_events: MetadataEventBus,
+    progress: MetadataWorkHandle,
 ) {
     let mut stats = MetadataSweepStats::default();
 
@@ -470,11 +528,13 @@ async fn run_enrichment_sweep(
         replace_complete,
         &activity,
         &metadata_events,
+        &progress,
     )
     .await;
     log_metadata_phase("artists", artist_phase.stats);
     stats.artists = artist_phase.stats;
 
+    progress.set_phase(MetadataPhase::AlbumArtists);
     let album_artist_phase = run_musicbrainz_album_artist_sweep(
         &library,
         &client,
@@ -484,12 +544,14 @@ async fn run_enrichment_sweep(
         replace_complete,
         &activity,
         &metadata_events,
+        &progress,
     )
     .await;
     log_metadata_phase("album artists", album_artist_phase.stats);
     stats.album_artists = album_artist_phase.stats;
 
     if album_artist_phase.stats.updated > 0 {
+        progress.set_phase(MetadataPhase::Artists);
         let artist_catchup_phase = run_artist_enrichment_sweep(
             &library,
             &client,
@@ -500,12 +562,14 @@ async fn run_enrichment_sweep(
             false,
             &activity,
             &metadata_events,
+            &progress,
         )
         .await;
         log_metadata_phase("artist catch-up", artist_catchup_phase.stats);
         stats.artist_catchup = artist_catchup_phase.stats;
     }
 
+    progress.set_phase(MetadataPhase::Albums);
     let mut album_remaining = budget.album_limit();
     if tag_error_first {
         let tag_error_album_phase = run_tag_error_album_enrichment(
@@ -517,6 +581,7 @@ async fn run_enrichment_sweep(
             replace_complete,
             &activity,
             &metadata_events,
+            &progress,
         )
         .await;
         log_metadata_phase("tag-error albums", tag_error_album_phase.stats);
@@ -524,6 +589,9 @@ async fn run_enrichment_sweep(
         stats.tag_error_albums = tag_error_album_phase.stats;
     }
 
+    // The tag-error pass can check the same albums as the catalog pass.
+    // Give each pass its own counter rather than double-counting checks.
+    progress.set_phase(MetadataPhase::Albums);
     let album_phase = run_album_enrichment_sweep(
         &library,
         &client,
@@ -533,11 +601,13 @@ async fn run_enrichment_sweep(
         replace_complete,
         &activity,
         &metadata_events,
+        &progress,
     )
     .await;
     log_metadata_phase("albums", album_phase.stats);
     stats.albums = album_phase.stats;
 
+    log_persisted_album_metadata_totals(&library);
     finish_metadata_scan(&activity, stats);
 }
 
@@ -551,15 +621,28 @@ async fn run_artist_enrichment_sweep(
     replace_complete: bool,
     activity: &ActivityStore,
     metadata_events: &MetadataEventBus,
+    work: &MetadataWorkHandle,
 ) -> PhaseProgress {
     let mut progress = PhaseProgress::new(limit);
     if progress.remaining == 0 {
         return progress;
     }
     let page_size = 100;
+    let billed_artists = match library.billed_artist_ids() {
+        Ok(ids) => ids,
+        Err(err) => {
+            warn!(
+                "External artist sweep failed to load billed artists: {}",
+                err
+            );
+            return progress;
+        }
+    };
+    work.set_total(billed_artists.len());
     let mut offset = 0usize;
+    let mut cursor = None;
     loop {
-        let (items, total) = match library.list_artists(None, page_size, offset) {
+        let (items, total) = match library.page_artists(&mut cursor, page_size) {
             Ok(result) => result,
             Err(err) => {
                 warn!("External artist sweep failed: {}", err);
@@ -567,9 +650,13 @@ async fn run_artist_enrichment_sweep(
             }
         };
         for artist in items {
+            if !billed_artists.contains(&artist.id) {
+                continue;
+            }
             if progress.remaining == 0 {
                 break;
             }
+            let _item = work.item(&artist.name, None);
             let result = fetch_artist_enrichment(
                 library,
                 client,
@@ -601,6 +688,7 @@ async fn run_album_enrichment_sweep(
     replace_complete: bool,
     activity: &ActivityStore,
     metadata_events: &MetadataEventBus,
+    work: &MetadataWorkHandle,
 ) -> PhaseProgress {
     let mut progress = PhaseProgress::new(limit);
     if progress.remaining == 0 {
@@ -608,14 +696,16 @@ async fn run_album_enrichment_sweep(
     }
     let page_size = 100;
     let mut offset = 0usize;
+    let mut cursor = None;
     loop {
-        let (items, total) = match library.list_albums(None, page_size, offset) {
+        let (items, total) = match library.page_albums(&mut cursor, page_size) {
             Ok(result) => result,
             Err(err) => {
                 warn!("External album sweep failed: {}", err);
                 return progress;
             }
         };
+        work.set_total(total);
         for album in items {
             if progress.remaining == 0 {
                 break;
@@ -625,6 +715,7 @@ async fn run_album_enrichment_sweep(
                 .ok()
                 .and_then(|artist| artist.map(|value| value.name))
                 .unwrap_or_else(|| "Unknown Artist".to_string());
+            let _item = work.item(&artist_name, Some(&album.title));
             let result = fetch_album_enrichment(
                 library,
                 client,
@@ -667,6 +758,95 @@ fn log_metadata_phase(label: &str, stats: PhaseStats) {
     );
 }
 
+fn log_persisted_album_metadata_totals(library: &Library) {
+    match library.album_metadata_stats() {
+        Ok(stats) => info!(
+            event = "album_metadata_completeness",
+            complete = stats.completed,
+            total = stats.total,
+            incomplete = stats.total.saturating_sub(stats.completed),
+            "Persisted album metadata completeness after sweep"
+        ),
+        Err(err) => warn!(
+            event = "album_metadata_completeness",
+            error = %err,
+            "Failed to read persisted album metadata completeness after sweep"
+        ),
+    }
+}
+
+fn album_metadata_missing_fields(album: &Album) -> &'static str {
+    let description_present = album
+        .summary
+        .as_ref()
+        .is_some_and(|summary| !summary.trim().is_empty());
+    match (description_present, album.genres.is_empty()) {
+        (true, false) => "none",
+        (false, false) => "description",
+        (true, true) => "genres",
+        (false, true) => "description, genres",
+    }
+}
+
+fn log_album_metadata_storage_outcome(
+    library: &Library,
+    album: &Album,
+    artist_name: &str,
+    replace: bool,
+    received_description_present: bool,
+    received_genre_count: usize,
+    updated: bool,
+) {
+    // The provider payload can be partial, and replacing metadata preserves
+    // previously stored fields when those fields are absent from the response.
+    // Read the committed record rather than interpreting the payload as storage.
+    match library.get_album(&album.id) {
+        Ok(Some(persisted)) => info!(
+            event = "album_metadata_storage",
+            album_id = %album.id,
+            artist = artist_name,
+            album = %album.title,
+            replace,
+            received_description_present,
+            received_genre_count,
+            updated,
+            persisted_description_present = persisted
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty()),
+            persisted_genre_count = persisted.genres.len(),
+            persisted_complete = persisted.has_enriched_metadata(),
+            missing_fields = album_metadata_missing_fields(&persisted),
+            "Album metadata storage result"
+        ),
+        Ok(None) => warn!(
+            event = "album_metadata_storage",
+            album_id = %album.id,
+            artist = artist_name,
+            album = %album.title,
+            replace,
+            received_description_present,
+            received_genre_count,
+            updated,
+            outcome = "missing_record",
+            "Album metadata storage could not be verified: album record is missing"
+        ),
+        Err(err) => warn!(
+            event = "album_metadata_storage",
+            album_id = %album.id,
+            artist = artist_name,
+            album = %album.title,
+            replace,
+            received_description_present,
+            received_genre_count,
+            updated,
+            outcome = "read_failed",
+            error = %err,
+            "Album metadata storage could not be verified: persisted record read failed"
+        ),
+    }
+}
+
 async fn run_musicbrainz_album_artist_sweep(
     library: &Library,
     client: &Client,
@@ -676,6 +856,7 @@ async fn run_musicbrainz_album_artist_sweep(
     replace_complete: bool,
     activity: &ActivityStore,
     metadata_events: &MetadataEventBus,
+    work: &MetadataWorkHandle,
 ) -> PhaseProgress {
     let mut progress = PhaseProgress::new(limit);
     let Some(source) = musicbrainz_source(config) else {
@@ -705,6 +886,7 @@ async fn run_musicbrainz_album_artist_sweep(
 
     let page_size = 100usize;
     let mut offset = 0usize;
+    let mut cursor = None;
     let mut seen_albums = 0usize;
     let mut skipped_albums = 0usize;
     let mut matched_albums = 0usize;
@@ -713,7 +895,7 @@ async fn run_musicbrainz_album_artist_sweep(
     let mut updated_albums = 0usize;
     let mut total_albums = None;
     loop {
-        let (albums, total) = match library.list_albums(None, page_size, offset) {
+        let (albums, total) = match library.page_albums(&mut cursor, page_size) {
             Ok(result) => result,
             Err(err) => {
                 warn!("MusicBrainz album-artist sweep failed: {}", err);
@@ -721,6 +903,7 @@ async fn run_musicbrainz_album_artist_sweep(
                 return progress;
             }
         };
+        work.set_total(total);
         if total_albums.is_none() {
             total_albums = Some(total);
             info!(
@@ -748,6 +931,7 @@ async fn run_musicbrainz_album_artist_sweep(
             } else {
                 artist_name.as_str()
             };
+            let _item = work.item(artist_name, Some(&album.title));
 
             let key = external_attempt_key("album_artists", &album.id);
             if !replace_complete {
@@ -757,6 +941,8 @@ async fn run_musicbrainz_album_artist_sweep(
                         skipped_albums = skipped_albums.saturating_add(1);
                         progress.record_skip();
                         info!(
+                            album_id = %album.id,
+                            min_interval_secs = min_interval.as_secs(),
                             "MusicBrainz album-artist sweep {} skipping '{}' (artist='{}', min interval not reached)",
                             progress_label,
                             album.title,
@@ -767,7 +953,12 @@ async fn run_musicbrainz_album_artist_sweep(
                     Err(err) => {
                         failed_albums = failed_albums.saturating_add(1);
                         progress.record_failed();
-                        warn!("MusicBrainz album-artist check failed: {}", err);
+                        warn!(
+                            album_id = %album.id,
+                            artist = %artist_name,
+                            album = %album.title,
+                            "MusicBrainz album-artist check failed: {}", err
+                        );
                         continue;
                     }
                 }
@@ -805,10 +996,12 @@ async fn run_musicbrainz_album_artist_sweep(
                 .resolve_album_artists(library, &album, &tracks, &known_artists)
                 .await
             {
-                Ok(Some(resolved_artists)) => {
+                Ok(Some(resolution)) => {
+                    let resolved_artists = resolution.artists;
                     matched_albums = matched_albums.saturating_add(1);
                     match library.merge_album_artists(&album.id, &resolved_artists) {
                         Ok(updated) => {
+                            let updated = updated || resolution.source_credit_repaired;
                             progress.record_attempt(updated);
                             let _ = library.record_external_attempt(&key, true);
                             let associated_artists = resolved_artists
@@ -908,6 +1101,7 @@ async fn run_tag_error_album_enrichment(
     replace_complete: bool,
     activity: &ActivityStore,
     metadata_events: &MetadataEventBus,
+    work: &MetadataWorkHandle,
 ) -> PhaseProgress {
     let mut progress = PhaseProgress::new(limit);
     if progress.remaining == 0 {
@@ -924,10 +1118,12 @@ async fn run_tag_error_album_enrichment(
                 return progress;
             }
         };
+        work.set_total(total);
         for info in items {
             if progress.remaining == 0 {
                 break;
             }
+            let _item = work.item(&info.artist_name, Some(&info.album_title));
             match library.get_album(&info.album_id) {
                 Ok(Some(album)) => {
                     let artist_name = if !info.artist_name.trim().is_empty() {
@@ -978,15 +1174,14 @@ fn musicbrainz_source(config: &ExternalConfig) -> Option<ExternalSource> {
 
 fn load_all_artists(library: &Library) -> Result<Vec<Artist>, library::LibraryError> {
     let mut items = Vec::new();
-    let mut offset = 0usize;
+    let mut cursor = None;
     let limit = 200usize;
     loop {
-        let (mut batch, total) = library.list_artists(None, limit, offset)?;
+        let (mut batch, total) = library.page_artists(&mut cursor, limit)?;
         items.append(&mut batch);
         if items.len() >= total {
             break;
         }
-        offset = items.len();
     }
     Ok(items)
 }
@@ -1068,9 +1263,17 @@ pub async fn fetch_artist_enrichment(
             }
         }
     }
+    let mut timing = MetadataTiming::new("artist");
     let _ = library.record_external_attempt(&key, false);
+    if let Some(timing) = timing.as_mut() {
+        timing.stage("store_attempt");
+    }
     info!("Fetching external artist metadata for '{}'", artist.name);
-    match external::fetch_artist(client, config, &artist.name).await {
+    let fetched = external::fetch_artist(client, config, &artist.name).await;
+    if let Some(timing) = timing.as_mut() {
+        timing.stage("fetch");
+    }
+    match fetched {
         Ok(Some(metadata)) => {
             let summary = metadata
                 .summary
@@ -1085,8 +1288,18 @@ pub async fn fetch_artist_enrichment(
                 metadata.logo_url.as_deref().unwrap_or("<none>"),
                 metadata.banner_url.as_deref().unwrap_or("<none>")
             );
-            let (logo_ref, banner_ref) =
-                store_artist_assets(metadata_root, client, config, &artist.id, &metadata).await;
+            let (logo_ref, banner_ref) = store_artist_assets(
+                metadata_root,
+                client,
+                config,
+                &artist.id,
+                &metadata,
+                replace,
+            )
+            .await;
+            if let Some(timing) = timing.as_mut() {
+                timing.stage("artwork");
+            }
             let mut failed = false;
             let updated = match library.update_artist_enrichment(
                 &artist.id,
@@ -1118,6 +1331,10 @@ pub async fn fetch_artist_enrichment(
                 );
             }
             let _ = library.record_external_attempt(&key, true);
+            if let Some(mut timing) = timing {
+                timing.stage("store");
+                timing.finish(if failed { "error" } else { "ok" }, updated);
+            }
             if failed {
                 FetchResult::failed()
             } else {
@@ -1126,12 +1343,111 @@ pub async fn fetch_artist_enrichment(
         }
         Ok(None) => {
             info!("External artist metadata not found for '{}'", artist.name);
+            // Keep the cooldown anchored at completion, including slow sources.
             let _ = library.record_external_attempt(&key, false);
+            if let Some(timing) = timing {
+                timing.finish("not_found", false);
+            }
             FetchResult::attempted(false)
         }
         Err(err) => {
             warn!("External artist fetch failed for {}: {}", artist.name, err);
+            if let Some(timing) = timing {
+                timing.finish("error", false);
+            }
             FetchResult::failed()
+        }
+    }
+}
+
+#[derive(Default)]
+struct AlbumMetadataIdentity {
+    identity: Option<AlbumSourceIdentity>,
+    ambiguous: bool,
+}
+
+async fn resolve_album_metadata_identity(
+    library: &Library,
+    client: &Client,
+    config: &ExternalConfig,
+    album: &Album,
+) -> AlbumMetadataIdentity {
+    let result = async {
+        let tracks = library
+            .get_album_tracks(&album.id)
+            .map_err(|err| err.to_string())?;
+        let fingerprint = identity_source_fingerprint(library, album, &tracks)?;
+        if let Some(identity) = library
+            .get_album_source_identity(&album.id, &fingerprint)
+            .map_err(|err| err.to_string())?
+        {
+            info!(
+                event = "metadata_source_identity_cache",
+                album_id = album.id,
+                release_group_id = identity.musicbrainz_release_group_id,
+                outcome = "hit"
+            );
+            return Ok::<_, String>(AlbumMetadataIdentity {
+                identity: Some(identity),
+                ambiguous: false,
+            });
+        }
+        info!(
+            event = "metadata_source_identity_cache",
+            album_id = album.id,
+            outcome = "miss"
+        );
+        let Some(source) = musicbrainz_source(config) else {
+            return Ok(AlbumMetadataIdentity::default());
+        };
+        let user_agent = source.user_agent.as_deref().unwrap_or_default().trim();
+        if user_agent.is_empty() {
+            return Ok(AlbumMetadataIdentity::default());
+        }
+        let resolver = MusicBrainzAlbumArtistResolver::new(
+            client,
+            user_agent,
+            source.timeout,
+            ResolveOptions::default(),
+        );
+        let verified = match resolver
+            .resolve_album_identity_outcome(library, album, &tracks)
+            .await?
+        {
+            AlbumIdentityOutcome::Verified(identity) => identity,
+            AlbumIdentityOutcome::NoMatch => return Ok(AlbumMetadataIdentity::default()),
+            AlbumIdentityOutcome::Ambiguous => {
+                return Ok(AlbumMetadataIdentity {
+                    identity: None,
+                    ambiguous: true,
+                })
+            }
+        };
+        let identity = verified.to_source_identity();
+        if let Err(err) = library.set_album_source_identity(&album.id, &identity) {
+            // Verified proof remains usable for this request if optional persistence fails.
+            warn!(event = "metadata_source_identity_cache", album_id = album.id,
+                outcome = "write_failed", error = %err);
+        }
+        info!(
+            event = "metadata_source_identity_cache",
+            album_id = album.id,
+            release_group_id = identity.musicbrainz_release_group_id,
+            outcome = "verified"
+        );
+        Ok(AlbumMetadataIdentity {
+            identity: Some(identity),
+            ambiguous: false,
+        })
+    }
+    .await;
+    match result {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(event = "metadata_album_identity_failed", album_id = album.id,
+                album = album.title, error = %err,
+                "Album identity resolution failed; literal provider matching remains available");
+            AlbumMetadataIdentity::default()
         }
     }
 }
@@ -1149,6 +1465,8 @@ pub async fn fetch_album_enrichment(
 ) -> FetchResult {
     if !replace && !needs_album_enrichment(album) {
         info!(
+            album_id = %album.id,
+            artist = artist_name,
             "External metadata: skipping album '{}' (already enriched)",
             album.title
         );
@@ -1160,30 +1478,71 @@ pub async fn fetch_album_enrichment(
             Ok(true) => {}
             Ok(false) => {
                 info!(
+                    album_id = %album.id,
+                    artist = artist_name,
+                    min_interval_secs = min_interval.as_secs(),
                     "External metadata: skipping album '{}' (min interval not reached)",
                     album.title
                 );
                 return FetchResult::skipped();
             }
             Err(err) => {
-                warn!("External metadata check failed: {}", err);
+                warn!(
+                    album_id = %album.id,
+                    artist = artist_name,
+                    album = %album.title,
+                    "External metadata check failed: {}", err
+                );
                 return FetchResult::skipped();
             }
         }
     }
+    let mut timing = MetadataTiming::new("album");
     let _ = library.record_external_attempt(&key, false);
+    if let Some(timing) = timing.as_mut() {
+        timing.stage("store_attempt");
+    }
     info!(
+        album_id = %album.id,
         "Fetching external album metadata for '{}' - '{}'",
         artist_name, album.title
     );
-    match external::fetch_album(client, config, artist_name, &album.title).await {
+    let identity = resolve_album_metadata_identity(library, client, config, album).await;
+    let fetched = if identity.ambiguous {
+        info!(
+            event = "metadata_lookup_skipped",
+            album_id = album.id,
+            reason = "ambiguous_verified_album_groups",
+            "Conflicting verified album groups prevent literal metadata fallback"
+        );
+        Ok(None)
+    } else {
+        external::fetch_album_with_identity(
+            client,
+            config,
+            artist_name,
+            &album.title,
+            identity.identity.as_ref(),
+        )
+        .await
+    };
+    if let Some(timing) = timing.as_mut() {
+        timing.stage("fetch");
+    }
+    match fetched {
         Ok(Some(metadata)) => {
+            let received_description_present = metadata
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty());
+            let received_genre_count = metadata.genres.len();
             let summary = metadata
                 .summary
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or("<none>");
             info!(
+                album_id = %album.id,
                 "External album metadata received for '{} - {}': summary='{}', genres={:?}",
                 artist_name, album.title, summary, metadata.genres
             );
@@ -1194,9 +1553,28 @@ pub async fn fetch_album_enrichment(
                 &metadata.genres,
                 replace,
             ) {
-                Ok(updated) => updated,
+                Ok(updated) => {
+                    log_album_metadata_storage_outcome(
+                        library,
+                        album,
+                        artist_name,
+                        replace,
+                        received_description_present,
+                        received_genre_count,
+                        updated,
+                    );
+                    updated
+                }
                 Err(err) => {
                     warn!(
+                        event = "album_metadata_storage",
+                        album_id = %album.id,
+                        artist = artist_name,
+                        album = %album.title,
+                        replace,
+                        received_description_present,
+                        received_genre_count,
+                        outcome = "write_failed",
                         "External album metadata update failed for {} - {}: {}",
                         artist_name, album.title, err
                     );
@@ -1220,6 +1598,10 @@ pub async fn fetch_album_enrichment(
                 );
             }
             let _ = library.record_external_attempt(&key, true);
+            if let Some(mut timing) = timing {
+                timing.stage("store");
+                timing.finish(if failed { "error" } else { "ok" }, updated);
+            }
             if failed {
                 FetchResult::failed()
             } else {
@@ -1228,17 +1610,25 @@ pub async fn fetch_album_enrichment(
         }
         Ok(None) => {
             info!(
+                album_id = %album.id,
                 "External album metadata not found for '{} - {}'",
                 artist_name, album.title
             );
             let _ = library.record_external_attempt(&key, false);
+            if let Some(timing) = timing {
+                timing.finish("not_found", false);
+            }
             FetchResult::attempted(false)
         }
         Err(err) => {
             warn!(
+                album_id = %album.id,
                 "External album fetch failed for {} - {}: {}",
                 artist_name, album.title, err
             );
+            if let Some(timing) = timing {
+                timing.finish("error", false);
+            }
             FetchResult::failed()
         }
     }
@@ -1247,6 +1637,14 @@ pub async fn fetch_album_enrichment(
 pub fn schedule_artist_enrichment(state: &AppState, library: &Library, artist: &Artist) {
     if !needs_artist_enrichment(artist) {
         return;
+    }
+    match library.billed_artist_ids() {
+        Ok(ids) if ids.contains(&artist.id) => {}
+        Ok(_) => return,
+        Err(err) => {
+            warn!("Cannot determine artist billing for metadata: {}", err);
+            return;
+        }
     }
     let config = match external_config(state) {
         Some(config) => config,
@@ -1259,7 +1657,15 @@ pub fn schedule_artist_enrichment(state: &AppState, library: &Library, artist: &
     let metadata_root = metadata_root_path(state);
     let activity = state.activity.clone();
     let metadata_events = state.metadata_events.clone();
+    let progress = state
+        .library_state
+        .read()
+        .metadata_work
+        .start(MetadataPhase::Artists);
     tokio::spawn(async move {
+        let _progress = progress;
+        _progress.set_total(1);
+        let _item = _progress.item(&artist.name, None);
         let _ = fetch_artist_enrichment(
             &library,
             &client,
@@ -1295,7 +1701,15 @@ pub fn schedule_album_enrichment(
     let client = state.external_client.clone();
     let activity = state.activity.clone();
     let metadata_events = state.metadata_events.clone();
+    let progress = state
+        .library_state
+        .read()
+        .metadata_work
+        .start(MetadataPhase::Albums);
     tokio::spawn(async move {
+        let _progress = progress;
+        _progress.set_total(1);
+        let _item = _progress.item(&artist_name, Some(&album.title));
         let _ = fetch_album_enrichment(
             &library,
             &client,
@@ -1323,12 +1737,7 @@ fn needs_artist_enrichment(artist: &Artist) -> bool {
 }
 
 fn needs_album_enrichment(album: &Album) -> bool {
-    album
-        .summary
-        .as_ref()
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-        || album.genres.is_empty()
+    !album.has_enriched_metadata()
 }
 
 async fn store_artist_assets(
@@ -1337,20 +1746,46 @@ async fn store_artist_assets(
     config: &ExternalConfig,
     artist_id: &str,
     metadata: &external::ExternalMetadata,
+    replace: bool,
 ) -> (Option<String>, Option<String>) {
-    let mut logo_ref = None;
-    let mut banner_ref = None;
-
-    if let Some(url) = metadata.logo_url.as_deref() {
-        logo_ref =
-            fetch_and_store_asset(metadata_root, client, config, artist_id, "logo", url).await;
-    }
-    if let Some(url) = metadata.banner_url.as_deref() {
-        banner_ref =
-            fetch_and_store_asset(metadata_root, client, config, artist_id, "banner", url).await;
-    }
-
-    (logo_ref, banner_ref)
+    // Independent assets use separate directories; one slow download need not
+    // delay starting the other. Verified source-URL cache checks stay first.
+    tokio::join!(
+        async {
+            match metadata.logo_url.as_deref() {
+                Some(url) => {
+                    fetch_and_store_asset(
+                        metadata_root,
+                        client,
+                        config,
+                        artist_id,
+                        "logo",
+                        url,
+                        replace,
+                    )
+                    .await
+                }
+                None => None,
+            }
+        },
+        async {
+            match metadata.banner_url.as_deref() {
+                Some(url) => {
+                    fetch_and_store_asset(
+                        metadata_root,
+                        client,
+                        config,
+                        artist_id,
+                        "banner",
+                        url,
+                        replace,
+                    )
+                    .await
+                }
+                None => None,
+            }
+        }
+    )
 }
 
 async fn fetch_and_store_asset(
@@ -1360,48 +1795,106 @@ async fn fetch_and_store_asset(
     artist_id: &str,
     label: &str,
     url: &str,
+    replace: bool,
 ) -> Option<String> {
-    let (dir_name, legacy_name) = match label {
+    fetch_and_store_asset_with(metadata_root, artist_id, label, url, replace, || {
+        download_image(client, config, url)
+    })
+    .await
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArtistAssetSource {
+    url: String,
+    filename: String,
+}
+
+async fn fetch_and_store_asset_with<F, Fut>(
+    metadata_root: &Path,
+    artist_id: &str,
+    label: &str,
+    url: &str,
+    replace: bool,
+    download: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<(Bytes, String)>>,
+{
+    let started = crate::performance::enabled().then(std::time::Instant::now);
+    let (dir_name, _legacy_name) = match label {
         "logo" => ("logos", "logo"),
         "banner" => ("banners", "banner"),
         _ => ("artists", label),
     };
     let base_dir = metadata_root.join(dir_name);
-    let _ = tokio::fs::create_dir_all(&base_dir).await;
-
-    for ext in ["jpg", "jpeg", "png"] {
-        let filename = format!("{}.{}", artist_id, ext);
-        let path = base_dir.join(&filename);
-        if tokio::fs::metadata(&path).await.is_ok() {
-            return Some(format!("{}/{}", dir_name, filename));
-        }
-    }
-
-    let legacy_dir = metadata_root.join("artists").join(artist_id);
-    for ext in ["jpg", "jpeg", "png"] {
-        let legacy_path = legacy_dir.join(format!("{}.{}", legacy_name, ext));
-        if tokio::fs::metadata(&legacy_path).await.is_ok() {
-            let filename = format!("{}.{}", artist_id, ext);
-            let target_path = base_dir.join(&filename);
-            if tokio::fs::metadata(&target_path).await.is_err() {
-                if tokio::fs::copy(&legacy_path, &target_path).await.is_err() {
-                    return Some(format!("artists/{}/{}.{}", artist_id, legacy_name, ext));
+    tokio::fs::create_dir_all(&base_dir).await.ok()?;
+    let source_record = base_dir.join(format!("{artist_id}.source"));
+    if !replace {
+        if let Ok(bytes) = tokio::fs::read(&source_record).await {
+            if let Ok(cached) = serde_json::from_slice::<ArtistAssetSource>(&bytes) {
+                // Older unversioned and legacy assets have no known provider
+                // URL. Refresh them once instead of assuming the current URL
+                // refers to those bytes.
+                if cached.url == url
+                    && cached.filename.starts_with(&format!("{artist_id}."))
+                    && Path::new(&cached.filename).components().count() == 1
+                {
+                    if let Ok(metadata) = tokio::fs::metadata(base_dir.join(&cached.filename)).await
+                    {
+                        record_asset_timing(started, label, "cache", "ok", Some(metadata.len()));
+                        return Some(format!("{dir_name}/{}", cached.filename));
+                    }
                 }
             }
-            return Some(format!("{}/{}", dir_name, filename));
         }
     }
 
-    let (bytes, ext) = match download_image(client, config, url).await {
+    let (bytes, ext) = match download().await {
         Some(value) => value,
-        None => return None,
+        None => {
+            record_asset_timing(started, label, "network", "error", None);
+            return None;
+        }
     };
-    let filename = format!("{}.{}", artist_id, ext);
+    let byte_count = bytes.len() as u64;
+    // A content version changes the stored reference, so metadata listeners
+    // can observe replacement artwork even when its provider URL is unchanged.
+    let version = blake3::hash(&bytes).to_hex();
+    let filename = format!("{artist_id}.{version}.{ext}");
     let path = base_dir.join(&filename);
-    if tokio::fs::write(&path, bytes).await.is_err() {
+    if tokio::fs::write(&path, &bytes).await.is_err() {
+        record_asset_timing(started, label, "network", "store_error", Some(byte_count));
         return None;
     }
+    if let Ok(record) = serde_json::to_vec(&ArtistAssetSource {
+        url: url.to_owned(),
+        filename: filename.clone(),
+    }) {
+        let _ = tokio::fs::write(source_record, record).await;
+    }
+    record_asset_timing(started, label, "network", "ok", Some(byte_count));
     Some(format!("{}/{}", dir_name, filename))
+}
+
+fn record_asset_timing(
+    started: Option<std::time::Instant>,
+    asset: &str,
+    source: &'static str,
+    outcome: &'static str,
+    bytes: Option<u64>,
+) {
+    if let Some(started) = started {
+        tracing::info!(
+            target: "performance",
+            event = "metadata_artwork",
+            asset,
+            source,
+            outcome,
+            bytes,
+            elapsed_ms = crate::performance::milliseconds(started.elapsed()),
+        );
+    }
 }
 
 async fn download_image(
@@ -1454,86 +1947,446 @@ pub fn external_attempt_key(kind: &str, id: &str) -> String {
     format!("{}:{}", kind, id)
 }
 
-fn external_config_from_settings(config: &ServerConfig) -> Option<ExternalConfig> {
-    let timeout = config.external_metadata_timeout_secs.max(1);
-    let mut sources = Vec::new();
-    for source in &config.external_metadata_sources {
-        if !source.enabled {
-            continue;
-        }
-        match source.provider {
-            Provider::TheAudioDb => {
-                let api_key = source.api_key.trim();
-                if api_key.is_empty() {
-                    continue;
-                }
-                sources.push(ExternalSource {
-                    provider: Provider::TheAudioDb,
-                    api_key: Some(api_key.to_string()),
-                    user_agent: None,
-                    timeout: Duration::from_secs(timeout),
-                });
-            }
-            Provider::MusicBrainz => {
-                let user_agent = source.user_agent.trim();
-                if user_agent.is_empty() {
-                    continue;
-                }
-                sources.push(ExternalSource {
-                    provider: Provider::MusicBrainz,
-                    api_key: None,
-                    user_agent: Some(user_agent.to_string()),
-                    timeout: Duration::from_secs(timeout),
-                });
-            }
-        }
-    }
-    if sources.is_empty() {
-        return None;
-    }
-    Some(ExternalConfig { sources })
-}
-
-pub fn parse_provider(value: &str) -> Result<Provider, String> {
-    let provider =
-        external::provider_from_str(value).ok_or_else(|| "unsupported provider".to_string())?;
-    Ok(provider)
-}
-
-pub fn source_fields_from_parts(
-    provider: Provider,
-    api_key: &str,
-    user_agent: &str,
-) -> Result<(String, String), String> {
-    let api_key = api_key.trim();
-    let user_agent = user_agent.trim();
-    match provider {
-        Provider::TheAudioDb => {
-            if api_key.is_empty() {
-                return Err("api key is required".to_string());
-            }
-            Ok((api_key.to_string(), String::new()))
-        }
-        Provider::MusicBrainz => {
-            if user_agent.is_empty() {
-                return Err("user agent is required".to_string());
-            }
-            Ok((String::new(), user_agent.to_string()))
-        }
-    }
-}
-
-pub fn new_source_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
-    format!("src-{}", nanos)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{FetchResult, PhaseProgress, SweepBudget};
+
+    fn metadata_album(summary: Option<&str>, genres: &[&str]) -> common::Album {
+        serde_json::from_value(serde_json::json!({
+            "id": "diagnostic-album", "artist_id": "artist", "artist_names": ["Artist"],
+            "title": "Diagnostic Album", "year": null, "folder_relpath": "Artist/Album",
+            "cover_ref": null, "summary": summary, "genres": genres
+        }))
+        .unwrap()
+    }
+
+    fn metadata_test_library(album: Option<&common::Album>) -> library::Library {
+        let db = std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        let library = library::Library::load_or_scan_with_db(Vec::new(), db.clone())
+            .unwrap()
+            .0;
+        if let Some(album) = album {
+            let transaction = db.begin_write().unwrap();
+            {
+                let mut albums = transaction
+                    .open_table(redb::TableDefinition::<&str, &[u8]>::new("albums"))
+                    .unwrap();
+                let encoded = bincode::serialize(album).unwrap();
+                albums
+                    .insert(album.id.as_str(), encoded.as_slice())
+                    .unwrap();
+                let mut meta = transaction
+                    .open_table(redb::TableDefinition::<&str, &[u8]>::new("meta"))
+                    .unwrap();
+                let counts = bincode::serialize(&library::AlbumMetadataStats {
+                    completed: usize::from(album.has_enriched_metadata()),
+                    total: 1,
+                })
+                .unwrap();
+                meta.insert("album_metadata_stats_v1", counts.as_slice())
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        library
+    }
+
+    #[tokio::test]
+    async fn metadata_identity_cache_reuses_proof_without_enabling_musicbrainz_requests() {
+        let album = metadata_album(None, &[]);
+        let library = metadata_test_library(Some(&album));
+        let fingerprint = super::identity_source_fingerprint(&library, &album, &[]).unwrap();
+        let identity = library::AlbumSourceIdentity {
+            schema_version: library::ALBUM_SOURCE_IDENTITY_SCHEMA_VERSION,
+            context_fingerprint: fingerprint,
+            musicbrainz_release_id: "c547b57a-0cf7-4fbe-85d4-759a1193a6f8".into(),
+            musicbrainz_release_group_id: "4587e021-3f9d-43a6-81f3-50505e05fbd3".into(),
+            canonical_title: "Diagnostic Album".into(),
+            artist_names: vec!["Artist".into()],
+            artist_ids: vec!["070d193a-845c-479f-980e-bef15710653e".into()],
+            verified_at_ms: 1,
+            evidence: "previously verified test proof".into(),
+        };
+        library
+            .set_album_source_identity(&album.id, &identity)
+            .unwrap();
+        // No providers configured: this must be a cache-only path.
+        let config = crate::external::ExternalConfig {
+            sources: Vec::new(),
+        };
+        let client = reqwest::Client::new();
+        assert_eq!(
+            super::resolve_album_metadata_identity(&library, &client, &config, &album,)
+                .await
+                .identity,
+            Some(identity)
+        );
+        let mut changed = album;
+        changed.title = "A different source album".into();
+        assert!(
+            super::resolve_album_metadata_identity(&library, &client, &config, &changed,)
+                .await
+                .identity
+                .is_none()
+        );
+    }
+
+    #[derive(Clone)]
+    struct MetadataLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for MetadataLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_metadata_logs(action: impl FnOnce()) -> String {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = MetadataLogWriter(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        let bytes = output.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn metadata_missing_field_diagnostics_distinguish_each_incomplete_state() {
+        for (summary, genres, expected) in [
+            (None, Vec::new(), "description, genres"),
+            (Some(" \n\t"), vec!["Rock"], "description"),
+            (Some("Description"), Vec::new(), "genres"),
+            (Some("Description"), vec!["Rock"], "none"),
+        ] {
+            let album = metadata_album(summary, &genres);
+            assert_eq!(super::album_metadata_missing_fields(&album), expected);
+            assert_eq!(album.has_enriched_metadata(), expected == "none");
+        }
+    }
+
+    #[test]
+    fn metadata_storage_diagnostics_read_committed_fields_and_report_cached_completeness() {
+        let album = metadata_album(Some("Existing description"), &["Rock"]);
+        let library = metadata_test_library(Some(&album));
+        let updated = library
+            .update_album_enrichment(&album.id, None, &["Jazz".into()], true)
+            .unwrap();
+        assert!(updated);
+        let logs = capture_metadata_logs(|| {
+            super::log_album_metadata_storage_outcome(
+                &library, &album, "Artist", true, false, 1, updated,
+            );
+            super::log_persisted_album_metadata_totals(&library);
+        });
+        for field in [
+            "album_id=diagnostic-album",
+            "received_description_present=false",
+            "received_genre_count=1",
+            "updated=true",
+            "persisted_description_present=true",
+            "persisted_genre_count=1",
+            "persisted_complete=true",
+            "missing_fields=\"none\"",
+            "complete=1 total=1 incomplete=0",
+        ] {
+            assert!(logs.contains(field), "{logs}");
+        }
+        assert_eq!(
+            library
+                .get_album(&album.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("Existing description")
+        );
+
+        // A received genre can normalize away. The committed record and cached
+        // count, rather than raw payload size or updated=true, define completion.
+        let updated = library
+            .update_album_enrichment(&album.id, None, &[" \t".into()], true)
+            .unwrap();
+        assert!(updated);
+        let logs = capture_metadata_logs(|| {
+            super::log_album_metadata_storage_outcome(
+                &library, &album, "Artist", true, false, 1, updated,
+            );
+            super::log_persisted_album_metadata_totals(&library);
+        });
+        for field in [
+            "received_genre_count=1",
+            "updated=true",
+            "persisted_genre_count=0",
+            "persisted_complete=false",
+            "missing_fields=\"genres\"",
+            "complete=0 total=1 incomplete=1",
+        ] {
+            assert!(logs.contains(field), "{logs}");
+        }
+    }
+
+    #[test]
+    fn metadata_storage_diagnostics_do_not_claim_completeness_when_verification_fails() {
+        let album = metadata_album(None, &[]);
+        let library = metadata_test_library(None);
+        let missing = capture_metadata_logs(|| {
+            super::log_album_metadata_storage_outcome(
+                &library, &album, "Artist", false, true, 1, false,
+            );
+        });
+        assert!(missing.contains("outcome=\"missing_record\""), "{missing}");
+        assert!(!missing.contains("persisted_complete="), "{missing}");
+
+        let db = library.db();
+        let transaction = db.begin_write().unwrap();
+        {
+            let mut albums = transaction
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new("albums"))
+                .unwrap();
+            albums.insert(album.id.as_str(), &[0xff_u8][..]).unwrap();
+        }
+        transaction.commit().unwrap();
+        let failed = capture_metadata_logs(|| {
+            super::log_album_metadata_storage_outcome(
+                &library, &album, "Artist", false, true, 1, false,
+            );
+        });
+        assert!(failed.contains("outcome=\"read_failed\""), "{failed}");
+        assert!(!failed.contains("persisted_complete="), "{failed}");
+    }
+
+    struct AssetTestDirectory(std::path::PathBuf);
+
+    impl AssetTestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("phonolite-artist-assets-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for AssetTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_sweep_checks_advance_without_claiming_unmatched_or_deferred_albums_complete()
+    {
+        let dir = AssetTestDirectory::new();
+        for title in ["First", "Second"] {
+            let folder = dir.0.join("Artist").join(title);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("Track.mp3"), b"untagged audio fixture").unwrap();
+        }
+        let db = std::sync::Arc::new(
+            redb::Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        let library = library::Library::load_or_scan_with_db(
+            vec![library::LibraryRoot {
+                id: String::new(),
+                path: dir.0.clone(),
+            }],
+            db.clone(),
+        )
+        .unwrap()
+        .0;
+        let albums = library.list_albums(None, 10, 0).unwrap().0;
+        assert_eq!(albums.len(), 2);
+        library
+            .record_external_attempt(&super::external_attempt_key("album", &albums[0].id), false)
+            .unwrap();
+        let activity = crate::activity_store::ActivityStore::new(db);
+        activity.init_tables().unwrap();
+        let events = crate::metadata_events::MetadataEventBus::new(16);
+        let work = std::sync::Arc::new(crate::metadata_progress::MetadataWork::default());
+        let job = work.start(crate::metadata_progress::MetadataPhase::Albums);
+        // No providers: the other album is unmatched without any network requests.
+        let phase = super::run_album_enrichment_sweep(
+            &library,
+            &reqwest::Client::new(),
+            &crate::external::ExternalConfig {
+                sources: Vec::new(),
+            },
+            std::time::Duration::from_secs(3600),
+            usize::MAX,
+            false,
+            &activity,
+            &events,
+            &job,
+        )
+        .await;
+        assert_eq!(phase.stats.skipped, 1);
+        assert_eq!(phase.stats.attempted, 1);
+        let progress = work.snapshot().unwrap();
+        assert_eq!(progress.checked, 2);
+        assert_eq!(progress.total, Some(2));
+        let stored = library.album_metadata_stats().unwrap();
+        assert_eq!(stored.completed, 0);
+        assert_eq!(stored.total, 2);
+    }
+
+    #[tokio::test]
+    async fn artist_artwork_reuses_verified_url_cache_and_refreshes_changed_urls_or_replacements() {
+        let dir = AssetTestDirectory::new();
+        let first = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/old",
+            false,
+            || async { Some((bytes::Bytes::from_static(b"first logo"), "png".to_owned())) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(dir.0.join(&first)).await.unwrap(),
+            b"first logo"
+        );
+
+        let reused = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/old",
+            false,
+            || async { panic!("unchanged provider URL should reuse verified artwork") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reused, first);
+
+        let new_url = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/new",
+            false,
+            || async {
+                Some((
+                    bytes::Bytes::from_static(b"new provider logo"),
+                    "webp".to_owned(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(new_url, first);
+        assert_eq!(
+            tokio::fs::read(dir.0.join(&new_url)).await.unwrap(),
+            b"new provider logo"
+        );
+
+        let replacement = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/new",
+            true,
+            || async {
+                Some((
+                    bytes::Bytes::from_static(b"corrected same URL logo"),
+                    "webp".to_owned(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(replacement, new_url);
+        assert_eq!(
+            tokio::fs::read(dir.0.join(&replacement)).await.unwrap(),
+            b"corrected same URL logo"
+        );
+        let unchanged_bytes = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/new",
+            true,
+            || async {
+                Some((
+                    bytes::Bytes::from_static(b"corrected same URL logo"),
+                    "webp".to_owned(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged_bytes, replacement);
+    }
+
+    #[tokio::test]
+    async fn artwork_refresh_rejects_unverified_legacy_cache_and_failed_download_keeps_previous_asset(
+    ) {
+        let dir = AssetTestDirectory::new();
+        let logos = dir.0.join("logos");
+        tokio::fs::create_dir_all(&logos).await.unwrap();
+        tokio::fs::write(logos.join("artist.jpg"), b"unverified wrong artist")
+            .await
+            .unwrap();
+        let corrected = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/correct",
+            false,
+            || async {
+                Some((
+                    bytes::Bytes::from_static(b"verified new artist"),
+                    "jpg".to_owned(),
+                ))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(dir.0.join(&corrected)).await.unwrap(),
+            b"verified new artist"
+        );
+
+        assert!(super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/correct",
+            true,
+            || async { None }
+        )
+        .await
+        .is_none());
+        assert_eq!(
+            tokio::fs::read(dir.0.join(&corrected)).await.unwrap(),
+            b"verified new artist"
+        );
+        let retained = super::fetch_and_store_asset_with(
+            &dir.0,
+            "artist",
+            "logo",
+            "https://example.test/correct",
+            false,
+            || async { panic!("a failed refresh must leave the previous verified cache usable") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained, corrected);
+    }
 
     #[test]
     fn normal_sweep_budget_applies_limit_per_phase() {

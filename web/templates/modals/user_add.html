@@ -1,26 +1,26 @@
-<div class="modal" id="modal-add">
+<div class="modal" id="modal-add" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="modal-add-title">
   <div class="modal-backdrop" data-close></div>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <div class="modal-header">
-      <h3>Add User</h3>
+      <h2 id="modal-add-title">Add user</h2>
     </div>
     <form id="form-add-user">
       <div class="form-group">
-        <label>Username</label>
-        <input type="text" name="username" required autocomplete="off" />
+        <label for="user-add-username">Username</label>
+        <input id="user-add-username" type="text" name="username" required autocomplete="off" />
       </div>
       <div class="form-group">
-        <label>Password</label>
-        <input type="password" name="password" required autocomplete="new-password" />
+        <label for="user-add-password">Password</label>
+        <input id="user-add-password" type="password" name="password" required autocomplete="new-password" />
       </div>
       <div class="form-group">
-        <label>Role</label>
-        <select name="role">
+        <label for="user-add-role">Role</label>
+        <select id="user-add-role" name="role">
           <option value="user">User</option>
           <option value="admin">Admin</option>
         </select>
       </div>
-      <div id="add-user-error" class="inline-error"></div>
+      <div id="add-user-error" class="inline-error" role="alert"></div>
       <div class="row right">
         <button type="button" class="button ghost" data-close>Cancel</button>
         <button type="submit" class="button primary">Create</button>

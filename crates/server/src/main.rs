@@ -1,27 +1,38 @@
 mod activity_store;
 mod admin;
+mod album_lookup;
 mod api;
 mod assets;
 mod auth;
 mod config;
+mod download_files;
 mod download_jobs;
 mod external;
+mod http;
+mod library_views;
 mod logging;
 mod metadata_events;
+mod metadata_progress;
+mod metadata_sources;
 mod musicbrainz_album_artists;
+mod musicbrainz_http;
 mod musicbrainz_rate_limit;
+mod offline_metadata;
+mod performance;
+mod process_control;
 mod quic;
 mod range;
 mod scan;
+mod security;
+mod security_protocol;
 mod shuffle;
 mod state;
 mod stats_store;
 mod stream_cache;
-mod stream_sessions;
 mod streaming;
+mod tls;
 mod transcode;
 mod user_data;
-mod utils;
 mod watch;
 
 use std::sync::Arc;
@@ -45,18 +56,32 @@ use state::{AppState, LibraryState, LibraryStatus};
 use stats_store::StatsStore;
 use stream_cache::StreamCache;
 use tower_http::request_id::{MakeRequestUuid, SetRequestIdLayer};
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tower_http::LatencyUnit;
-use tracing::{info, warn, Level};
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
 use user_data::{open_or_create_db as open_user_db, UserDataStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        None => {}
+        Some("--setup-admin") if args.len() == 3 => {}
+        Some("--renew-certificate") if args.len() == 2 => {}
+        _ => return Err("usage: server [--setup-admin USER | --renew-certificate]".into()),
+    }
     let config_path = config_path_from_env();
     let (config, created) = load_or_create_config(&config_path)?;
     let (log_dir, log_control) = logging::init_logging(&config_path, &config)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     let config_store = Arc::new(RwLock::new(config.clone()));
+
+    if args.get(1).map(String::as_str) == Some("--renew-certificate") {
+        tls::renew(&config, &config_path)?;
+        println!(
+            "Certificate renewed with the existing server key. Restart the server when ready."
+        );
+        return Ok(());
+    }
 
     if created {
         info!("Created default config at {:?}", config_path);
@@ -87,9 +112,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let db = Library::open_db(&index_path)?;
+    tls::harden_file(&index_path)?;
     let auth = AuthStore::new(Arc::clone(&db), session_ttl);
-    if let Err(err) = auth.init_tables() {
-        warn!("Failed to create initial tables: {}", err);
+    auth.init_tables()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let security = security::SecurityState::new(auth.opaque_setup()?);
+    let enrolled = auth.has_any_user()?;
+    let (cert_path, key_path) = tls::identity(&config, &config_path, enrolled)?;
+    if args.get(1).map(String::as_str) == Some("--setup-admin") {
+        let username = args.get(2).ok_or("provide a username")?;
+        let password = zeroize::Zeroizing::new(rpassword::prompt_password("Password: ")?);
+        let confirmation =
+            zeroize::Zeroizing::new(rpassword::prompt_password("Confirm password: ")?);
+        if *password != *confirmation {
+            return Err("passwords do not match".into());
+        }
+        auth.create_superadmin(username, &password)?;
+        println!("Initial account created. No server was started.");
+        return Ok(());
     }
     if let Err(err) = auth.ensure_superadmin() {
         warn!("Failed to ensure superadmin: {}", err);
@@ -132,11 +172,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let library_state = Arc::new(RwLock::new(LibraryState {
         library: None,
         status: LibraryStatus::Unconfigured,
+        metadata_work: Default::default(),
     }));
     let watcher = Arc::new(RwLock::new(None));
     let state = AppState {
         library_state,
         auth,
+        security,
         config_path,
         config: config_store,
         db,
@@ -146,7 +188,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_control,
         watcher,
         external_client,
-        stream_sessions: stream_sessions::StreamSessions::new(),
         stream_cache,
         metadata_events: MetadataEventBus::new(1024),
         download_jobs,
@@ -171,14 +212,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .nest("/api/v1", api_router(state.clone()))
         // .nest("/api/v1", api::api_router(state.clone())) // Removed duplicate
-        .merge(admin_router(state.clone()))
+        .layer(axum::middleware::from_fn(performance::http_request))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(
-            TraceLayer::new_for_http().on_response(
-                DefaultOnResponse::new()
-                    .level(Level::INFO)
-                    .latency_unit(LatencyUnit::Millis),
-            ),
+            TraceLayer::new_for_http()
+                .make_span_with(performance::trace_span)
+                .on_request(performance::trace_request)
+                .on_response(performance::trace_response)
+                .on_eos(performance::trace_end),
         );
 
     if state.config.read().quic_enabled {
@@ -190,37 +231,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let admin_ip = config::parse_admin_bind_addr(&config.admin_bind_addr)?;
+    let admin_listener = tokio::net::TcpListener::bind((admin_ip, config.admin_port)).await?;
+    let admin_address = admin_listener.local_addr()?;
+    let admin_app = admin_router(state.clone(), admin_address);
+    let admin_cert = cert_path.clone();
+    let admin_key = key_path.clone();
+    tokio::spawn(async move {
+        if let Err(error) = tls::serve(
+            admin_listener,
+            admin_app,
+            &admin_cert,
+            &admin_key,
+            tls::Endpoint::Admin,
+        )
+        .await
+        {
+            tracing::error!("admin listener failed: {error}");
+        }
+    });
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!("Listening on {}", bind_addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    info!(
+        "HTTPS listening on {}; administration listening on {}",
+        bind_addr, admin_address
+    );
+    tls::serve(listener, app, &cert_path, &key_path, tls::Endpoint::Api).await?;
     Ok(())
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(err) => {
-                warn!("Failed to install terminate signal handler: {}", err);
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = term.recv() => {},
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!("Failed to listen for ctrl-c: {}", err);
-        }
-    }
-
-    info!("Shutdown signal received.");
 }

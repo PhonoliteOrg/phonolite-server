@@ -1,24 +1,26 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use common::{artist_identity_id, Album, Artist, Track};
+use common::{artist_identity_id, Album, Artist, ArtistCredit, Track};
 use library::Library;
 use metadata::read_tags;
 use regex::Regex;
 use reqwest::{Client, Url};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use strsim::normalized_levenshtein;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::musicbrainz_rate_limit;
+use crate::{musicbrainz_http, performance};
+
+#[path = "musicbrainz_album_identity.rs"]
+mod album_identity;
+pub use album_identity::{identity_source_fingerprint, AlbumIdentityOutcome};
 
 const DEFAULT_MB_LIMIT: usize = 25;
-const DEFAULT_MIN_TRACK_COUNT: usize = 2;
-const DEFAULT_MIN_TRACK_RATIO: f32 = 0.25;
 
 const CONNECTOR_ARTISTS: &[&str] = &[
     "&",
@@ -36,16 +38,12 @@ const DEFAULT_ARTIST_NAME_MAP: &[(&str, &str)] = &[("ye", "Kanye West")];
 #[derive(Clone, Copy, Debug)]
 pub struct ResolveOptions {
     pub mb_limit: usize,
-    pub min_track_count: usize,
-    pub min_track_ratio: f32,
 }
 
 impl Default for ResolveOptions {
     fn default() -> Self {
         Self {
             mb_limit: DEFAULT_MB_LIMIT,
-            min_track_count: DEFAULT_MIN_TRACK_COUNT,
-            min_track_ratio: DEFAULT_MIN_TRACK_RATIO,
         }
     }
 }
@@ -55,6 +53,11 @@ pub struct MusicBrainzAlbumArtistResolver<'a> {
     user_agent: &'a str,
     timeout: Duration,
     options: ResolveOptions,
+}
+
+pub struct AlbumArtistResolution {
+    pub artists: Vec<Artist>,
+    pub source_credit_repaired: bool,
 }
 
 impl<'a> MusicBrainzAlbumArtistResolver<'a> {
@@ -78,17 +81,74 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         album: &Album,
         tracks: &[Track],
         existing_artists: &[Artist],
-    ) -> Result<Option<Vec<Artist>>, String> {
+    ) -> Result<Option<AlbumArtistResolution>, String> {
         if self.user_agent.trim().is_empty() {
             return Ok(None);
         }
 
-        let local = build_local_album_info(library, album, tracks).await?;
+        // Enriched credits can already contain a wrong primary. Always search
+        // using the locally indexed identity rather than feeding it back into
+        // the provider on later sweeps.
+        let mut source_album = library
+            .get_local_album(&album.id)
+            .map_err(|err| err.to_string())?
+            .unwrap_or_else(|| album.clone());
+        let mut local = build_local_album_info(&source_album, tracks.len());
+        let source_credit = library
+            .album_credits(&album.id)
+            .map_err(|err| err.to_string())?;
+        local.allow_display_resolution = source_credit
+            .credits
+            .iter()
+            .filter(|credit| credit.is_album_artist())
+            .all(|credit| matches!(credit.source.as_str(), "local_tags" | "folder"));
+        if local.allow_display_resolution && !source_credit.display_name.trim().is_empty() {
+            local.artist_hint = source_credit.display_name;
+        }
+        local.track_titles = tracks.iter().map(|track| track.title.clone()).collect();
         let base_name_map = default_artist_name_map();
-        let resolved = match self.resolve_album_with_musicbrainz(&local).await? {
+        let started = performance::enabled().then(Instant::now);
+        let result = self.resolve_album_with_musicbrainz(&local).await;
+        if let Some(started) = started {
+            tracing::info!(
+                target: "performance",
+                event = "metadata_source_fetch",
+                provider = "musicbrainz",
+                kind = "album_artists",
+                outcome = match &result {
+                    Ok(Some(_)) => "found",
+                    Ok(None) => "not_found",
+                    Err(_) => "error",
+                },
+                elapsed_ms = performance::milliseconds(started.elapsed()),
+            );
+        }
+        let resolved = match result? {
             Some(resolved) => resolved,
             None => return Ok(None),
         };
+        let mut source_credit_repaired = false;
+        if local.allow_display_resolution && !resolved.artist_credits.is_empty() {
+            let repair_library = library.clone();
+            let album_id = album.id.clone();
+            let provider_credits = resolved.artist_credits.clone();
+            let repaired = tokio::task::spawn_blocking(move || {
+                repair_library.resolve_album_display_credit(&album_id, &provider_credits)
+            })
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
+            if repaired {
+                source_credit_repaired = true;
+                source_album = library
+                    .get_local_album(&album.id)
+                    .map_err(|err| err.to_string())?
+                    .unwrap_or(source_album);
+            }
+        }
+        // Local collaborator tags are only needed after a remote release match.
+        // Unmatched albums no longer reread every audio file during this sweep.
+        local.track_artists = read_local_track_artists(library, tracks).await?;
 
         let effective_name_map =
             build_effective_name_map(&base_name_map, Some(&resolved.auto_name_map));
@@ -110,11 +170,19 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
             album_track_collaborators.push(collaborators);
         }
 
-        let selected = select_significant_album_artists(
-            &album_artists,
-            &album_track_collaborators,
-            self.options.min_track_count,
-            self.options.min_track_ratio,
+        // Only release-level billing can establish album ownership. Repeated
+        // song features remain song credits, regardless of their frequency.
+        let selected = unique_preserve_order(album_artists.clone());
+        // A shared composer, band name, or work title cannot identify a
+        // performer. A release can authenticate the existing local primary
+        // without proving that its additional credits belong to these files.
+        // Only add artists independently supported by the local tags, and do
+        // not let remote alias maps manufacture that supporting evidence.
+        let selected = locally_supported_artists(
+            &selected,
+            &source_album,
+            &local.track_artists,
+            &base_name_map,
         );
         let selected = rank_selected_album_artists(
             &selected,
@@ -127,10 +195,19 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         }
 
         let artists = materialize_artists(&selected, existing_artists, &effective_name_map);
+        let artists = preserve_local_primary(
+            artists,
+            &source_album,
+            existing_artists,
+            &effective_name_map,
+        );
         if artists.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(artists))
+            Ok(Some(AlbumArtistResolution {
+                artists,
+                source_credit_repaired,
+            }))
         }
     }
 
@@ -138,48 +215,51 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         &self,
         local: &LocalAlbumInfo,
     ) -> Result<Option<ResolvedRelease>, String> {
-        let mut candidates = Vec::new();
+        if !usable_artist_hint(&local.artist_hint) {
+            return Ok(None);
+        }
+        let mut diagnostics = ReleaseMatchDiagnostics::default();
         for query in
             build_release_queries(Some(local.artist_hint.as_str()), local.album_hint.as_str())
         {
-            let results = self
+            let candidates = self
                 .search_releases(query.as_str(), self.options.mb_limit)
                 .await?;
-            if !results.is_empty() {
-                candidates = results;
-                break;
+            let best = best_matching_release_with_diagnostics(
+                local,
+                &candidates,
+                |release_id| async move { self.fetch_release(&release_id).await },
+                &mut diagnostics,
+            )
+            .await;
+            if let Some(release) = best {
+                return Ok(Some(ResolvedRelease {
+                    album_artists: collect_release_artists(&release),
+                    artist_credits: if release_tracks_align(local, &release) {
+                        provider_artist_credits(&release)
+                    } else {
+                        Vec::new()
+                    },
+                    // Equal counts alone do not identify corresponding tracks.
+                    track_artists: if release_tracks_align(local, &release) {
+                        collect_release_track_artists(&release)
+                    } else {
+                        Vec::new()
+                    },
+                    auto_name_map: infer_name_map_from_release(&release),
+                }));
             }
         }
-
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-
-        let mut best_score = -1.0f64;
-        let mut best = None;
-        for candidate in candidates {
-            let Some(release_id) = candidate.id.as_deref() else {
-                continue;
-            };
-            let release = match self.fetch_release(release_id).await {
-                Ok(release) => release,
-                Err(_) => continue,
-            };
-
-            let score = candidate_score(local, &candidate, &release);
-            if score <= best_score {
-                continue;
-            }
-
-            best_score = score;
-            best = Some(ResolvedRelease {
-                album_artists: collect_release_artists(&release),
-                track_artists: collect_release_track_artists(&release),
-                auto_name_map: infer_name_map_from_release(&release),
-            });
-        }
-
-        Ok(best)
+        tracing::info!(
+            provider = "musicbrainz",
+            kind = "album_artists",
+            album = %local.album_hint,
+            artist = %local.artist_hint,
+            candidates = diagnostics.candidates,
+            reasons = %diagnostics.summary(),
+            "MusicBrainz album-artist candidates did not establish the local release identity"
+        );
+        Ok(None)
     }
 
     async fn search_releases(
@@ -200,7 +280,9 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
             ],
         )
         .map_err(|err| err.to_string())?;
-        let payload: ReleaseSearchResponse = self.get_json(url).await?;
+        let payload: ReleaseSearchResponse =
+            musicbrainz_http::get_json(self.client, url.as_str(), self.user_agent, self.timeout)
+                .await?;
         Ok(payload.releases)
     }
 
@@ -210,72 +292,25 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
             &[("fmt", "json"), ("inc", "recordings+artist-credits")],
         )
         .map_err(|err| err.to_string())?;
-        self.get_json(url).await
-    }
-
-    async fn get_json<T: DeserializeOwned>(&self, url: Url) -> Result<T, String> {
-        let tries = 6usize;
-        let mut last_error = String::from("request failed");
-        for attempt in 0..tries {
-            musicbrainz_rate_limit::wait_for_slot().await;
-            let response = self
-                .client
-                .get(url.clone())
-                .timeout(self.timeout)
-                .header("User-Agent", self.user_agent)
-                .send()
-                .await;
-            match response {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        match response.bytes().await {
-                            Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
-                                Ok(payload) => return Ok(payload),
-                                Err(err) => {
-                                    last_error = format_musicbrainz_decode_error(err, &bytes);
-                                }
-                            },
-                            Err(err) => {
-                                last_error = err.to_string();
-                            }
-                        }
-                        if attempt + 1 == tries {
-                            return Err(last_error);
-                        }
-                    } else {
-                        last_error = format!("http {status}");
-                        if !(status.as_u16() == 429 || status.is_server_error())
-                            || attempt + 1 == tries
-                        {
-                            return Err(last_error);
-                        }
-                    }
-                }
-                Err(err) => {
-                    last_error = err.to_string();
-                    if attempt + 1 == tries {
-                        return Err(last_error);
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(1000 + (attempt as u64 * 500))).await;
-        }
-        Err(last_error)
+        musicbrainz_http::get_json(self.client, url.as_str(), self.user_agent, self.timeout).await
     }
 }
 
 #[derive(Clone, Debug)]
 struct LocalAlbumInfo {
+    allow_display_resolution: bool,
     album_hint: String,
     artist_hint: String,
+    local_artist_names: Vec<String>,
     year_hint: Option<i32>,
     track_artists: Vec<String>,
+    track_titles: Vec<String>,
     track_count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct ResolvedRelease {
+    artist_credits: Vec<ArtistCredit>,
     album_artists: Vec<String>,
     track_artists: Vec<Vec<String>>,
     auto_name_map: HashMap<String, String>,
@@ -314,6 +349,7 @@ struct ReleaseMedium {
 
 #[derive(Clone, Debug, Deserialize)]
 struct ReleaseTrack {
+    title: Option<String>,
     #[serde(rename = "artist-credit")]
     artist_credit: Option<Vec<Value>>,
     recording: Option<ReleaseRecording>,
@@ -321,21 +357,20 @@ struct ReleaseTrack {
 
 #[derive(Clone, Debug, Deserialize)]
 struct ReleaseRecording {
+    title: Option<String>,
     #[serde(rename = "artist-credit")]
     artist_credit: Option<Vec<Value>>,
 }
 
-async fn build_local_album_info(
+async fn read_local_track_artists(
     library: &Library,
-    album: &Album,
     tracks: &[Track],
-) -> Result<LocalAlbumInfo, String> {
+) -> Result<Vec<String>, String> {
     let paths: Vec<Option<PathBuf>> = tracks
         .iter()
         .map(|track| library.resolve_relpath(&track.file_relpath))
         .collect();
-    let track_count = tracks.len();
-    let track_artists = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         paths
             .into_iter()
             .map(|path| {
@@ -346,8 +381,10 @@ async fn build_local_album_info(
             .collect::<Vec<_>>()
     })
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())
+}
 
+fn build_local_album_info(album: &Album, track_count: usize) -> LocalAlbumInfo {
     let artist_hint = album
         .artist_names
         .first()
@@ -363,13 +400,16 @@ async fn build_local_album_info(
         })
         .unwrap_or_else(|| "Unknown Artist".to_string());
 
-    Ok(LocalAlbumInfo {
+    LocalAlbumInfo {
+        allow_display_resolution: false,
         album_hint: album.title.clone(),
         artist_hint,
+        local_artist_names: album.artist_names.clone(),
         year_hint: album.year,
-        track_artists,
+        track_artists: Vec::new(),
+        track_titles: Vec::new(),
         track_count,
-    })
+    }
 }
 
 fn default_artist_name_map() -> HashMap<String, String> {
@@ -378,6 +418,66 @@ fn default_artist_name_map() -> HashMap<String, String> {
         out.insert(dedupe_key(alias), normalize_artist_display(canonical));
     }
     out
+}
+
+fn locally_supported_artists(
+    selected: &[String],
+    source_album: &Album,
+    local_track_artists: &[String],
+    local_name_map: &HashMap<String, String>,
+) -> Vec<String> {
+    let supported = source_album
+        .artist_names
+        .iter()
+        .chain(local_track_artists)
+        // Repeated artist tag fields are joined with semicolons by the tag
+        // reader. Slashes, commas, ampersands and "and" can be part of one
+        // artist's name and must not authenticate separate remote artists.
+        .flat_map(|value| value.split([';', '\0']))
+        .map(|name| dedupe_key(&canonicalize_artist_name(name, local_name_map)))
+        .filter(|key| !key.is_empty())
+        .collect::<HashSet<_>>();
+    selected
+        .iter()
+        .filter(|name| {
+            supported.contains(&dedupe_key(&canonicalize_artist_name(name, local_name_map)))
+        })
+        .cloned()
+        .collect()
+}
+
+fn preserve_local_primary(
+    mut artists: Vec<Artist>,
+    source_album: &Album,
+    existing_artists: &[Artist],
+    name_map: &HashMap<String, String>,
+) -> Vec<Artist> {
+    let Some(name) = source_album.artist_names.first() else {
+        return artists;
+    };
+    let local_key = dedupe_key(&canonicalize_artist_name(name, name_map));
+    artists.retain(|artist| {
+        artist.id != source_album.artist_id
+            && dedupe_key(&canonicalize_artist_name(&artist.name, name_map)) != local_key
+    });
+    let primary = existing_artists
+        .iter()
+        .find(|artist| artist.id == source_album.artist_id)
+        .cloned()
+        .map(|artist| Artist {
+            name: name.clone(),
+            ..artist
+        })
+        .unwrap_or_else(|| Artist {
+            id: source_album.artist_id.clone(),
+            name: name.clone(),
+            genres: Vec::new(),
+            summary: None,
+            logo_ref: None,
+            banner_ref: None,
+        });
+    artists.insert(0, primary);
+    artists
 }
 
 fn build_effective_name_map(
@@ -473,21 +573,78 @@ fn build_release_query(artist: Option<&str>, release: &str) -> String {
 
 fn build_release_queries(artist: Option<&str>, release: &str) -> Vec<String> {
     let mut queries = Vec::new();
-    if let Some(query) = build_exact_release_query(artist, release) {
-        queries.push(query);
+    // Prefer the complete local title. Only recognized edition qualifiers
+    // provide a second search title; arbitrary subtitles remain significant.
+    let mut titles = vec![release];
+    if let Some(base) = edition_base_title(release) {
+        titles.push(base);
     }
-    if let Some(query) = artist
-        .and_then(|artist| build_loose_artist_release_query(artist, release))
-        .filter(|query| !queries.iter().any(|existing| existing == query))
-    {
-        queries.push(query);
-    }
-    if let Some(query) = build_exact_release_query(None, release)
-        .filter(|query| !queries.iter().any(|existing| existing == query))
-    {
-        queries.push(query);
+    for title in titles {
+        let variants = [
+            build_exact_release_query(artist, title),
+            artist.and_then(|artist| build_loose_artist_release_query(artist, title)),
+            build_exact_release_query(None, title),
+        ];
+        for query in variants.into_iter().flatten() {
+            if !queries.iter().any(|existing| existing == &query) {
+                queries.push(query);
+            }
+        }
     }
     queries
+}
+
+fn edition_base_title(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let open = match trimmed.chars().last()? {
+        ')' => '(',
+        ']' => '[',
+        _ => return None,
+    };
+    let start = trimmed.rfind(open)?;
+    let base = trimmed[..start].trim_end();
+    if base.is_empty()
+        || !trimmed[..start]
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    let qualifier = &trimmed[start + 1..trimmed.len() - 1];
+    if qualifier.contains(['(', ')', '[', ']']) {
+        return None;
+    }
+    // An edition word in a meaningful subtitle, such as "Deluxe Live at
+    // Wembley", is insufficient. Every word must be edition vocabulary.
+    let words = normalize_search_text(qualifier);
+    let mut has_edition = false;
+    for word in words.split_whitespace() {
+        match word {
+            "deluxe" | "expanded" | "anniversary" | "remaster" | "remastered" | "remastering" => {
+                has_edition = true
+            }
+            "edition" | "version" | "super" | "special" | "limited" | "collectors"
+            | "collector" | "s" | "digital" | "bonus" | "track" | "tracks" | "with" | "and"
+            | "the" => {}
+            _ if word.chars().all(|character| character.is_ascii_digit()) => {}
+            _ if ["st", "nd", "rd", "th"].iter().any(|suffix| {
+                word.strip_suffix(*suffix).is_some_and(|number| {
+                    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+                })
+            }) => {}
+            _ => return None,
+        }
+    }
+    has_edition.then_some(base)
+}
+
+fn edition_titles_match(local: &str, remote: &str) -> bool {
+    let local_base = edition_base_title(local);
+    let remote_base = edition_base_title(remote);
+    (local_base.is_some() || remote_base.is_some())
+        && normalize_search_text(local_base.unwrap_or(local))
+            == normalize_search_text(remote_base.unwrap_or(remote))
 }
 
 fn build_exact_release_query(artist: Option<&str>, release: &str) -> Option<String> {
@@ -542,20 +699,6 @@ fn query_term(field: &str, value: &str) -> Option<String> {
     }
     let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
     Some(format!(r#"{field}:"{escaped}""#))
-}
-
-fn format_musicbrainz_decode_error(err: serde_json::Error, body: &[u8]) -> String {
-    let snippet = String::from_utf8_lossy(body);
-    let snippet = snippet.trim();
-    if snippet.is_empty() {
-        return format!("error decoding response body: {}", err);
-    }
-    let snippet = if snippet.len() > 240 {
-        format!("{}...", &snippet[..240])
-    } else {
-        snippet.to_string()
-    };
-    format!("error decoding response body: {} | body={}", err, snippet)
 }
 
 fn normalize_text(value: &str) -> String {
@@ -747,6 +890,46 @@ fn collect_release_artists(release: &ReleaseDetail) -> Vec<String> {
     extract_credit_names(release.artist_credit.as_deref())
 }
 
+fn provider_artist_credits(release: &ReleaseDetail) -> Vec<ArtistCredit> {
+    let mut result = Vec::new();
+    for value in release.artist_credit.as_deref().unwrap_or_default() {
+        let Some(artist) = value.get("artist") else {
+            return Vec::new();
+        };
+        let Some(id) = artist
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Vec::new();
+        };
+        let Some(name) = artist
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+        else {
+            return Vec::new();
+        };
+        result.push(ArtistCredit {
+            artist_id: id.to_owned(),
+            name: name.to_owned(),
+            credited_name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_owned(),
+            role: "album_artist".into(),
+            join_phrase: value
+                .get("joinphrase")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            source: "musicbrainz".into(),
+        });
+    }
+    result
+}
+
 fn release_year_from_release(release: &ReleaseDetail) -> Option<i32> {
     release.date.as_deref().and_then(parse_year)
 }
@@ -778,6 +961,26 @@ fn collect_release_track_artists(release: &ReleaseDetail) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+fn release_tracks_align(local: &LocalAlbumInfo, release: &ReleaseDetail) -> bool {
+    let remote: Vec<_> = release
+        .media
+        .iter()
+        .flat_map(|medium| &medium.tracks)
+        .collect();
+    !local.track_titles.is_empty()
+        && local.track_titles.len() == remote.len()
+        && local.track_titles.iter().zip(remote).all(|(title, track)| {
+            let key = normalize_search_text(title);
+            let remote_title = track.title.as_deref().or_else(|| {
+                track
+                    .recording
+                    .as_ref()
+                    .and_then(|recording| recording.title.as_deref())
+            });
+            !key.is_empty() && key == normalize_search_text(remote_title.unwrap_or_default())
+        })
 }
 
 fn infer_name_map_from_release(release: &ReleaseDetail) -> HashMap<String, String> {
@@ -840,6 +1043,7 @@ fn infer_name_map_from_release(release: &ReleaseDetail) -> HashMap<String, Strin
     }
 
     let mut inferred = HashMap::new();
+    let mut ambiguous = HashSet::new();
     for (artist_id, aliases) in alias_counts {
         let pool = canonical_counts.get(&artist_id).unwrap_or(&aliases);
         let Some((canonical_key, _)) = pool
@@ -855,10 +1059,16 @@ fn infer_name_map_from_release(release: &ReleaseDetail) -> HashMap<String, Strin
             continue;
         };
         for alias_key in aliases.keys() {
+            if inferred
+                .get(alias_key)
+                .is_some_and(|name: &String| dedupe_key(name) != dedupe_key(&canonical_name))
+            {
+                ambiguous.insert(alias_key.clone());
+            }
             inferred.insert(alias_key.clone(), canonical_name.clone());
         }
     }
-
+    inferred.retain(|alias, _| !ambiguous.contains(alias));
     inferred
 }
 
@@ -924,80 +1134,13 @@ fn build_track_collaborators(
     canonicalize_artist_list(&split_artist_string(local_artist), name_map)
 }
 
-fn select_significant_album_artists(
-    album_artists: &[String],
-    track_collaborators: &[Vec<String>],
-    min_track_count: usize,
-    min_track_ratio: f32,
-) -> Vec<String> {
-    let mut selected = unique_preserve_order(album_artists.to_vec());
-    let mut selected_keys = selected
-        .iter()
-        .map(|name| dedupe_key(name))
-        .collect::<HashSet<_>>();
-
-    let mut counts = HashMap::<String, usize>::new();
-    let mut display_names = HashMap::<String, String>::new();
-    for names in track_collaborators {
-        for name in unique_preserve_order(names.clone()) {
-            let key = dedupe_key(&name);
-            if key.is_empty() {
-                continue;
-            }
-            counts
-                .entry(key.clone())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            display_names.entry(key).or_insert(name);
-        }
-    }
-
-    let track_total = track_collaborators.len().max(1);
-    let ratio_threshold = ((track_total as f32) * min_track_ratio.max(0.0))
-        .ceil()
-        .max(1.0) as usize;
-    let threshold = min_track_count.max(ratio_threshold).max(1);
-
-    let mut extras = counts
-        .into_iter()
-        .filter(|(key, count)| !selected_keys.contains(key) && *count >= threshold)
-        .collect::<Vec<_>>();
-    extras.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| display_names[&left.0].cmp(&display_names[&right.0]))
-    });
-
-    for (key, _) in extras {
-        if let Some(name) = display_names.get(&key) {
-            selected_keys.insert(key);
-            selected.push(name.clone());
-        }
-    }
-
-    if !selected.is_empty() {
-        return unique_preserve_order(selected);
-    }
-
-    let Some((best_key, _)) = display_names
-        .keys()
-        .filter_map(|key| counts_for_key(track_collaborators, key).map(|count| (key, count)))
-        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(left.0)))
-    else {
-        return Vec::new();
-    };
-
-    display_names.get(best_key).cloned().into_iter().collect()
-}
-
 fn rank_selected_album_artists(
     selected: &[String],
     local_track_artists: &[String],
     track_collaborators: &[Vec<String>],
     name_map: &HashMap<String, String>,
 ) -> Vec<String> {
-    if selected.len() <= 2 {
+    if selected.len() <= 1 {
         return unique_preserve_order(selected.to_vec());
     }
 
@@ -1074,27 +1217,6 @@ fn local_track_artist_candidates(
     }
 }
 
-fn counts_for_key(track_collaborators: &[Vec<String>], target_key: &str) -> Option<usize> {
-    let mut count = 0usize;
-    for names in track_collaborators {
-        let mut seen = false;
-        for name in names {
-            if dedupe_key(name) == target_key {
-                seen = true;
-                break;
-            }
-        }
-        if seen {
-            count += 1;
-        }
-    }
-    if count == 0 {
-        None
-    } else {
-        Some(count)
-    }
-}
-
 fn parse_year(value: &str) -> Option<i32> {
     let mut digits = String::new();
     for ch in value.chars() {
@@ -1139,6 +1261,216 @@ fn ratio(left: &str, right: &str) -> f64 {
     normalized_levenshtein(&left, &right)
 }
 
+fn usable_artist_hint(name: &str) -> bool {
+    let key = normalize_search_text(name);
+    !key.is_empty()
+        && !matches!(
+            key.as_str(),
+            "unknown" | "unknown artist" | "various" | "various artists"
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseIdentityRejection {
+    TitleMismatch,
+    UnusableLocalArtist,
+    MissingArtistCredits,
+    MissingArtistIds,
+    TracklistMismatch,
+    ArtistMismatch,
+}
+
+impl ReleaseIdentityRejection {
+    fn description(self) -> &'static str {
+        match self {
+            Self::TitleMismatch => "title mismatch",
+            Self::UnusableLocalArtist => "unusable local artist",
+            Self::MissingArtistCredits => "missing artist credits",
+            Self::MissingArtistIds => "missing structured artist IDs",
+            Self::TracklistMismatch => "track count, titles or order mismatch",
+            Self::ArtistMismatch => "artist identities not supported locally",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReleaseMatchDiagnostics {
+    candidates: usize,
+    detail_failures: usize,
+    missing_release_ids: usize,
+    rejections: HashMap<&'static str, usize>,
+}
+
+impl ReleaseMatchDiagnostics {
+    fn reject(&mut self, rejection: ReleaseIdentityRejection) {
+        *self.rejections.entry(rejection.description()).or_default() += 1;
+    }
+
+    fn summary(&self) -> String {
+        if self.candidates == 0 {
+            return "no search candidates".to_owned();
+        }
+        let mut counts = self.rejections.clone();
+        if self.detail_failures > 0 {
+            counts.insert("release detail fetch failed", self.detail_failures);
+        }
+        if self.missing_release_ids > 0 {
+            counts.insert("missing release IDs", self.missing_release_ids);
+        }
+        let mut entries = counts.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(reason, _)| *reason);
+        entries
+            .into_iter()
+            .map(|(reason, count)| format!("{reason}: {count}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn edition_artist_credits_supported(
+    local: &LocalAlbumInfo,
+    provider_credits: &[ArtistCredit],
+) -> bool {
+    if provider_credits.is_empty() {
+        return false;
+    }
+    if local.allow_display_resolution
+        && library::resolve_display_credit(&local.artist_hint, provider_credits).is_some()
+    {
+        return true;
+    }
+
+    // Names already established by explicit local credits are independent
+    // evidence. Do not split punctuation or introduce remote-inferred aliases
+    // here: either can manufacture support for an unmentioned collaborator.
+    let name_map = default_artist_name_map();
+    let local_names = local
+        .local_artist_names
+        .iter()
+        .map(|name| dedupe_key(&canonicalize_artist_name(name, &name_map)))
+        .filter(|key| !key.is_empty())
+        .collect::<HashSet<_>>();
+    if local_names.is_empty() {
+        return false;
+    }
+    let mut covered = HashMap::new();
+    let mut identified = HashMap::new();
+    for credit in provider_credits {
+        let matches = [&credit.name, &credit.credited_name]
+            .into_iter()
+            .map(|name| dedupe_key(&canonicalize_artist_name(name, &name_map)))
+            .filter(|key| local_names.contains(key))
+            .collect::<HashSet<_>>();
+        if matches.len() != 1 {
+            return false;
+        }
+        let local_key = matches.into_iter().next().unwrap();
+        if covered
+            .insert(local_key.clone(), credit.artist_id.clone())
+            .is_some_and(|previous_id| previous_id != credit.artist_id)
+            || identified
+                .insert(credit.artist_id.clone(), local_key.clone())
+                .is_some_and(|previous_key| previous_key != local_key)
+        {
+            return false;
+        }
+    }
+    covered.len() == local_names.len()
+}
+
+fn release_identity_rejection(
+    local: &LocalAlbumInfo,
+    release: &ReleaseDetail,
+) -> Option<ReleaseIdentityRejection> {
+    let title_key = normalize_search_text(&local.album_hint);
+    let remote_title = release.title.as_deref().unwrap_or_default();
+    let exact_title = title_key == normalize_search_text(remote_title);
+    if title_key.is_empty()
+        || (!exact_title && !edition_titles_match(&local.album_hint, remote_title))
+    {
+        return Some(ReleaseIdentityRejection::TitleMismatch);
+    }
+    if !usable_artist_hint(&local.artist_hint) {
+        return Some(ReleaseIdentityRejection::UnusableLocalArtist);
+    }
+    let Some(credits) = release
+        .artist_credit
+        .as_deref()
+        .filter(|credits| !credits.is_empty())
+    else {
+        return Some(ReleaseIdentityRejection::MissingArtistCredits);
+    };
+
+    if !exact_title {
+        let provider_credits = provider_artist_credits(release);
+        if provider_credits.is_empty() {
+            return Some(ReleaseIdentityRejection::MissingArtistIds);
+        }
+        if !release_tracks_align(local, release) {
+            return Some(ReleaseIdentityRejection::TracklistMismatch);
+        }
+        return (!edition_artist_credits_supported(local, &provider_credits))
+            .then_some(ReleaseIdentityRejection::ArtistMismatch);
+    }
+
+    // Search relevance is not identity evidence. In particular, classical
+    // releases often share a work title, year and track count across performers.
+    // Accept only the credited name, canonical name, or full joint credit;
+    // never use fuzzy artist similarity to change an album's attribution.
+    // Track aliases cannot authenticate a release artist. A shared or
+    // conflicting track alias must never remap the trusted local identity.
+    let release_credit_only = ReleaseDetail {
+        media: Vec::new(),
+        ..release.clone()
+    };
+    let name_map = build_effective_name_map(
+        &default_artist_name_map(),
+        Some(&infer_name_map_from_release(&release_credit_only)),
+    );
+    let local_key = normalize_search_text(&canonicalize_artist_name(&local.artist_hint, &name_map));
+    let mut full_credit = String::new();
+    let mut matched = false;
+    for credit in credits {
+        let credited = credit
+            .as_str()
+            .or_else(|| credit.get("name").and_then(Value::as_str));
+        let canonical = credit
+            .get("artist")
+            .and_then(|artist| artist.get("name"))
+            .and_then(Value::as_str);
+        for name in credited.into_iter().chain(canonical) {
+            if normalize_search_text(&canonicalize_artist_name(name, &name_map)) == local_key {
+                matched = true;
+            }
+        }
+        if let Some(name) = credited.or(canonical) {
+            full_credit.push_str(name);
+        }
+        if let Some(joinphrase) = credit.get("joinphrase").and_then(Value::as_str) {
+            full_credit.push_str(joinphrase);
+        }
+    }
+    if matched || normalize_search_text(&full_credit) == local_key {
+        return None;
+    }
+    if local.allow_display_resolution {
+        let provider_credits = provider_artist_credits(release);
+        if provider_credits.is_empty() {
+            return Some(ReleaseIdentityRejection::MissingArtistIds);
+        }
+        if library::resolve_display_credit(&local.artist_hint, &provider_credits).is_some() {
+            return (!release_tracks_align(local, release))
+                .then_some(ReleaseIdentityRejection::TracklistMismatch);
+        }
+    }
+    Some(ReleaseIdentityRejection::ArtistMismatch)
+}
+
+#[cfg(test)]
+fn release_matches_local_identity(local: &LocalAlbumInfo, release: &ReleaseDetail) -> bool {
+    release_identity_rejection(local, release).is_none()
+}
+
 fn candidate_score(
     local: &LocalAlbumInfo,
     candidate: &ReleaseSearchCandidate,
@@ -1174,36 +1506,861 @@ fn candidate_score(
     mb_score + title_score + year_score + count_score.clamp(0.0, 30.0)
 }
 
+fn candidate_score_upper_bound(local: &LocalAlbumInfo, candidate: &ReleaseSearchCandidate) -> f64 {
+    candidate.score.unwrap_or(0.0).min(100.0) / 10.0
+        + 40.0 // A perfect title match.
+        + if local.year_hint.is_some() { 20.0 } else { 0.0 }
+        + if local.track_count > 0 { 30.0 } else { 0.0 }
+}
+
+#[cfg(test)]
+async fn best_matching_release<F, Fut>(
+    local: &LocalAlbumInfo,
+    candidates: &[ReleaseSearchCandidate],
+    fetch: F,
+) -> Option<ReleaseDetail>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<ReleaseDetail, String>>,
+{
+    best_matching_release_with_diagnostics(
+        local,
+        candidates,
+        fetch,
+        &mut ReleaseMatchDiagnostics::default(),
+    )
+    .await
+}
+
+async fn best_matching_release_with_diagnostics<F, Fut>(
+    local: &LocalAlbumInfo,
+    candidates: &[ReleaseSearchCandidate],
+    mut fetch: F,
+    diagnostics: &mut ReleaseMatchDiagnostics,
+) -> Option<ReleaseDetail>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<ReleaseDetail, String>>,
+{
+    let mut best_score = -1.0f64;
+    let mut best = None;
+    let mut fetched = HashMap::new();
+    for candidate in candidates {
+        diagnostics.candidates += 1;
+        let Some(release_id) = candidate.id.as_deref() else {
+            diagnostics.missing_release_ids += 1;
+            continue;
+        };
+        // Equal scores retain the first candidate, matching the original search
+        // order. A detail request cannot change that when its best possible
+        // score is no better. A perfect first result skips the remaining 24
+        // requests at the default search limit.
+        if candidate_score_upper_bound(local, candidate) <= best_score {
+            continue;
+        }
+        let release = match fetched.get(release_id) {
+            Some(release) => release,
+            None => {
+                let Ok(release) = fetch(release_id.to_owned()).await else {
+                    diagnostics.detail_failures += 1;
+                    // Failed requests are not cached: a duplicate candidate may
+                    // still succeed if the provider recovers later in this pass.
+                    continue;
+                };
+                fetched.insert(release_id.to_owned(), release);
+                &fetched[release_id]
+            }
+        };
+        if let Some(rejection) = release_identity_rejection(local, release) {
+            diagnostics.reject(rejection);
+            continue;
+        }
+        let score = candidate_score(local, candidate, release);
+        if score > best_score {
+            best_score = score;
+            best = Some(release.clone());
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use common::{artist_identity_id, stable_id, Artist};
 
     use super::{
         artist_search_tokens, build_release_queries, dedupe_key, default_artist_name_map,
-        materialize_artists, rank_selected_album_artists, select_significant_album_artists,
+        materialize_artists, rank_selected_album_artists,
     };
+
+    fn local_fixture(year: Option<i32>, tracks: usize) -> super::LocalAlbumInfo {
+        super::LocalAlbumInfo {
+            allow_display_resolution: false,
+            album_hint: "Album".to_owned(),
+            artist_hint: "Artist".to_owned(),
+            local_artist_names: vec!["Artist".to_owned()],
+            year_hint: year,
+            track_artists: Vec::new(),
+            track_titles: Vec::new(),
+            track_count: tracks,
+        }
+    }
+
+    fn candidate_fixture(id: Option<&str>, score: Option<f64>) -> super::ReleaseSearchCandidate {
+        super::ReleaseSearchCandidate {
+            id: id.map(str::to_owned),
+            score,
+        }
+    }
+
+    fn release_fixture(
+        title: &str,
+        year: Option<i32>,
+        tracks: usize,
+        artist: &str,
+    ) -> super::ReleaseDetail {
+        super::ReleaseDetail {
+            title: Some(title.to_owned()),
+            date: year.map(|year| year.to_string()),
+            artist_credit: Some(vec![serde_json::json!({
+                "name": artist, "artist": {"id": "fixture-artist", "name": "Artist"}
+            })]),
+            media: vec![super::ReleaseMedium {
+                track_count: Some(tracks),
+                tracks: Vec::new(),
+            }],
+        }
+    }
+
+    fn credited_release(title: &str, artist: &str) -> super::ReleaseDetail {
+        let mut release = release_fixture(title, Some(2005), 12, artist);
+        release.artist_credit = Some(vec![serde_json::json!({
+            "name": artist, "artist": {"id": artist, "name": artist}
+        })]);
+        release
+    }
+
+    fn source_album(names: &[&str]) -> common::Album {
+        serde_json::from_value(serde_json::json!({
+            "id": "album", "artist_id": artist_identity_id(names[0]),
+            "artist_names": names, "title": "The Four Seasons", "year": 2005,
+            "folder_relpath": "Vivaldi/The Four Seasons", "cover_ref": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repeated_song_guests_require_release_billing_to_qualify_as_album_artists() {
+        let mut release = release_fixture("Album", Some(2026), 4, "Main");
+        let source = source_album(&["Main"]);
+        let track_artists = vec!["Main; Guest".to_owned(); 4];
+        let release_artists = super::collect_release_artists(&release);
+        assert_eq!(
+            super::locally_supported_artists(
+                &release_artists,
+                &source,
+                &track_artists,
+                &default_artist_name_map()
+            ),
+            ["Main"]
+        );
+        release
+            .artist_credit
+            .as_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "Guest", "artist": {"id": "guest", "name": "Guest"}
+            }));
+        let joint_billing = super::collect_release_artists(&release);
+        assert_eq!(
+            super::locally_supported_artists(
+                &joint_billing,
+                &source,
+                &track_artists,
+                &default_artist_name_map()
+            ),
+            ["Main", "Guest"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_composer_match_cannot_import_an_unconfirmed_performer() {
+        let source = source_album(&["Antonio Vivaldi"]);
+        let mut local = super::build_local_album_info(&source, 12);
+        local.track_artists = vec!["Antonio Vivaldi".to_owned(); 12];
+        let remote: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "title": "The Four Seasons", "date": "2005",
+            "artist-credit": [
+                {"name": "Antonio Vivaldi", "artist": {"id": "composer", "name": "Antonio Vivaldi"}},
+                {"name": "Unconfirmed Performer", "artist": {"id": "performer", "name": "Unconfirmed Performer"}}
+            ],
+            "media": [{"track-count": 12}]
+        }))
+        .unwrap();
+        let matched = super::best_matching_release(
+            &local,
+            &[candidate_fixture(
+                Some("perfect-but-ambiguous"),
+                Some(100.0),
+            )],
+            |_| std::future::ready(Ok(remote.clone())),
+        )
+        .await
+        .unwrap();
+        let supported = super::locally_supported_artists(
+            &super::collect_release_artists(&matched),
+            &source,
+            &local.track_artists,
+            &default_artist_name_map(),
+        );
+        assert_eq!(supported, ["Antonio Vivaldi"]);
+    }
+
+    #[test]
+    fn named_local_performers_and_explicit_tag_lists_support_additional_credits() {
+        let source = source_album(&["Antonio Vivaldi"]);
+        let selected = [
+            "Antonio Vivaldi".to_owned(),
+            "Janine Jansen".to_owned(),
+            "Another Performer".to_owned(),
+            "Unknown Guest".to_owned(),
+        ];
+        let supported = super::locally_supported_artists(
+            &selected,
+            &source,
+            &["Janine Jansen; Another Performer".to_owned()],
+            &default_artist_name_map(),
+        );
+        assert_eq!(
+            supported,
+            ["Antonio Vivaldi", "Janine Jansen", "Another Performer"]
+        );
+    }
+
+    #[test]
+    fn remote_aliases_and_band_punctuation_do_not_manufacture_local_artist_evidence() {
+        let source = source_album(&["AC/DC"]);
+        let selected = [
+            "AC/DC".to_owned(),
+            "AC".to_owned(),
+            "DC".to_owned(),
+            "Earth".to_owned(),
+            "Wind".to_owned(),
+            "Fire".to_owned(),
+            "Remote Canonical Artist".to_owned(),
+            "Kanye West".to_owned(),
+        ];
+        let supported = super::locally_supported_artists(
+            &selected,
+            &source,
+            &[
+                "Earth, Wind & Fire".to_owned(),
+                "Local Artist Alias".to_owned(),
+                "Ye".to_owned(),
+            ],
+            &default_artist_name_map(),
+        );
+        assert_eq!(supported, ["AC/DC", "Kanye West"]);
+    }
+
+    #[tokio::test]
+    async fn four_seasons_requires_the_local_performer_even_for_a_perfect_search_hit() {
+        let mut local = local_fixture(Some(2005), 12);
+        local.album_hint = "The Four Seasons".to_owned();
+        local.artist_hint = "Janine Jansen".to_owned();
+        let wrong = credited_release("The Four Seasons", "Jacques Loussier Trio");
+        let right = credited_release("The Four Seasons", "Janine Jansen");
+        let candidates = [
+            candidate_fixture(Some("wrong"), Some(100.0)),
+            candidate_fixture(Some("right"), Some(80.0)),
+        ];
+        let release = super::best_matching_release(&local, &candidates, |id| {
+            std::future::ready(Ok(if id == "wrong" {
+                wrong.clone()
+            } else {
+                right.clone()
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(super::collect_release_artists(&release), ["Janine Jansen"]);
+        assert!(super::best_matching_release(&local, &candidates[..1], |_| {
+            std::future::ready(Ok(wrong.clone()))
+        })
+        .await
+        .is_none());
+    }
+
+    #[test]
+    fn identity_validation_rejects_missing_credits_unknown_artists_and_other_versions() {
+        let mut local = local_fixture(Some(2020), 10);
+        let mut release = credited_release("Album", "Artist");
+        assert!(super::release_matches_local_identity(&local, &release));
+        release.artist_credit = None;
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = credited_release("Album (Live)", "Artist");
+        assert!(!super::release_matches_local_identity(&local, &release));
+        for name in ["", "Unknown Artist", "Various Artists"] {
+            local.artist_hint = name.to_owned();
+            release = credited_release("Album", name);
+            assert!(!super::release_matches_local_identity(&local, &release));
+        }
+    }
+
+    #[test]
+    fn artist_identity_accepts_release_credit_aliases_but_never_track_aliases() {
+        let local = local_fixture(Some(2020), 10);
+        let release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "title": "Album",
+            "artist-credit": [{"name": "Artist", "artist": {"id": "a", "name": "Canonical"}}]
+        }))
+        .unwrap();
+        assert!(super::release_matches_local_identity(&local, &release));
+
+        let release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "title": "Album",
+            "artist-credit": [{"artist": {"id": "other", "name": "Other Artist"}}],
+            "media": [{"tracks": [{
+                "artist-credit": [{"name": "Artist", "artist": {"id": "other", "name": "Other Artist"}}]
+            }]}]
+        }))
+        .unwrap();
+        assert!(!super::release_matches_local_identity(&local, &release));
+    }
+
+    #[test]
+    fn conflicting_artist_aliases_are_not_canonicalized() {
+        let release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "artist-credit": [{"name": "Shared Name", "artist": {"id": "a", "name": "First Artist"}}],
+            "media": [{"tracks": [{
+                "artist-credit": [{"name": "Shared Name", "artist": {"id": "b", "name": "Second Artist"}}]
+            }]}]
+        }))
+        .unwrap();
+        let map = super::infer_name_map_from_release(&release);
+        assert!(!map.contains_key(&dedupe_key("Shared Name")));
+    }
+
+    #[test]
+    fn verified_alias_keeps_the_original_local_primary_identity() {
+        let source: common::Album = serde_json::from_value(serde_json::json!({
+            "id": "album", "artist_id": artist_identity_id("Ye"),
+            "artist_names": ["Ye"], "title": "Album", "year": null,
+            "folder_relpath": "Ye/Album", "cover_ref": null
+        }))
+        .unwrap();
+        let map = default_artist_name_map();
+        let remote = materialize_artists(
+            &["Guest Artist".to_owned(), "Kanye West".to_owned()],
+            &[],
+            &map,
+        );
+        let artists = super::preserve_local_primary(remote, &source, &[], &map);
+        assert_eq!(artists[0].id, source.artist_id);
+        assert_eq!(artists[0].name, "Ye");
+        assert_eq!(artists.len(), 2);
+        assert_eq!(artists[1].name, "Guest Artist");
+    }
+
+    #[test]
+    fn track_credits_require_matching_titles_and_order_not_just_count() {
+        let mut local = local_fixture(Some(2020), 2);
+        local.track_titles = vec!["First".to_owned(), "Second".to_owned()];
+        let mut release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "media": [{"tracks": [
+                {"title": "First"}, {"recording": {"title": "Second"}}
+            ]}]
+        }))
+        .unwrap();
+        assert!(super::release_tracks_align(&local, &release));
+        release.media[0].tracks.reverse();
+        assert!(!super::release_tracks_align(&local, &release));
+        release.media[0].tracks.pop();
+        assert!(!super::release_tracks_align(&local, &release));
+        local.track_titles.clear();
+        assert!(!super::release_tracks_align(&local, &release));
+    }
+
+    #[test]
+    fn duplicated_prince_display_requires_complete_provider_ids_and_an_aligned_tracklist() {
+        let mut local = local_fixture(Some(1984), 2);
+        local.allow_display_resolution = true;
+        local.album_hint = "Purple Rain".into();
+        local.artist_hint = "Prince, Prince and the Revolution".into();
+        local.track_titles = vec!["Let's Go Crazy".into(), "Take Me with U".into()];
+        let mut release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "title": "Purple Rain", "date": "1984",
+            "artist-credit": [
+                {"name": "Prince", "joinphrase": " and ", "artist": {
+                    "id": "070d193a-845c-479f-980e-bef15710653e", "name": "Prince"}},
+                {"name": "the Revolution", "joinphrase": "", "artist": {
+                    "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48", "name": "The Revolution"}}
+            ],
+            "media": [{"tracks": [{"title": "Let's Go Crazy"}, {"title": "Take Me with U"}]}]
+        }))
+        .unwrap();
+        assert!(super::release_matches_local_identity(&local, &release));
+        let credits = super::provider_artist_credits(&release);
+        assert_eq!(credits[0].join_phrase, " and ");
+        let resolved = library::resolve_display_credit(&local.artist_hint, &credits).unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|credit| credit.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Prince", "The Revolution"]
+        );
+
+        local.allow_display_resolution = false;
+        assert!(!super::release_matches_local_identity(&local, &release));
+        local.allow_display_resolution = true;
+        release.media[0].tracks.reverse();
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release.media[0].tracks.reverse();
+        release.artist_credit.as_mut().unwrap()[1]["artist"]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+        assert!(super::provider_artist_credits(&release).is_empty());
+        assert!(!super::release_matches_local_identity(&local, &release));
+    }
+
+    fn prince_expanded_fixture() -> (super::LocalAlbumInfo, super::ReleaseDetail) {
+        let mut local = local_fixture(Some(1985), 22);
+        local.allow_display_resolution = true;
+        local.album_hint = "Around The World In A Day (Deluxe Expanded Edition)".into();
+        local.artist_hint = "Prince, Prince and the Revolution".into();
+        local.local_artist_names = vec![local.artist_hint.clone()];
+        // Synthetic track names test an expanded catalog without implying that
+        // this user-specific edition exists in the live provider catalog.
+        local.track_titles = (1..=22).map(|number| format!("Track {number}")).collect();
+        let tracks = local
+            .track_titles
+            .iter()
+            .map(|title| serde_json::json!({"title": title}))
+            .collect::<Vec<_>>();
+        let release = serde_json::from_value(serde_json::json!({
+            "title": "Around The World In A Day", "date": "1985",
+            "artist-credit": [
+                {"name": "Prince", "joinphrase": " and ", "artist": {
+                    "id": "070d193a-845c-479f-980e-bef15710653e", "name": "Prince"}},
+                {"name": "the Revolution", "joinphrase": "", "artist": {
+                    "id": "4c8ead39-b9df-4c56-a27c-51bc049cfd48", "name": "The Revolution"}}
+            ],
+            "media": [{"tracks": tracks}]
+        }))
+        .unwrap();
+        (local, release)
+    }
+
+    #[tokio::test]
+    async fn expanded_title_fallback_selects_only_the_fully_aligned_twenty_two_track_release() {
+        let (local, right) = prince_expanded_fixture();
+        let mut standard = right.clone();
+        standard.media[0].tracks.truncate(9);
+        let mut wrong_performer = right.clone();
+        wrong_performer.artist_credit =
+            credited_release("unused", "Another Performer").artist_credit;
+        let candidates = [
+            candidate_fixture(Some("standard"), Some(100.0)),
+            candidate_fixture(Some("wrong-performer"), Some(100.0)),
+            candidate_fixture(Some("expanded"), Some(80.0)),
+        ];
+        let selected = super::best_matching_release(&local, &candidates, |id| {
+            std::future::ready(Ok(match id.as_str() {
+                "standard" => standard.clone(),
+                "wrong-performer" => wrong_performer.clone(),
+                _ => right.clone(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::collect_release_artists(&selected),
+            ["Prince", "the Revolution"]
+        );
+        assert!(super::release_tracks_align(&local, &selected));
+        assert!(
+            super::best_matching_release(&local, &candidates[..2], |id| {
+                std::future::ready(Ok(if id == "standard" {
+                    standard.clone()
+                } else {
+                    wrong_performer.clone()
+                }))
+            })
+            .await
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn edition_title_variants_require_every_track_and_complete_supported_artist_ids() {
+        let (local, right) = prince_expanded_fixture();
+        assert!(super::release_matches_local_identity(&local, &right));
+        let mut release = right.clone();
+        release.title =
+            Some("Around The World In A Day [25th Anniversary Remastered Edition]".into());
+        assert!(super::release_matches_local_identity(&local, &release));
+
+        release = right.clone();
+        release.media[0].tracks.swap(0, 1);
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = right.clone();
+        release.media[0].tracks.pop();
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = right.clone();
+        release.media[0].tracks[0].title = Some("Different recording".into());
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = right.clone();
+        release.artist_credit.as_mut().unwrap()[1]["artist"]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = right.clone();
+        release
+            .artist_credit
+            .as_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "Unmentioned Guest", "artist": {"id": "guest", "name": "Unmentioned Guest"}
+            }));
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release = right.clone();
+        release.artist_credit.as_mut().unwrap().remove(0);
+        assert!(!super::release_matches_local_identity(&local, &release));
+    }
+
+    #[test]
+    fn explicit_local_artist_names_support_edition_variants_without_parsing_display_punctuation() {
+        let (template, right) = prince_expanded_fixture();
+        let mut album = source_album(&["Prince", "The Revolution"]);
+        album.title = template.album_hint;
+        let mut local = super::build_local_album_info(&album, 22);
+        local.track_titles = template.track_titles;
+        assert!(!local.allow_display_resolution);
+        assert_eq!(local.artist_hint, "Prince");
+        assert_eq!(local.local_artist_names, ["Prince", "The Revolution"]);
+        assert!(super::release_matches_local_identity(&local, &right));
+
+        let mut release = right.clone();
+        release.artist_credit.as_mut().unwrap().pop();
+        assert!(!super::release_matches_local_identity(&local, &release));
+        local.local_artist_names = vec!["Prince".into()];
+        assert!(!super::release_matches_local_identity(&local, &right));
+        local.local_artist_names = vec!["Prince, Prince and the Revolution".into()];
+        local.artist_hint = local.local_artist_names[0].clone();
+        assert!(!super::release_matches_local_identity(&local, &right));
+    }
+
+    #[test]
+    fn edition_variants_reject_conflicting_aliases_and_identity_collapses() {
+        let (mut local, right) = prince_expanded_fixture();
+        local.allow_display_resolution = false;
+        local.artist_hint = "Prince".into();
+        local.local_artist_names = vec!["Prince".into(), "The Revolution".into()];
+        let mut release = right.clone();
+        // A canonical name and its alias cannot merge two established local
+        // artists into a single provider identity.
+        release.artist_credit.as_mut().unwrap().pop();
+        release.artist_credit.as_mut().unwrap()[0]["name"] = "The Revolution".into();
+        assert!(!super::release_matches_local_identity(&local, &release));
+
+        // A shared alias cannot authenticate an additional, distinct artist ID.
+        local.local_artist_names = vec!["Prince".into()];
+        release = right.clone();
+        release.artist_credit.as_mut().unwrap()[1]["name"] = "Prince".into();
+        assert!(!super::release_matches_local_identity(&local, &release));
+        release.artist_credit.as_mut().unwrap()[1]["artist"]["name"] = "Prince".into();
+        assert!(!super::release_matches_local_identity(&local, &release));
+
+        // Repeated references to the same authenticated identity are harmless.
+        release.artist_credit.as_mut().unwrap()[1]["artist"]["id"] =
+            "070d193a-845c-479f-980e-bef15710653e".into();
+        assert!(super::release_matches_local_identity(&local, &release));
+    }
+
+    #[test]
+    fn release_queries_prefer_full_title_and_only_strip_known_trailing_edition_qualifiers() {
+        let full = "Around The World In A Day (Deluxe Expanded Edition)";
+        let queries = build_release_queries(Some("Prince, Prince and the Revolution"), full);
+        assert_eq!(queries.len(), 6);
+        assert!(queries[..3]
+            .iter()
+            .all(|query| query.contains(&format!(r#"release:"{full}""#))));
+        assert!(queries[3..]
+            .iter()
+            .all(|query| query.contains(r#"release:"Around The World In A Day""#)));
+
+        for suffix in [
+            "(Deluxe Edition)",
+            "[Super Deluxe Expanded Edition]",
+            "(2011 Remaster)",
+            "(Remastered)",
+            "(25th Anniversary Edition)",
+        ] {
+            let title = format!("Album {suffix}");
+            assert_eq!(super::edition_base_title(&title), Some("Album"));
+        }
+        for title in [
+            "Album (Live)",
+            "Album (The Motion Picture)",
+            "Album (Deluxe Live at Wembley)",
+            "Album (Special Edition)",
+            "Album (Live (Deluxe))",
+            "Album(Deluxe)",
+            "(Deluxe Edition)",
+            "Album (Expanded Experience)",
+        ] {
+            assert_eq!(super::edition_base_title(title), None, "{title}");
+            assert_eq!(
+                build_release_queries(Some("Artist"), title).len(),
+                3,
+                "{title}"
+            );
+        }
+        let (mut local, right) = prince_expanded_fixture();
+        local.album_hint = "Around The World In A Day (Live)".into();
+        assert!(!super::release_matches_local_identity(&local, &right));
+    }
+
+    #[tokio::test]
+    async fn unmatched_release_diagnostics_distinguish_fetch_title_tracks_ids_and_artists() {
+        let (local, right) = prince_expanded_fixture();
+        let candidates = [
+            candidate_fixture(None, Some(100.0)),
+            candidate_fixture(Some("fetch-failed"), Some(100.0)),
+            candidate_fixture(Some("wrong-title"), Some(100.0)),
+            candidate_fixture(Some("wrong-tracks"), Some(100.0)),
+            candidate_fixture(Some("missing-ids"), Some(100.0)),
+            candidate_fixture(Some("wrong-artist"), Some(100.0)),
+        ];
+        let mut diagnostics = super::ReleaseMatchDiagnostics::default();
+        assert!(super::best_matching_release_with_diagnostics(
+            &local,
+            &candidates,
+            |id| {
+                let mut release = right.clone();
+                match id.as_str() {
+                    "fetch-failed" => {
+                        return std::future::ready(Err("provider unavailable".into()))
+                    }
+                    "wrong-title" => release.title = Some("Unrelated Album".into()),
+                    "wrong-tracks" => {
+                        release.media[0].tracks.pop();
+                    }
+                    "missing-ids" => {
+                        release.artist_credit.as_mut().unwrap()[0]["artist"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("id");
+                    }
+                    _ => {
+                        release.artist_credit =
+                            credited_release("unused", "Another Performer").artist_credit
+                    }
+                }
+                std::future::ready(Ok(release))
+            },
+            &mut diagnostics
+        )
+        .await
+        .is_none());
+        assert_eq!(diagnostics.candidates, 6);
+        let summary = diagnostics.summary();
+        for reason in [
+            "release detail fetch failed: 1",
+            "missing release IDs: 1",
+            "title mismatch: 1",
+            "track count, titles or order mismatch: 1",
+            "missing structured artist IDs: 1",
+            "artist identities not supported locally: 1",
+        ] {
+            assert!(summary.contains(reason), "{summary}");
+        }
+        assert_eq!(
+            super::ReleaseMatchDiagnostics::default().summary(),
+            "no search candidates"
+        );
+    }
+
+    #[test]
+    fn structured_provider_group_credit_is_one_identity_even_with_a_joint_display() {
+        let release: super::ReleaseDetail = serde_json::from_value(serde_json::json!({
+            "title": "Raising Sand",
+            "artist-credit": [{"name": "Robert Plant | Alison Krauss", "artist": {
+                "id": "38eb4af8-2282-4b8f-8819-1c7f92640dde", "name": "Robert Plant & Alison Krauss"}}]
+        })).unwrap();
+        let credits = super::provider_artist_credits(&release);
+        let resolved =
+            library::resolve_display_credit("Robert Plant | Alison Krauss", &credits).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].artist_id,
+            "38eb4af8-2282-4b8f-8819-1c7f92640dde"
+        );
+        assert_eq!(
+            super::collect_release_artists(&release),
+            ["Robert Plant | Alison Krauss"]
+        );
+    }
+
+    #[test]
+    fn identity_validation_keeps_non_latin_names_distinct() {
+        let mut local = local_fixture(None, 0);
+        local.artist_hint = "東京".to_owned();
+        local.album_hint = "Album 東京".to_owned();
+        assert!(super::release_matches_local_identity(
+            &local,
+            &credited_release("Album 東京", "東京")
+        ));
+        assert!(!super::release_matches_local_identity(
+            &local,
+            &credited_release("Album 大阪", "東京")
+        ));
+        assert!(!super::release_matches_local_identity(
+            &local,
+            &credited_release("Album 東京", "大阪")
+        ));
+    }
+
+    #[tokio::test]
+    async fn perfect_release_skips_remaining_24_requests_and_retains_first_tie() {
+        let local = local_fixture(Some(2020), 10);
+        let candidates: Vec<_> = (0..25)
+            .map(|index| candidate_fixture(Some(&index.to_string()), Some(100.0)))
+            .collect();
+        let mut requests = 0;
+        let release = super::best_matching_release(&local, &candidates, |id| {
+            requests += 1;
+            std::future::ready(Ok(release_fixture("Album", Some(2020), 10, &id)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(super::collect_release_artists(&release), ["0"]);
+    }
+
+    #[tokio::test]
+    async fn missing_local_year_and_count_use_lower_bound_without_changing_ties() {
+        let local = local_fixture(None, 0);
+        let candidates = [
+            candidate_fixture(Some("first"), None),
+            candidate_fixture(Some("second"), Some(0.0)),
+        ];
+        let mut requests = 0;
+        let release = super::best_matching_release(&local, &candidates, |id| {
+            requests += 1;
+            std::future::ready(Ok(release_fixture("Album", Some(2020), 10, &id)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(super::collect_release_artists(&release), ["first"]);
+    }
+
+    #[tokio::test]
+    async fn successful_duplicate_release_ids_reuse_details_with_new_search_score() {
+        let local = local_fixture(Some(2020), 10);
+        let candidates = [
+            candidate_fixture(Some("same"), Some(50.0)),
+            candidate_fixture(Some("same"), Some(100.0)),
+            candidate_fixture(Some("cannot_win"), Some(99.0)),
+        ];
+        let mut requests = 0;
+        let release = super::best_matching_release(&local, &candidates, |id| {
+            requests += 1;
+            std::future::ready(Ok(release_fixture("Album", Some(2020), 10, &id)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(super::collect_release_artists(&release), ["same"]);
+    }
+
+    #[tokio::test]
+    async fn failed_duplicate_release_can_recover_and_missing_ids_do_not_fetch() {
+        let local = local_fixture(Some(2020), 10);
+        let candidates = [
+            candidate_fixture(None, Some(100.0)),
+            candidate_fixture(Some("same"), Some(100.0)),
+            candidate_fixture(Some("same"), Some(100.0)),
+        ];
+        let mut requests = 0;
+        let release = super::best_matching_release(&local, &candidates, |id| {
+            requests += 1;
+            std::future::ready(if requests == 1 {
+                Err("provider unavailable".to_owned())
+            } else {
+                Ok(release_fixture("Album", Some(2020), 10, &id))
+            })
+        })
+        .await;
+        assert!(release.is_some());
+        assert_eq!(requests, 2);
+    }
+
+    #[tokio::test]
+    async fn no_candidates_or_all_failed_details_return_no_match() {
+        let local = local_fixture(Some(2020), 10);
+        let mut requests = 0;
+        let mut fetch = |_| {
+            requests += 1;
+            std::future::ready(Err("not available".to_owned()))
+        };
+        assert!(super::best_matching_release(&local, &[], &mut fetch)
+            .await
+            .is_none());
+        let candidates = [candidate_fixture(Some("failed"), Some(100.0))];
+        assert!(
+            super::best_matching_release(&local, &candidates, &mut fetch)
+                .await
+                .is_none()
+        );
+        assert_eq!(requests, 1);
+    }
+
+    #[tokio::test]
+    async fn pruning_matches_exhaustive_scoring_for_partial_and_different_releases() {
+        let releases = [
+            release_fixture("Other", None, 0, "other"),
+            release_fixture("Albums", Some(2018), 8, "close"),
+            release_fixture("Album", Some(2020), 10, "perfect"),
+            release_fixture("Album", Some(2020), 10, "equal"),
+        ];
+        for year in [None, Some(2020), Some(2010)] {
+            for tracks in [0, 10, 20] {
+                for search_score in [None, Some(-10.0), Some(50.0), Some(100.0), Some(150.0)] {
+                    let local = local_fixture(year, tracks);
+                    let candidates: Vec<_> = (0..releases.len())
+                        .map(|index| candidate_fixture(Some(&index.to_string()), search_score))
+                        .collect();
+                    let mut expected = None;
+                    let mut best_score = -1.0;
+                    for (candidate, release) in candidates.iter().zip(&releases) {
+                        let score = super::candidate_score(&local, candidate, release);
+                        assert!(score <= super::candidate_score_upper_bound(&local, candidate));
+                        if super::release_matches_local_identity(&local, release)
+                            && score > best_score
+                        {
+                            best_score = score;
+                            expected = Some(super::collect_release_artists(release));
+                        }
+                    }
+                    let actual = super::best_matching_release(&local, &candidates, |id| {
+                        std::future::ready(Ok(releases[id.parse::<usize>().unwrap()].clone()))
+                    })
+                    .await
+                    .map(|release| super::collect_release_artists(&release));
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn dedupe_key_normalizes_dash_variants() {
         assert_eq!(dedupe_key("Jay-Z"), dedupe_key("Jay‐Z"));
-    }
-
-    #[test]
-    fn select_significant_album_artists_keeps_repeat_collaborators() {
-        let selected = select_significant_album_artists(
-            &[String::from("Jay-Z")],
-            &[
-                vec![String::from("Jay-Z"), String::from("Kanye West")],
-                vec![String::from("Jay-Z"), String::from("Kanye West")],
-                vec![String::from("Jay-Z")],
-            ],
-            2,
-            0.25,
-        );
-        assert_eq!(
-            selected,
-            vec![String::from("Jay-Z"), String::from("Kanye West")]
-        );
     }
 
     #[test]
@@ -1295,5 +2452,16 @@ mod tests {
                 String::from("Another Guest"),
             ]
         );
+    }
+
+    #[test]
+    fn two_artist_releases_also_prioritize_the_local_track_artist() {
+        let ranked = rank_selected_album_artists(
+            &["Guest Artist".to_owned(), "Janine Jansen".to_owned()],
+            &["Janine Jansen".to_owned(), "Janine Jansen".to_owned()],
+            &[],
+            &default_artist_name_map(),
+        );
+        assert_eq!(ranked, ["Janine Jansen", "Guest Artist"]);
     }
 }

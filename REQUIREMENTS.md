@@ -86,13 +86,16 @@
 - DATA-013: Activity events shall be persisted in the main library database.
 - DATA-014: Server-side playlist, like, and playback-setting persistence shall currently be global to the server instance rather than partitioned per authenticated user.
 - DATA-015: Server-side playlists and likes shall remain separate from any client-local offline playlists and likes maintained by Phonolite apps.
+- DATA-016: Listening events, sessions, device preferences, metadata snapshots, account cursors, and server identity shall persist in stats.redb separately from legacy aggregates.
+- DATA-017: Unique event insertion, deduplication, session qualification, period rollups, and cursor publication shall commit atomically before upload acknowledgment.
+- DATA-018: Legacy statistics shall remain a baseline for the existing summary endpoint and shall never be synthesized into replayable listening events.
 
 ## Library Discovery, Indexing, and Searchable Catalog Behavior
 - LIB-001: A valid on-disk index shall load without rescanning when its stored index version matches the current implementation.
 - LIB-002: A missing or version-mismatched index shall trigger a rescan.
-- LIB-003: A full rescan shall clear prior library catalog tables before rebuilding them.
+- LIB-003: A full rescan shall rebuild catalog tables in staging and atomically reconcile changed rows into the live database.
 - LIB-004: A full rescan shall also clear prior embedded-cover flags, external-attempt records, and tag-error tables.
-- LIB-005: Incremental scans shall update the existing index in place rather than dropping all prior catalog state first.
+- LIB-005: Incremental scans shall reuse unchanged file tags by path, size and modification time, reconcile additions/edits/deletions, and skip catalog rebuilding when the file manifest is unchanged.
 - LIB-006: Album-directory detection shall treat the deepest directories containing audio as albums unless those directories are only disc subfolders under a parent album directory.
 - LIB-007: Album-directory promotion shall recognize disc-folder labels such as `cd`, `disc`, `disk`, `dvd`, `volume`, `part`, `side`, and `lp`, including numeric and Roman-numeral suffixes.
 - LIB-008: Album file discovery shall inspect an album directory recursively down to two levels for supported audio files.
@@ -107,7 +110,7 @@
 - LIB-017: Album cover selection shall prefer the first embedded cover found during album track processing.
 - LIB-018: When no embedded cover is selected, album cover selection shall fall back to common folder-art filenames such as `cover`, `folder`, `front`, or `album` with `jpg`, `jpeg`, or `png` extensions.
 - LIB-019: Artist list queries shall support optional case-insensitive search, limit, and offset parameters.
-- LIB-020: Artist list queries shall exclude artists that do not currently own at least one indexed album link.
+- LIB-020: Artist list queries shall include individual artists with an indexed album or track credit and exclude orphan artist identities without a current credit relationship.
 - LIB-021: Album list queries shall support optional case-insensitive search, limit, and offset parameters.
 - LIB-022: Track list queries shall support optional case-insensitive search, limit, and offset parameters.
 - LIB-023: Artist lookups shall support direct ID fetches.
@@ -129,15 +132,26 @@
 - LIB-039: Multi-root scans shall canonicalize albums by normalized artist and album title, while preserving separate albums when both copies have conflicting non-empty years.
 - LIB-040: Multi-root scans shall canonicalize duplicate tracks within a canonical album by disc/track number when available, otherwise by normalized title with compatible duration.
 - LIB-041: When duplicate physical copies are found during a full scan, the first configured music root shall provide the playable canonical file path while lower-priority roots may contribute missing metadata and non-duplicate tracks.
+- LIB-042: Tracks shall retain their own tagged artist independently of the album artist, including through album-credit updates; track artists shall be searchable and able to browse their albums without changing the primary album credit.
+- LIB-043: Catalog identities shall preserve non-Latin letters; duplicate-track matching shall verify artist, title, compatible duration, and any specified track and disc numbers rather than relying on track numbers alone.
+- LIB-044: Empty text tags and zero track or disc numbers shall be treated as missing; standard date tags and repeated artist and genre fields shall be read, and obsolete tag caches shall be reparsed on metadata-policy upgrades.
+- LIB-045: Artist-folder sidecars shall describe only the matching tagged artist, and genre normalization shall preserve specific subgenres and recognized compound labels. Web library and API genre labels shall use consistent title case with customary acronym casing, including for existing metadata, without rewriting stored tags or matching keys.
+- LIB-046: Explicit track genres shall remain independent of other tracks' genres; aggregate album genres shall supply a fallback only when a track lacks its own genre tags.
+- LIB-047: The artist browser and search shall include main album and song artists and explicitly featured guests by default; supporting contributors shall require an explicit contributor filter. Filtering shall precede pagination and totals.
+- LIB-048: Artist profiles shall distinguish solo headline Albums, Collab albums with joint album billing, Appears on with billed song appearances, and Other credits with supporting roles; each canonical album shall appear once per section with its relevant song scope.
+- LIB-049: Explicit repeated artist tags and dedicated ARTISTS/ALBUMARTISTS fields shall establish separate ordered credits; clear list and featured-artist separators shall identify collaborators, while ambiguous punctuation shall require independent identity evidence and legitimate compound band names shall remain intact.
+- LIB-050: Composer, conductor, performer, and producer tags shall establish inspectable contributor roles, and provider metadata shall not remove local joint credits or promote a track-only guest into an album artist.
+- LIB-051: Artist playback shall include solo and joint headline albums and only the specifically credited songs from other collaborations. Download artist shall include solo and joint headline albums, with guest and contributor albums available through explicit album downloads.
+- LIB-052: Credit-bearing offline snapshots shall include full credit data and available main and featured artist profiles, keep existing contributor metadata readable, and retain existing download records through migration from positional binary storage to versioned JSON records.
 
 ## External Metadata Enrichment and Asset Handling
 - META-001: The server shall support external metadata providers `the_audio_db` and `music_brainz`.
 - META-002: TheAudioDb sources shall require an API key.
 - META-003: MusicBrainz sources shall require a non-empty `User-Agent`.
 - META-004: Source testing shall issue a real remote probe request and return success only for a successful HTTP response.
-- META-005: Artist enrichment shall merge results from all enabled sources into a combined metadata result.
+- META-005: Automatic artist enrichment shall target identities billed on at least one album or song, including featured guests; supporting-only identities shall not consume enrichment budget or automatically fetch biographies and artwork.
 - META-006: Album enrichment shall merge results from all enabled sources into a combined metadata result.
-- META-007: When multiple providers contribute metadata, TheAudioDb summaries shall take precedence over MusicBrainz fallback text, while MusicBrainz genres may take precedence over existing provider genres during merge.
+- META-007: When multiple providers contribute metadata, TheAudioDb shall provide descriptive summaries while verified MusicBrainz genres may take precedence over existing provider genres during merge.
 - META-008: Logo and banner URLs shall be accepted from providers only when the merged result does not already have those asset URLs.
 - META-009: MusicBrainz requests shall be globally rate-limited to one request per second.
 - META-010: MusicBrainz JSON fetches shall retry on `429`, `5xx`, decode failures, and transient transport failures up to six attempts with increasing delays.
@@ -155,8 +169,16 @@
 - META-022: Cover-cache warming shall run across albums after scans so common cover requests can hit cached files.
 - META-023: Artist cover resolution shall prefer an explicit artist logo, then an explicit artist banner, then the first album cover owned by the artist.
 - META-024: Embedded-cover extraction shall use the first front-cover image when available and otherwise the first embedded picture.
-- META-025: Cover responses shall include long-lived public cache headers (`max-age=31536000`).
+- META-025: Stable cover URLs shall require private HTTP cache revalidation (`private, no-cache`) so corrected artwork can be retrieved. Disk caches shall validate source references and file modification metadata, and replacement artist artwork shall use content-versioned references.
 - META-026: Clearing metadata assets shall remove the entire metadata root directory tree.
+- META-027: External artist enrichment and literal album search fallback shall require a unique normalized identity match; literal album enrichment shall verify both artist credit and title, and missing or ambiguous identities shall be skipped. A verified album release-group identity may establish cross-provider album metadata as specified in META-034 without changing local titles or credits.
+- META-028: MusicBrainz album-artist resolution shall validate the release title and locally indexed artist identity before scoring candidates, including fallback searches; provider credits shall preserve the local primary artist identity and order except for a verified repair of an unstructured combined display credit.
+- META-029: Additional MusicBrainz album artists shall require release-level artist billing and independent local tag support. Repeated song appearances shall not establish album ownership. Track-level collaborators shall require local and remote track titles to align in count and order, and conflicting artist aliases shall not canonicalize names.
+- META-030: The next normal startup or scan of a catalog created before the current credit-identity policy shall repair existing combined artist organization from local tags and sidecars, reparse obsolete tag caches, discard unverified external enrichment and artist associations once, and reset external retry state without modifying audio files or canonical album and track IDs.
+- META-031: MusicBrainz genre enrichment shall use identity-validated MBID detail lookups requesting recognized genres; general folksonomy tags and artist disambiguation comments shall not be presented as genres or biographies.
+- META-032: Unstructured combined artist displays may be repaired only when complete local names or unambiguous credited aliases cover every structured MusicBrainz release artist ID and local track titles align in count and order. Repairs shall deduplicate by provider ID, preserve single provider group identities and explicit artist tags, retain original source wording, render verified credited names and joining words in album/song/API/offline displays, and persist across scans without changing media IDs. Explicit multi-artist local credits may remove repeated display names only with complete identity coverage while preserving billing order; authoritative single band names and unknown portions shall remain intact. MusicBrainz search shall try exact titles before recognized trailing edition-title variants, accepting an edition-title difference only with complete ordered track and structured artist identity agreement; candidate rejection reasons shall be available in server logs. A primary-only TheAudioDB artist shall not establish additional collaborators.
+- META-033: Metadata diagnostics shall distinguish empty searches, missing or mismatched identities, ambiguous matches, invalid provider IDs, request-stage failures, and verified records lacking required fields without changing match acceptance. Provider results shall report field availability and description support; MusicBrainz failures shall report retry attempts, HTTP status when available, and delays. Album storage diagnostics shall verify persisted completeness after writes, and sweep completion shall report persisted complete and total album counts separately from updates. Diagnostic identity samples shall be bounded, and request errors shall omit credential URLs.
+- META-034: Album metadata discovery shall use bounded general title/artist variants and verify candidate releases against local artist identity and track programme evidence before accepting a canonical release-group ID. Edition labels and classical catalogue/movement typography may vary while live/remix/acoustic and different-work distinctions remain significant. Incomplete local programmes shall require unambiguous numbered high-coverage correspondence and shall never authorize credit repairs; different matching release groups shall be rejected as ambiguous. TheAudioDB release-group lookups shall require the same returned MusicBrainz ID. Cached identities shall live in an optional versioned JSON sidecar tied to local source/track fingerprints without changing binary media records or the index version. Verified metadata-group evidence shall not relax the complete ordered-track and artist identity rules for credit changes or rewrite local editions, artists, or source wording.
 
 ## Authentication, Sessions, and Authorization
 - AUTH-001: User roles shall include `superadmin`, `admin`, and `user`.
@@ -197,9 +219,9 @@
 - API-009: `GET /api/v1/browse/artists` shall accept optional `search`, `limit`, and `offset` query parameters.
 - API-010: `GET /api/v1/browse/artists` shall default the limit to `200` and clamp the minimum logical limit to `1`.
 - API-011: `GET /api/v1/browse/artists` shall return a `ListResponse` with `items` and `total`.
-- API-012: Artist browse items shall include artist ID, name, genres, album count, summary, logo reference, and banner reference.
+- API-012: Artist browse items shall include individual artist ID, name, genres, total distinct headline and billed-appearance album count (`release_count`), solo and joint album counts, summary, logo reference, and banner reference. Supporting credits shall not inflate release or collaboration counts.
 - API-013: `GET /api/v1/browse/artists/:artist_id` shall return the raw artist object or `404`.
-- API-014: `GET /api/v1/browse/artists/:artist_id/albums` shall return the artist’s albums with resolved track counts and displayable artist names.
+- API-014: `GET /api/v1/browse/artists/:artist_id/albums` shall return solo and joint headline albums with resolved track counts and displayable artist names; `/releases` shall return solo Albums and consolidated Collab albums with roles and credited song scope.
 - API-015: `GET /api/v1/browse/albums/:album_id/tracks` shall return sorted track views and `404` when the album is not found.
 - API-016: Album-track sorting shall order by disc number, then track number, then lowercased title.
 - API-017: `GET /api/v1/browse/tracks/:track_id` shall return a single track view or `404`.
@@ -231,20 +253,24 @@
 - API-043: `DELETE /api/v1/library/likes/:track_id` shall remove a track ID from likes.
 - API-044: `GET /api/v1/player/settings` shall currently expose only `repeat_mode`.
 - API-045: `POST /api/v1/player/settings` shall currently accept only `repeat_mode` values `off` and `one`.
-- API-046: `GET /api/v1/stats` shall return `403` when stats collection is disabled.
+- API-046: Previously recorded statistics and synchronization identity shall remain readable when collection is disabled; ingestion shall return `403`.
 - API-047: `GET /api/v1/stats` shall accept optional `year` and `month` query parameters.
 - API-048: A provided `month` shall be validated into the range `1..12`.
 - API-049: When neither `year` nor `month` is provided, stats shall default to the current UTC year and month.
 - API-050: When `year` is provided without `month`, stats shall return a year-wide aggregate.
 - API-051: Stats responses shall expose total minutes plus top tracks, artists, and genres.
 - API-052: Stats rankings shall currently be limited to the top five entries in each category.
-- API-053: `GET /api/v1/library/tracks/:track_id/offline-metadata` shall be protected and shall return a schema-versioned fragment containing the track view, owning album, and owning artist for local download hydration.
+- API-053: `GET /api/v1/library/tracks/:track_id/offline-metadata` shall be protected and shall return a schema-versioned fragment containing the track view, owning album, primary artist and individual credited artist profiles for local download hydration.
 - API-054: `POST /api/v1/download/batches` shall be protected and shall accept `track_ids` plus an optional `client_batch_id`.
 - API-055: Download batch responses shall include schema version, batch ID, created timestamp, available items, and unavailable track IDs without failing the whole batch for missing tracks.
 - API-056: Each download batch item shall include track ID, download URL, offline metadata fragment, byte length, content type, ETag, and SHA256 checksum.
 - API-057: Repeated batch manifest requests shall reuse a checksum cache keyed by file path, modified time, and byte length when the source file has not changed.
 - API-058: `GET /api/v1/download/tracks/:track_id` shall support `Range` plus `If-Range`, returning `206` only when the supplied ETag matches and returning a full `200` response when the ETag is stale or mismatched.
 - API-059: Album and artist cover endpoints shall remain usable by authenticated app clients for offline artwork hydration, including album covers, artist logos, and artist banners.
+- API-060: `GET /api/v1/stats/sync` shall expose authenticated account identity, persistent server identity, collection state, history generation, and at most 200 commit-ordered listening events after a saved cursor.
+- API-061: `POST /api/v1/stats/events` shall authenticate ownership, gate recording by server and installation preferences, acknowledge identical retries, and reject conflicting event contents or session identity.
+- API-062: `POST /api/v1/stats/preferences` shall persist enabled-by-default recording consent per account and installation using monotonic revisions, including when server-wide collection is disabled.
+- API-063: The summary response shall preserve the existing minute/ranking fields and expose exact listening milliseconds, qualified plays, unique tracks, and unique artists.
 
 ## Admin Console, HTML Flows, and Operator Actions
 - ADMIN-001: The admin console shall be served from the HTTP root rather than from the JSON API namespace.
@@ -254,7 +280,7 @@
 - ADMIN-005: Admin login shall present an HTML form when an admin exists and no valid admin session is present.
 - ADMIN-006: Admin asset files shall be served from `web/static`.
 - ADMIN-007: Admin asset requests shall reject path traversal by allowing only normal path components.
-- ADMIN-008: Admin asset responses shall currently special-case JavaScript and CSS MIME types and otherwise fall back to `application/octet-stream`.
+- ADMIN-008: Admin asset responses shall serve JavaScript, CSS, supported fonts, and supported images with their corresponding MIME types and otherwise fall back to `application/octet-stream`.
 - ADMIN-009: The admin UI shall use HTML templates loaded from the resolved web root.
 - ADMIN-010: The admin UI shall render error pages through HTML templates when possible and through a fallback inline HTML shell otherwise.
 - ADMIN-011: Admin endpoints shall return JSON responses instead of redirects when the request prefers JSON through `Accept: application/json` or `X-Requested-With: fetch`.
@@ -295,16 +321,28 @@
 - ADMIN-046: `GET /logs/tail` shall expose JSON tail data for the selected log view.
 - ADMIN-047: The logs tail endpoint shall cap the requested line count at the global log max-line setting.
 - ADMIN-048: `POST /logs/clear` shall truncate every managed log file.
-- ADMIN-049: `GET /activity` shall render the activity page for authenticated admins.
-- ADMIN-050: `GET /status/activity` shall return JSON activity summary counts for authenticated admins.
-- ADMIN-051: `POST /activity/clear` shall clear both the activity database records and the activity log file.
+- ADMIN-049: `GET /logs/issues` shall return rendered indexing issues and their total count for authenticated admins.
+- ADMIN-050: The logs page shall show indexing issue details only in a separate Indexing issues tab and refresh only the selected view.
+- ADMIN-051: The console shall omit the dedicated Activity page, navigation item, and activity status and clear routes.
+- ADMIN-052: The console shall use the Phonolite Obsidian palette and locally served Poppins and Rajdhani fonts, with labeled sidebar navigation and a visible current-page state. Below `980 px`, an icon-only hamburger on the left shall open the sidebar as an overlay drawer without shifting the main content.
+- ADMIN-053: Login and initial setup shall use a centered authentication layout without private navigation or server-action controls.
+- ADMIN-054: Initial library HTML and asynchronous library fragments shall share rendered content, search, and pagination; navigation shall preserve search parameters, deep links, and browser history.
+- ADMIN-055: Console dialogs shall support keyboard focus containment, Escape dismissal, labeled titles, and focus restoration when closed.
+- ADMIN-056: Library and log requests shall protect against stale responses and preserve existing results when an update fails; polling shall pause while the document is hidden.
+- ADMIN-057: After the initial HTML document loads, the console shall navigate within a persistent single page shell. GET requests with `X-Console-View: true` shall return rendered JSON views containing `title`, `page`, `page_class`, `content`, `nav`, and `footer`, subject to the same session and role checks as document requests; ordinary GET requests shall retain complete HTML responses.
+- ADMIN-058: Login, setup, logout, Settings saves, and immediate console actions shall submit asynchronous POST requests. JSON requests shall receive structured success, error, or redirect results, with authentication redirects preserving session-cookie changes; existing document form behavior shall remain available.
+- ADMIN-059: Client navigation shall display the clean console path while retaining search, filter, pagination, and detail query state in browser history. Back and Forward shall restore that state, and direct GET deep links shall remain supported.
+- ADMIN-060: Console navigation and asynchronous actions shall show the shared Phonolite spinner while pending, preserve current content on failure, and cancel or ignore superseded results. Replacing a view shall dispose its listeners, polling, and in-flight requests; unsaved Settings edits shall require a leave decision. Private console views and mutation responses shall use `Cache-Control: private, no-store`.
+- ADMIN-061: Console page changes shall retain authenticated navigation and avoid page entrance fades or loading dimming. Library searches, filters, pagination, detail navigation, and history changes shall update only changed regions while preserving mounted search controls and newer text edits. User mutations shall reconcile authoritative table rows while retaining unchanged rows, edit mode, selection, and scroll. Settings saves shall retain the form and update its saved baseline in place. Scan completion shall update notices and refresh results only when Library is active.
+
+- ADMIN-062: Authenticated console views shall show indexing and metadata activity above the sidebar's server-actions button, with completed/total track reads and album-folder work during local indexing. Metadata gathering shall show the current sweep position in `[current/total]` format alongside the artist name or album title with its artist, including album-credit resolution. The position shall identify the item currently being processed using the same one-based numbering as the album-credit sweep logs, advance for skipped, failed, and unmatched checks, and reset for each phase/pass. Stored album completeness shall not determine this position. The current target shall remain visible through provider requests, retries, rate-limit waits, and storage, then clear when its lookup ends or the phase changes. Overlapping jobs shall retain independent positions and targets and remain active until all finish. The progress line shall hide when the library is ready and metadata work has stopped, including partial completion, and reappear for later work. This dedicated status shall update across page navigation and filesystem-triggered scans, with polling paused while the document is hidden.
 
 ## Logging, Activity, and Issue Tracking
 - LOG-001: Logging shall write to a log directory resolved from config.
 - LOG-002: Managed log files shall include `all.log`, `info.log`, `warnings.log`, `errors.log`, `issues.log`, `activities.log`, and `debug.log`.
-- LOG-003: Every event shall always write to `all.log`.
+- LOG-003: Events other than indexing issues shall write to `all.log`.
 - LOG-004: Activity-targeted events shall additionally write to `activities.log`.
-- LOG-005: Issue-targeted events shall additionally write to `issues.log`.
+- LOG-005: Issue-targeted events shall write exclusively to `issues.log`, without being copied to other log files.
 - LOG-006: Error, warning, info, and debug-or-trace events shall also write to their corresponding level-specific files.
 - LOG-007: Each managed log file shall trim itself after exceeding `10,000` lines.
 - LOG-008: Log trimming shall retain approximately `5,000` lines after a trim.
@@ -316,8 +354,8 @@
 - LOG-014: Activity clearing shall recreate the activity table after deletion so new events can continue to be stored.
 - LOG-015: The logs tail endpoint shall support the views `all`, `info`, `warnings`, `errors`, `issues`, `activities`, and `debug`.
 - LOG-016: The logs tail endpoint shall return the current total line count and last-updated timestamp alongside the returned tail lines.
-- LOG-017: The activity page shall surface indexing issues either from the issue log or, when unavailable, from persisted tag-error records.
-- LOG-018: The activity status endpoint shall include both active event counts and issue counts.
+- LOG-017: The Indexing issues tab shall surface indexing issues either from the issue log or, when unavailable, from persisted tag-error records. Other log views shall exclude historical ISSUE entries.
+- LOG-018: The logs issues endpoint shall use the same issue source and rendered details as the initial logs page.
 
 ## QUIC Transport, Streaming Sessions, and Playback Stats
 - STREAM-001: The server’s current playback transport shall be raw QUIC rather than HTTP streaming.
@@ -333,30 +371,30 @@
 - STREAM-011: Control responses shall support `auth_ok`, `error`, `pong`, `stream`, and `open_ok`.
 - STREAM-012: QUIC stream opening shall be rejected until the client has authenticated successfully.
 - STREAM-013: QUIC authentication shall validate the same session token store used by the HTTP API.
-- STREAM-014: An `open` request shall set the active track, optionally replace the playback queue, and start an active outgoing stream if needed.
+- STREAM-014: An `open` request shall set the active track, optionally replace the playback queue, allocate a new audio-stream generation, and accept `start_ms` for direct position restoration.
 - STREAM-015: An `advance` request shall move playback to the next queued track or fall back to the queue head when appropriate.
-- STREAM-016: A `buffer` message shall update the session’s client-buffer state and adaptive target.
-- STREAM-017: A `seek` message shall either reuse a compatible existing stream or spawn a new transcode worker from the requested position.
-- STREAM-018: A `playback` message shall feed listening-stat updates when stats collection is enabled.
+- STREAM-016: A `buffer` message shall update the session client-buffer state and sending target independently of cache production.
+- STREAM-017: Every remote `seek` shall cancel the obsolete audio stream and allocate a new server-initiated stream; its control announcement shall echo `request_id`, `seek_id`, and the clamped requested position.
+- STREAM-018: A legacy `playback` message shall remain accepted for compatibility and shall not independently collect listening statistics.
 - STREAM-019: A `ping` message shall return a `pong` with the echoed timestamp when provided.
 - STREAM-020: The server shall maintain one active control stream and separate server-initiated unidirectional audio streams.
 - STREAM-021: The server shall track an active track plus a queued list of track IDs per QUIC session.
 - STREAM-022: The server shall prefetch at most one queued future track at a time.
-- STREAM-023: Prefetch shall only occur when the client has reported buffering at or above its target threshold.
+- STREAM-023: Prefetch shall remain disabled until clients negotiate support for retaining inactive audio; any future prefetch shall require the client buffer to meet its target.
 - STREAM-024: Active stream sending shall pause when the client reports a buffer at or above the target threshold.
 - STREAM-025: Prefetched or superseded streams shall be pruned when they fall outside the allowed active or prefetch set.
-- STREAM-026: The server shall support adaptive bitrate sessions for `auto` transcode mode.
-- STREAM-027: Adaptive bitrate downshifts shall occur when the reported buffer drops below `2000ms` and the quality-change cooldown permits it.
-- STREAM-028: Adaptive bitrate upshifts shall require a reported buffer of at least `8000ms`, sustained stability, and the quality-change cooldown.
-- STREAM-029: Adaptive bitrate quality levels shall map to `160 kbps`, `96 kbps`, and `48 kbps`.
-- STREAM-030: Stream-session adaptation state shall expire after `90` seconds of inactivity.
+- STREAM-026: Both `auto` and `fixed` mode requests shall use a stable quality rendition during a playback session so encoded ranges can be shared and replayed.
+- STREAM-027: At most four source-range producers shall run concurrently; requests for the same source, quality, frame duration, and range shall share one producer.
+- STREAM-028: Source-to-QUIC staging shall use one channel bounded to `400ms` of frames and an outgoing queue bounded to `400ms` with a `64 KiB` byte ceiling.
+- STREAM-029: Stable rendition quality levels shall map to `160 kbps`, `96 kbps`, and `48 kbps`.
+- STREAM-030: Stream announcements shall include a source-version hash, clamped `position_ms`, `range_end_ms`, and `end_of_track`; a range EOS shall not imply that the track ended.
 - STREAM-031: Seek recovery shall temporarily reduce the target buffer to `400ms`.
-- STREAM-032: The server shall emit a seek-reset marker frame consisting of `0xFFFF` followed by the client-provided `seek_id`.
-- STREAM-033: The server shall preserve the active stream open after EOF so later seeks can reuse it.
-- STREAM-034: The QUIC layer shall flush pending listening stats on disconnect.
-- STREAM-035: Playback-stat duration deltas shall be ignored when a reported jump exceeds `15000ms`.
-- STREAM-036: A play count shall be recorded once a track reaches at least half of its duration while reported as playing.
-- STREAM-037: Pending listening stats shall flush at approximately `5s` intervals while playback continues.
+- STREAM-032: A new seek audio stream shall begin with a compatibility reset marker consisting of `0xFFFF` followed by the client-provided `seek_id`, ahead of its header and audio.
+- STREAM-033: A completed range shall send one EOS marker and a graceful QUIC FIN; later seeks and range continuations shall allocate new streams.
+- STREAM-034: Listening duration shall originate in client consumed-audio accounting and reach the server through durable event ingestion, including after disconnection.
+- STREAM-035: Duration shall be attributed to event occurrence time and split across UTC month and year boundaries; positions, seeks, and upload time shall not add listening.
+- STREAM-036: A session shall qualify once after min(30 seconds, half the known track duration) of actual listening, or 30 seconds when duration is unknown, independent of checkpoint arrival order.
+- STREAM-037: Server period aggregates shall be decoded and written once per affected period per upload batch, and synchronization shall retain event IDs for deduplication.
 
 ## Transcoding, Raw Opus Format, and Stream Caching
 - XCODE-001: The server shall transcode source audio to Opus.
@@ -367,7 +405,7 @@
 - XCODE-006: `auto` and `fixed` shall be the only supported transcode modes.
 - XCODE-007: `high`, `medium`, and `low` shall be the only supported named transcode qualities.
 - XCODE-008: `fixed` mode shall use the configured quality bitrate when no explicit fixed bitrate is provided.
-- XCODE-009: `auto` mode shall use the current adaptive-session target bitrate when available and otherwise fall back to the configured quality bitrate.
+- XCODE-009: `auto` mode shall select the configured quality bitrate as a stable rendition; midstream buffer-driven bitrate changes shall not invalidate cache identity.
 - XCODE-010: Raw Opus streams shall begin with a custom header using magic `OPUSR01\0`.
 - XCODE-011: The raw Opus header shall currently encode version, flags, total header length, sample rate, channels, frame duration, bitrate, duration, pre-skip, and variable-length track metadata strings.
 - XCODE-012: The raw Opus header shall include track ID, title, artist, album, codec label, and container label fields.
@@ -375,16 +413,16 @@
 - XCODE-014: Raw Opus audio frames shall be sent as little-endian `u16` frame-length prefixes followed by the packet payload.
 - XCODE-015: A raw Opus end-of-stream marker shall be encoded as a zero-length frame.
 - XCODE-016: Track seeking shall use coarse container seek when possible and skip-sample compensation when the actual seek point precedes the requested point.
-- XCODE-017: Seek compensation shall be capped to the equivalent of `250ms` of samples per channel.
+- XCODE-017: Coarse-seek compensation shall discard the full measured sample distance so deep seeks remain accurate; cached replay shall include decoder preroll and exact sample-offset trimming.
 - XCODE-018: The source decode path shall resample non-48kHz input to 48kHz through a linear resampler.
 - XCODE-019: The server shall expose a raw-Opus metadata builder that resolves artist and album names from the library for the stream header.
 - XCODE-020: A memory-backed stream cache shall exist for reusable fixed-bitrate raw-Opus streams.
-- XCODE-021: The current memory-backed stream cache shall enforce a per-entry size limit of `256 MiB`.
-- XCODE-022: Cache reads shall be available only when a complete matching cache entry is still alive in memory.
-- XCODE-023: Cache writes shall be exclusive per cache key while the backing entry is alive.
-- XCODE-024: Cache reuse for seeks shall only occur when the cached entry is complete and can start at the requested frame boundary.
-- XCODE-025: If the last active cache user drops while the cache entry is incomplete, the cache entry shall cancel itself.
-- XCODE-026: Fixed-mode streams shall be cacheable; adaptive auto-mode streams shall not.
+- XCODE-021: The shared memory-backed stream cache shall reserve at most sixty-four `5s` ranges of `4 MiB` each, for a total encoded-audio payload budget of `256 MiB`; ephemeral ranges when caching is disabled shall use the same reservations, and exhausted pinned capacity shall return a retryable error.
+- XCODE-022: Completed and partial ranges shall remain available after playback, use least-recently-used eviction when unpinned, and match the source path, file size, modification time, quality, frame duration, and range start.
+- XCODE-023: Cache production shall be exclusive per rendition range; failed production may retry its identical retained prefix without duplicating frames.
+- XCODE-024: Cache readers shall replay covered frames immediately and wait for their shared producer only at a missing frame; producer failure shall return an error rather than a truncated successful EOS.
+- XCODE-025: Dropping playback readers shall preserve cached partial ranges; queued producers without remaining readers shall yield to current requests before doing source work.
+- XCODE-026: Fixed and compatibility auto-mode streams shall be cacheable stable renditions; each independent range shall carry its own encoder delay and the client shall trim final packet padding to its declared range boundary.
 - XCODE-027: The configured `stream_cache_dir` path is not currently used by the live cache implementation.
 - XCODE-028: The transcode module shall also retain an Ogg Opus output helper even though the current server transport path uses raw Opus over QUIC.
 

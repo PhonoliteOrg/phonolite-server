@@ -1,3 +1,9 @@
+mod folders;
+mod validation;
+
+pub use folders::admin_browse_folders;
+
+use validation::validate_settings;
 // crates/server/src/admin/settings.rs
 use std::path::PathBuf;
 use std::time::Duration;
@@ -5,29 +11,30 @@ use std::time::Duration;
 use axum::{
     extract::{Form, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use tracing::warn;
 
+use crate::admin::presentation::{
+    apply_template, escape_html, html_error, load_template, render_admin_response, truncate_text,
+    PageLayout,
+};
 use crate::assets::clear_metadata_assets;
 use crate::config::{
     new_music_root_id, normalize_music_roots, resolve_path, save_config, MetadataSourceConfig,
     MusicRootConfig,
 };
 use crate::external::{self, ExternalSource};
-use crate::scan::{
-    apply_music_roots_update, new_source_id, parse_provider, source_fields_from_parts, start_rescan,
-};
+use crate::http::{html_response, json_error_response, json_ok_response, redirect_to, wants_json};
+use crate::metadata_sources::{new_source_id, parse_provider, source_fields_from_parts};
+use crate::scan::{apply_music_roots_update, start_rescan};
 use crate::state::{
     AppState, DebugLogToggleForm, MetadataSourceForm, MetadataTestForm, MetadataToggleForm,
     MusicRootForm, MusicRootUpdateForm, SettingsForm, SettingsQuery,
 };
-use crate::utils::{
-    apply_template, escape_html, html_error, html_response, json_error_response, json_ok_response,
-    load_template, redirect_to, render_admin_page, truncate_text, wants_json, PageLayout,
-};
 
-use super::{admin_user_from_headers, is_admin, render_message};
+use super::{admin_user_from_headers, is_admin};
 
 pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match admin_user_from_headers(&state, &headers) {
@@ -47,7 +54,7 @@ pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) ->
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        if let Err(err) = crate::utils::spawn_restart() {
+        if let Err(err) = crate::process_control::spawn_restart() {
             warn!("Restart failed: {}", err);
         }
         #[cfg(not(unix))]
@@ -155,107 +162,24 @@ pub async fn admin_update_settings(
         return html_error(&state, StatusCode::FORBIDDEN, "forbidden".to_string());
     }
 
-    let index_path = form.index_path.trim();
-    if index_path.is_empty() {
-        return admin_settings_page(&state, Some("index_path is required".to_string()));
-    }
-    let metadata_path = form.metadata_path.trim();
-    if metadata_path.is_empty() {
-        return admin_settings_page(&state, Some("metadata_path is required".to_string()));
-    }
-    let log_dir = form.log_dir.trim();
-    if log_dir.is_empty() {
-        return admin_settings_page(&state, Some("log_dir is required".to_string()));
-    }
-    let port = match form.port.trim().parse::<u16>() {
-        Ok(value) if value > 0 => value,
-        _ => return admin_settings_page(&state, Some("port must be a valid number".to_string())),
-    };
-    let quic_port = match form.quic_port.trim().parse::<u16>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("quic_port must be a valid number".to_string()),
-            )
+    let current_config = state.config.read().clone();
+    let config = match validate_settings(&form, &current_config) {
+        Ok(config) => config,
+        Err(message) => {
+            if wants_json(&headers) {
+                return json_error_response(StatusCode::BAD_REQUEST, message);
+            }
+            return admin_settings_page(&state, Some(message));
         }
     };
-    if quic_port == port {
-        return admin_settings_page(
-            &state,
-            Some("quic_port must be different from port".to_string()),
-        );
-    }
-    let watch_debounce_secs = match form.watch_debounce_secs.trim().parse::<u64>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("watch_debounce_secs must be a positive number".to_string()),
-            )
-        }
-    };
-    let session_ttl_secs = match form.session_ttl_secs.trim().parse::<u64>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("session_ttl_secs must be a positive number".to_string()),
-            )
-        }
-    };
-    let external_min_interval_secs = match form
-        .external_metadata_min_interval_secs
-        .trim()
-        .parse::<u64>()
-    {
-        Ok(value) if value > 0 => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("external_metadata_min_interval_secs must be a positive number".to_string()),
-            )
-        }
-    };
-    let external_timeout_secs = match form.external_metadata_timeout_secs.trim().parse::<u64>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("external_metadata_timeout_secs must be a positive number".to_string()),
-            )
-        }
-    };
-    let external_scan_limit = match form.external_metadata_scan_limit.trim().parse::<usize>() {
-        Ok(value) => value,
-        _ => {
-            return admin_settings_page(
-                &state,
-                Some("external_metadata_scan_limit must be a number".to_string()),
-            )
-        }
-    };
-
-    let mut config = state.config.read().clone();
-    config.index_path = index_path.to_string();
-    config.metadata_path = metadata_path.to_string();
-    config.log_dir = log_dir.to_string();
-    config.log_debug_enabled = form.log_debug_enabled.is_some();
-    config.port = port;
-    config.quic_port = quic_port;
-    config.watch_music = form.watch_music.is_some();
-    config.watch_debounce_secs = watch_debounce_secs;
-    config.session_ttl_secs = session_ttl_secs;
-    config.stats_collection_enabled = form.stats_collection_enabled.is_some();
-    config.external_metadata_min_interval_secs = external_min_interval_secs;
-    config.external_metadata_timeout_secs = external_timeout_secs;
-    config.external_metadata_scan_limit = external_scan_limit;
-    config.external_metadata_on_tag_error = form.external_metadata_on_tag_error.is_some();
-    let sources_enabled = has_enabled_sources(&config.external_metadata_sources);
-    config.external_metadata_enabled = sources_enabled;
-    config.external_metadata_enrich_on_scan = sources_enabled;
 
     if let Err(err) = save_config(&state.config_path, &config) {
+        if wants_json(&headers) {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("save failed: {}", err),
+            );
+        }
         return admin_settings_page(&state, Some(format!("save failed: {}", err)));
     }
 
@@ -266,9 +190,12 @@ pub async fn admin_update_settings(
     {
         warn!("Failed to update debug logging filter: {}", err);
     }
-    let mut message = "info: Saved.".to_string();
-    message.push_str(" Restart the server to apply port or index path changes.");
-    admin_settings_page(&state, Some(message))
+    if wants_json(&headers) {
+        Json(serde_json::json!({ "ok": true, "message": "Saved. Restart the server to apply bind address, port or index path changes." }))
+            .into_response()
+    } else {
+        admin_settings_page(&state, None)
+    }
 }
 
 pub async fn admin_add_music_root(
@@ -314,7 +241,7 @@ pub async fn admin_add_music_root(
     apply_music_roots_update(state.clone(), &config.music_roots, true);
 
     let html = render_music_root_rows(&state, &[root]);
-    html_response(StatusCode::OK, html)
+    row_response(&headers, html)
 }
 
 pub async fn admin_update_music_root(
@@ -366,6 +293,7 @@ pub async fn admin_update_music_root(
     };
 
     target.path = path.to_string();
+    let updated_root = target.clone();
     normalize_music_roots(&mut config);
 
     if let Err(err) = save_config(&state.config_path, &config) {
@@ -374,7 +302,11 @@ pub async fn admin_update_music_root(
     *state.config.write() = config.clone();
     apply_music_roots_update(state.clone(), &config.music_roots, true);
 
-    json_ok_response()
+    if wants_json(&headers) {
+        row_response(&headers, render_music_root_rows(&state, &[updated_root]))
+    } else {
+        json_ok_response()
+    }
 }
 
 pub async fn admin_delete_music_root(
@@ -462,7 +394,7 @@ pub async fn admin_add_metadata_source(
     }
     *state.config.write() = config;
     let html = render_metadata_sources(&state, &[source]);
-    html_response(StatusCode::OK, html)
+    row_response(&headers, html)
 }
 
 pub async fn admin_update_metadata_source(
@@ -512,12 +444,25 @@ pub async fn admin_update_metadata_source(
     target.provider = provider;
     target.api_key = api_key;
     target.user_agent = user_agent;
+    let updated_source = target.clone();
 
     if let Err(err) = save_config(&state.config_path, &config) {
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
     *state.config.write() = config;
-    json_ok_response()
+    if wants_json(&headers) {
+        row_response(&headers, render_metadata_sources(&state, &[updated_source]))
+    } else {
+        json_ok_response()
+    }
+}
+
+fn row_response(headers: &HeaderMap, html: String) -> Response {
+    if wants_json(headers) {
+        Json(serde_json::json!({ "ok": true, "html": html })).into_response()
+    } else {
+        html_response(StatusCode::OK, html)
+    }
 }
 
 pub async fn admin_delete_metadata_source(
@@ -802,8 +747,7 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
     let music_roots = render_music_roots(state, &config.music_roots);
     let metadata_sources = render_metadata_sources(state, &config.external_metadata_sources);
     let sources_enabled = has_enabled_sources(&config.external_metadata_sources);
-    let message_html = render_message(message);
-    let status_block = super::library::render_status_block_for_library(state);
+    let error = message.as_deref().unwrap_or_default();
     let log_debug_checked = if config.log_debug_enabled {
         "checked".to_string()
     } else {
@@ -822,8 +766,7 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
     let body = apply_template(
         template,
         &[
-            ("message", message_html),
-            ("status_block", status_block),
+            ("message", escape_html(error)),
             ("config_path", escape_html(&config_path)),
             ("music_roots", music_roots),
             ("index_path", escape_html(&config.index_path)),
@@ -834,6 +777,8 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
             ("log_full_path", escape_html(&log_full_path)),
             ("log_debug_checked", log_debug_checked),
             ("port", config.port.to_string()),
+            ("admin_port", config.admin_port.to_string()),
+            ("admin_bind_addr", escape_html(&config.admin_bind_addr)),
             ("quic_port", config.quic_port.to_string()),
             ("watch_checked", watch_checked),
             (
@@ -889,9 +834,12 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
             ("modals", modals),
         ],
     );
-    html_response(
+    render_admin_response(
+        state,
         StatusCode::OK,
-        render_admin_page(state, "Settings", &body, PageLayout::standard()),
+        "Settings",
+        &body,
+        PageLayout::standard(),
     )
 }
 
@@ -955,4 +903,34 @@ fn provider_value(provider: crate::external::Provider) -> &'static str {
 
 fn has_enabled_sources(sources: &[MetadataSourceConfig]) -> bool {
     sources.iter().any(|source| source.enabled)
+}
+
+#[cfg(test)]
+mod response_tests {
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[tokio::test]
+    async fn settings_rows_negotiate_json_without_changing_html_fallback() {
+        let html = "<tr data-id=\"root-1\"><td>Music &amp; More</td></tr>".to_string();
+        let mut headers = HeaderMap::new();
+        let response = super::row_response(&headers, html.clone());
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), html.as_bytes());
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        let response = super::row_response(&headers, html.clone());
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["html"], html);
+    }
 }

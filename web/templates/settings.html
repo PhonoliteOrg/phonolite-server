@@ -1,38 +1,154 @@
 <div class="page-title">
   <div>
-    <h2>Settings</h2>
-    <p class="muted">Update configuration values. Port and index path changes require a restart.</p>
+    <h1>Settings</h1>
+    <p class="muted">Update configuration values. Bind address, port and index path changes require a restart.</p>
   </div>
 </div>
-{{message}}
 <form method="post" action="/settings" id="settings">
   <div class="card">
-    <h3>Library</h3>
+    <h2>Library</h2>
     <p class="hint">Config file: <code>{{config_path}}</code></p>
     <div class="row space-between">
       <div>
-        <label>Music folders</label>
+        <h4>Music folders</h4>
         <p class="muted">Add one or more folders to scan into the library.</p>
       </div>
       <button class="button ghost" type="button" id="open-music-root-add">Add folder</button>
     </div>
-    <div class="source-list" id="music-roots">
+    <div class="source-list" id="music-roots" role="list" aria-label="Added music folders">
       {{music_roots}}
     </div>
     <p class="hint">
       Paths are relative to the config file when not absolute. All folders must exist.
     </p>
-    <label>Index path (relative to config file if not absolute)</label>
-    <input name="index_path" type="text" value="{{index_path}}" required />
+    <label for="settings-index-path">Index path (relative to config file if not absolute)</label>
+    <input id="settings-index-path" name="index_path" type="text" value="{{index_path}}" required />
     <p class="hint">Default index location: <code>{{index_full_path}}</code></p>
-    <label>Metadata assets path (relative to config file if not absolute)</label>
-    <input name="metadata_path" type="text" value="{{metadata_path}}" required />
+    <label for="settings-metadata-path">Metadata assets path (relative to config file if not absolute)</label>
+    <input id="settings-metadata-path" name="metadata_path" type="text" value="{{metadata_path}}" required />
     <p class="hint">Default metadata location: <code>{{metadata_full_path}}</code></p>
     <div class="divider"></div>
-    <label>Log directory (relative to config file if not absolute)</label>
-    <input name="log_dir" type="text" value="{{log_dir}}" required />
+    <label for="settings-log-dir">Log directory (relative to config file if not absolute)</label>
+    <input id="settings-log-dir" name="log_dir" type="text" value="{{log_dir}}" required />
     <p class="hint">Default log directory: <code>{{log_full_path}}</code>. Restart to apply changes.</p>
-    <div class="divider"></div>
+  </div>
+  <div class="card server-card">
+    <h2>Server</h2>
+    <div class="field-row">
+      <label for="port">API port (HTTPS)</label>
+      <input id="port" name="port" type="number" min="1" max="65535" value="{{port}}" required />
+    </div>
+    <div class="field-row">
+      <label for="admin_port">Admin port (HTTPS)</label>
+      <input
+        id="admin_port"
+        name="admin_port"
+        type="number"
+        min="1"
+        max="65535"
+        value="{{admin_port}}"
+        required
+      />
+    </div>
+    <div class="field-row">
+      <label for="admin_bind_addr">Admin bind IP</label>
+      <input id="admin_bind_addr" name="admin_bind_addr" type="text" value="{{admin_bind_addr}}" placeholder="0.0.0.0" required />
+    </div>
+    <div class="field-row">
+      <label for="quic_port">QUIC port</label>
+      <input
+        id="quic_port"
+        name="quic_port"
+        type="number"
+        min="1"
+        max="65535"
+        value="{{quic_port}}"
+        required
+      />
+    </div>
+    <div class="field-row">
+      <label for="session_ttl_secs">Session TTL (seconds)</label>
+      <input
+        id="session_ttl_secs"
+        name="session_ttl_secs"
+        type="number"
+        min="1"
+        value="{{session_ttl_secs}}"
+        required
+      />
+    </div>
+  </div>
+  <div class="card">
+    <h2>Library watcher</h2>
+    <label class="row">
+      <input name="watch_music" type="checkbox" {{watch_checked}} />
+      Watch music folder for changes
+    </label>
+    <label for="settings-watch-debounce-secs">Watch debounce (seconds)</label>
+    <input id="settings-watch-debounce-secs" name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
+  </div>
+  <div class="card">
+    <h2>Logging</h2>
+    <label class="row">
+      <input
+        name="log_debug_enabled"
+        type="checkbox"
+        id="log-debug-toggle"
+        data-ignore-dirty="true"
+        {{log_debug_checked}}
+      />
+      Enable debug logging (live)
+    </label>
+    <p class="hint">Applies immediately and can be noisy. Stored in the log file.</p>
+  </div>
+  <div class="card">
+    <h2>Listening stats</h2>
+    <label class="row">
+      <input name="stats_collection_enabled" type="checkbox" {{stats_collection_checked}} />
+      Enable per-user listening stats (monthly + yearly)
+    </label>
+    <p class="hint">Disabled by default. When enabled, the server aggregates playtime by month/year.</p>
+  </div>
+  <div class="card">
+    <div class="row space-between">
+      <div>
+        <h2>External metadata</h2>
+        <p class="muted">Add providers to fill missing summaries and genres.</p>
+      </div>
+      <button class="button ghost" type="button" id="open-metadata-add">Add source</button>
+    </div>
+    <div class="source-list" id="metadata-sources">
+      {{metadata_sources}}
+    </div>
+    <label for="settings-external-metadata-min-interval-secs">Retry interval (seconds)</label>
+    <input id="settings-external-metadata-min-interval-secs"
+      name="external_metadata_min_interval_secs"
+      type="number"
+      min="1"
+      value="{{external_min_interval_secs}}"
+      required
+    />
+    <label for="settings-external-metadata-timeout-secs">Request timeout (seconds)</label>
+    <input id="settings-external-metadata-timeout-secs"
+      name="external_metadata_timeout_secs"
+      type="number"
+      min="1"
+      value="{{external_timeout_secs}}"
+      required
+    />
+    <label class="row">
+      <input name="external_metadata_on_tag_error" type="checkbox" {{external_tag_error_checked}} />
+      Enrich when tag reading fails
+    </label>
+    <label for="settings-external-metadata-scan-limit">Max items to enrich per scan phase</label>
+    <input id="settings-external-metadata-scan-limit" name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
+    <p class="hint">
+      Normal scans apply this limit separately to artists, MusicBrainz album-artist fixes, and albums.
+      Reindex ignores the limit.
+    </p>
+  </div>
+  <div class="card">
+    <h2>Library maintenance</h2>
     <div class="stack">
       <p class="muted">
         Scan checks for new files and missing metadata. Reindex clears the index and all downloaded
@@ -55,114 +171,15 @@
       </div>
     </div>
   </div>
-  <div class="card server-card">
-    <h3>Server</h3>
-    <div class="field-row">
-      <label for="port">Port</label>
-      <input id="port" name="port" type="number" min="1" max="65535" value="{{port}}" required />
-    </div>
-    <div class="field-row">
-      <label for="quic_port">QUIC port</label>
-      <input
-        id="quic_port"
-        name="quic_port"
-        type="number"
-        min="1"
-        max="65535"
-        value="{{quic_port}}"
-        required
-      />
-    </div>
-    <p class="hint">QUIC port must be different from the HTTP port.</p>
-    <div class="field-row">
-      <label for="session_ttl_secs">Session TTL (seconds)</label>
-      <input
-        id="session_ttl_secs"
-        name="session_ttl_secs"
-        type="number"
-        min="1"
-        value="{{session_ttl_secs}}"
-        required
-      />
-    </div>
-  </div>
-  <div class="card">
-    <h3>Library watcher</h3>
-    <label class="row">
-      <input name="watch_music" type="checkbox" {{watch_checked}} />
-      Watch music folder for changes
-    </label>
-    <label>Watch debounce (seconds)</label>
-    <input name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
-  </div>
-  <div class="card">
-    <h3>Logging</h3>
-    <label class="row">
-      <input
-        name="log_debug_enabled"
-        type="checkbox"
-        id="log-debug-toggle"
-        data-ignore-dirty="true"
-        {{log_debug_checked}}
-      />
-      Enable debug logging (live)
-    </label>
-    <p class="hint">Applies immediately and can be noisy. Stored in the log file.</p>
-  </div>
-  <div class="card">
-    <h3>Listening stats</h3>
-    <label class="row">
-      <input name="stats_collection_enabled" type="checkbox" {{stats_collection_checked}} />
-      Enable per-user listening stats (monthly + yearly)
-    </label>
-    <p class="hint">Disabled by default. When enabled, the server aggregates playtime by month/year.</p>
-  </div>
-  <div class="card" id="metadata-card">
-    <div class="row space-between">
-      <div>
-        <h3>External metadata</h3>
-        <p class="muted">Add providers to fill missing summaries and genres.</p>
-      </div>
-      <button class="button ghost" type="button" id="open-metadata-add">Add source</button>
-    </div>
-    <div class="source-list" id="metadata-sources">
-      {{metadata_sources}}
-    </div>
-    <label>Retry interval (seconds)</label>
-    <input
-      name="external_metadata_min_interval_secs"
-      type="number"
-      min="1"
-      value="{{external_min_interval_secs}}"
-      required
-    />
-    <label>Request timeout (seconds)</label>
-    <input
-      name="external_metadata_timeout_secs"
-      type="number"
-      min="1"
-      value="{{external_timeout_secs}}"
-      required
-    />
-    <label class="row">
-      <input name="external_metadata_on_tag_error" type="checkbox" {{external_tag_error_checked}} />
-      Enrich when tag reading fails
-    </label>
-    <label>Max items to enrich per scan phase</label>
-    <input name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
-    <p class="hint">
-      Normal scans apply this limit separately to artists, MusicBrainz album-artist fixes, and albums.
-      Reindex ignores the limit.
-    </p>
-  </div>
 </form>
-<div class="card">
+<div class="card settings-save" id="settings-save-bar" hidden>
   <div class="row space-between">
     <div>
-      <h3>Save changes</h3>
+      <h2 id="settings-save-status" aria-live="polite">No unsaved changes</h2>
       <p class="muted">Settings apply immediately except port and index path.</p>
     </div>
     <button type="submit" form="settings" id="save-settings" class="button" disabled>Save settings</button>
   </div>
 </div>
+<div id="settings-error" class="inline-error" role="alert">{{message}}</div>
 {{modals}}

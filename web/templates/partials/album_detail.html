@@ -1,30 +1,32 @@
 <div class="detail-shell">
+  <a class="button ghost detail-back" data-library-link href="/library?filter=albums">Back to albums</a>
   <div class="card detail-album">
     {{cover}}
     <div class="detail-album-body">
       <div class="detail-section-title">
         <div>
-          <h3>{{title}}</h3>
-          <p class="muted"><a href="{{artist_link}}">{{artist_name}}</a></p>
+          <h2>{{title}}</h2>
+          <p class="muted">{{artist_credits_html}}</p>
         </div>
       </div>
       <div class="meta-grid">
         <div class="meta-row"><span class="meta-label">Year</span><span class="meta-value">{{year}}</span></div>
-        <div class="meta-row"><span class="meta-label">Genres</span><span class="meta-value">{{genres}}</span></div>
-        <div class="meta-row"><span class="meta-label">Folder</span><span class="meta-value"><code>{{folder}}</code></span></div>
+        <div class="meta-row"><span class="meta-label">Album genres</span><span class="meta-value">{{genres}}</span></div>
+        <div class="meta-row"><span class="meta-label">Artist genres</span><span class="meta-value">{{artist_genres}}</span></div>
+        <div class="meta-row"><span class="meta-label">Folder</span><span class="meta-value"><code class="detail-path">{{folder}}</code></span></div>
       </div>
     </div>
   </div>
   <div class="card detail-bio">
     <div class="detail-section-title">
-      <h3>Summary</h3>
+      <h2>Summary</h2>
     </div>
     <p class="detail-text">{{summary}}</p>
   </div>
   <div class="card detail-tracks">
     <div class="detail-section-title">
-      <h3>Tracks</h3>
+      <h2>Tracks</h2>
     </div>
-    {{track_table}}
+    <div class="table-scroll" role="region" aria-label="Album tracks" tabindex="0">{{track_table}}</div>
   </div>
 </div>

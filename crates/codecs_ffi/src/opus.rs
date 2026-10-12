@@ -15,6 +15,7 @@ pub struct OpusDecoder {
 const OPUS_OK: c_int = 0;
 const OPUS_APPLICATION_AUDIO: c_int = 2049;
 const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+const OPUS_GET_LOOKAHEAD_REQUEST: c_int = 4027;
 const OPUS_MAX_FRAME_SIZE: usize = 5760;
 
 extern "C" {
@@ -138,6 +139,17 @@ impl OpusEncoderWrapper {
             return Err(OpusEncodeError::EncodeFailed);
         }
         Ok(())
+    }
+
+    /// Encoder delay, in samples per channel, which a fresh decoder must discard.
+    pub fn lookahead(&self) -> Result<u32, OpusEncodeError> {
+        let mut samples: c_int = 0;
+        let result =
+            unsafe { opus_encoder_ctl(self.encoder, OPUS_GET_LOOKAHEAD_REQUEST, &mut samples) };
+        if result != OPUS_OK || samples < 0 {
+            return Err(OpusEncodeError::EncodeFailed);
+        }
+        Ok(samples as u32)
     }
 
     pub fn encode(&mut self, pcm: &[i16], frame_size: usize) -> Result<Vec<u8>, OpusEncodeError> {

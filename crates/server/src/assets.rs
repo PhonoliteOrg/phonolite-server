@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
@@ -143,9 +144,39 @@ async fn ensure_cover_cached(
 ) -> Result<PathBuf, String> {
     let metadata_root = metadata_root_path(state);
     let cache_dir = metadata_root.join("covers");
-    if !cache_dir.exists() {
-        let _ = tokio::fs::create_dir_all(&cache_dir).await;
-    }
+    ensure_cover_cached_at(&cache_dir, key, source).await
+}
+
+async fn cover_source_fingerprint(source: &CoverSource) -> Result<String, String> {
+    let (kind, path) = match source {
+        CoverSource::Embedded(path) => ("embedded", path),
+        CoverSource::File(path) => ("file", path),
+        CoverSource::External(path) => ("external", path),
+    };
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|err| format!("failed to read cover source metadata: {err}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|err| format!("failed to read cover source modification time: {err}"))?;
+    let bytes = serde_json::to_vec(&(kind, path, metadata.len(), modified))
+        .map_err(|err| format!("failed to fingerprint cover source: {err}"))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+async fn ensure_cover_cached_at(
+    cache_dir: &Path,
+    key: &CoverCacheKey,
+    source: CoverSource,
+) -> Result<PathBuf, String> {
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .map_err(|err| format!("failed to create cover cache: {err}"))?;
+    // The endpoint ID stays stable while the artwork source can change.
+    // Include source kind, path, size and modification time in the disk key.
+    // Separate generations also avoid concurrent requests overwriting one
+    // another's cached source while files are being rescanned.
+    let fingerprint = cover_source_fingerprint(&source).await?;
 
     let (id, prefix) = match key {
         CoverCacheKey::Album(id) => (id.clone(), "album".to_string()),
@@ -154,19 +185,24 @@ async fn ensure_cover_cached(
     };
 
     for ext in ["jpg", "png", "webp", "gif"] {
-        let filename = format!("{}-{}.{}", prefix, id, ext);
+        let filename = format!("{}-{}.{}.{}", prefix, id, fingerprint, ext);
         let path = cache_dir.join(filename);
         if path.exists() {
             return Ok(path);
         }
     }
 
-    let (data, mime) = fetch_cover(source).await?;
+    let (data, mime) = fetch_cover(source.clone()).await?;
+    if cover_source_fingerprint(&source).await? != fingerprint {
+        return Err("cover source changed while reading".to_owned());
+    }
 
     let ext = image_ext_from_mime(&mime).unwrap_or("jpg");
-    let filename = format!("{}-{}.{}", prefix, id, ext);
+    let filename = format!("{}-{}.{}.{}", prefix, id, fingerprint, ext);
     let path = cache_dir.join(filename);
-    let _ = tokio::fs::write(&path, &data).await;
+    tokio::fs::write(&path, &data)
+        .await
+        .map_err(|err| format!("failed to store cached cover: {err}"))?;
 
     Ok(path)
 }
@@ -222,7 +258,8 @@ pub fn cover_response(data: Vec<u8>, mime: &str) -> Response {
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000"),
+        // Cover URLs are stable, but their artwork and attribution can change.
+        HeaderValue::from_static("private, no-cache"),
     );
     response
 }
@@ -251,8 +288,37 @@ pub async fn prune_stale_metadata_assets(
     let track_ids = load_track_ids(library)?;
 
     let mut stats = MetadataAssetPruneStats::default();
-    stats.removed_files +=
-        prune_cover_cache(&root.join("covers"), &artist_ids, &album_ids, &track_ids).await?;
+    let metadata_root = &root;
+    stats.removed_files += prune_cover_cache(
+        &root.join("covers"),
+        &artist_ids,
+        &album_ids,
+        &track_ids,
+        |key| async move {
+            let source = match key {
+                CoverCacheKey::Album(id) => library
+                    .get_album(&id)
+                    .ok()
+                    .flatten()
+                    .and_then(|album| album.cover_ref)
+                    .and_then(|cover| resolve_cover_source(library, &cover).ok().flatten()),
+                CoverCacheKey::Track(id) => {
+                    resolve_cover_source(library, &CoverRef::Embedded { track_id: id })
+                        .ok()
+                        .flatten()
+                }
+                CoverCacheKey::Artist { id, variant } => match variant.as_str() {
+                    "logo" => resolve_artist_logo_source(library, metadata_root, &id),
+                    "banner" => resolve_artist_banner_source(library, metadata_root, &id),
+                    _ => resolve_artist_cover_source(library, metadata_root, &id),
+                }
+                .ok()
+                .flatten(),
+            }?;
+            cover_source_fingerprint(&source).await.ok()
+        },
+    )
+    .await?;
     stats.removed_files += prune_flat_artist_assets(&root.join("logos"), &artist_ids).await?;
     stats.removed_files += prune_flat_artist_assets(&root.join("banners"), &artist_ids).await?;
     stats.removed_dirs += prune_legacy_artist_assets(&root.join("artists"), &artist_ids).await?;
@@ -261,11 +327,11 @@ pub async fn prune_stale_metadata_assets(
 
 fn load_artist_ids(library: &Library) -> Result<HashSet<String>, String> {
     let mut ids = HashSet::new();
-    let mut offset = 0usize;
+    let mut cursor = None;
     let page_size = 500usize;
     loop {
         let (items, total) = library
-            .list_artists(None, page_size, offset)
+            .page_artists(&mut cursor, page_size)
             .map_err(|e| e.to_string())?;
         for item in items {
             ids.insert(item.id);
@@ -273,18 +339,17 @@ fn load_artist_ids(library: &Library) -> Result<HashSet<String>, String> {
         if ids.len() >= total {
             break;
         }
-        offset = ids.len();
     }
     Ok(ids)
 }
 
 fn load_album_ids(library: &Library) -> Result<HashSet<String>, String> {
     let mut ids = HashSet::new();
-    let mut offset = 0usize;
+    let mut cursor = None;
     let page_size = 500usize;
     loop {
         let (items, total) = library
-            .list_albums(None, page_size, offset)
+            .page_albums(&mut cursor, page_size)
             .map_err(|e| e.to_string())?;
         for item in items {
             ids.insert(item.id);
@@ -292,18 +357,17 @@ fn load_album_ids(library: &Library) -> Result<HashSet<String>, String> {
         if ids.len() >= total {
             break;
         }
-        offset = ids.len();
     }
     Ok(ids)
 }
 
 fn load_track_ids(library: &Library) -> Result<HashSet<String>, String> {
     let mut ids = HashSet::new();
-    let mut offset = 0usize;
+    let mut cursor = None;
     let page_size = 1000usize;
     loop {
         let (items, total) = library
-            .list_tracks(None, page_size, offset)
+            .page_tracks(&mut cursor, page_size)
             .map_err(|e| e.to_string())?;
         for item in items {
             ids.insert(item.id);
@@ -311,17 +375,21 @@ fn load_track_ids(library: &Library) -> Result<HashSet<String>, String> {
         if ids.len() >= total {
             break;
         }
-        offset = ids.len();
     }
     Ok(ids)
 }
 
-async fn prune_cover_cache(
+async fn prune_cover_cache<F, Fut>(
     dir: &Path,
     artist_ids: &HashSet<String>,
     album_ids: &HashSet<String>,
     track_ids: &HashSet<String>,
-) -> Result<usize, String> {
+    mut fingerprint: F,
+) -> Result<usize, String>
+where
+    F: FnMut(CoverCacheKey) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
     let mut removed = 0usize;
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -336,17 +404,46 @@ async fn prune_cover_cache(
         let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        let stale = if let Some(id) = stem.strip_prefix("album-") {
-            !album_ids.contains(id)
-        } else if let Some(id) = stem.strip_prefix("track-") {
-            !track_ids.contains(id)
-        } else if let Some(id) = stem.strip_prefix("artist-logo-") {
-            !artist_ids.contains(id)
-        } else if let Some(id) = stem.strip_prefix("artist-banner-") {
-            !artist_ids.contains(id)
+        // New cover cache names carry a source fingerprint after the ID.
+        let (identity, generation) = stem
+            .split_once('.')
+            .map_or((stem, None), |(id, generation)| (id, Some(generation)));
+        let (key, live) = if let Some(id) = identity.strip_prefix("album-") {
+            (CoverCacheKey::Album(id.to_owned()), album_ids.contains(id))
+        } else if let Some(id) = identity.strip_prefix("track-") {
+            (CoverCacheKey::Track(id.to_owned()), track_ids.contains(id))
+        } else if let Some(id) = identity.strip_prefix("artist-logo-") {
+            (
+                CoverCacheKey::Artist {
+                    id: id.to_owned(),
+                    variant: "logo".to_owned(),
+                },
+                artist_ids.contains(id),
+            )
+        } else if let Some(id) = identity.strip_prefix("artist-banner-") {
+            (
+                CoverCacheKey::Artist {
+                    id: id.to_owned(),
+                    variant: "banner".to_owned(),
+                },
+                artist_ids.contains(id),
+            )
+        } else if let Some(id) = identity.strip_prefix("artist-cover-") {
+            (
+                CoverCacheKey::Artist {
+                    id: id.to_owned(),
+                    variant: "cover".to_owned(),
+                },
+                artist_ids.contains(id),
+            )
         } else {
-            false
+            continue;
         };
+        let stale = !live
+            || match generation {
+                Some(generation) => fingerprint(key).await.as_deref() != Some(generation),
+                None => true, // Legacy cache bytes do not identify their source.
+            };
         if stale {
             tokio::fs::remove_file(&path)
                 .await
@@ -375,7 +472,9 @@ async fn prune_flat_artist_assets(
         let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !artist_ids.contains(stem) {
+        // Versioned image names and URL source records start with the artist ID.
+        let artist_id = stem.split('.').next().unwrap_or(stem);
+        if !artist_ids.contains(artist_id) {
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -411,4 +510,178 @@ async fn prune_legacy_artist_assets(
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("phonolite-artwork-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cover_cache_reuses_unchanged_sources_and_refreshes_changed_files_and_refs() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("cover.jpg");
+        let cache = dir.0.join("covers");
+        tokio::fs::write(&source, b"original artwork")
+            .await
+            .unwrap();
+        let key = CoverCacheKey::Album("album".to_owned());
+        let first = ensure_cover_cached_at(&cache, &key, CoverSource::File(source.clone()))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&first).await.unwrap(), b"original artwork");
+
+        // Alter only the cached bytes to prove an unchanged source takes the
+        // cache path, rather than performing another extraction or copy.
+        tokio::fs::write(&first, b"cached generation")
+            .await
+            .unwrap();
+        let reused = ensure_cover_cached_at(&cache, &key, CoverSource::File(source.clone()))
+            .await
+            .unwrap();
+        assert_eq!(reused, first);
+        assert_eq!(
+            tokio::fs::read(&reused).await.unwrap(),
+            b"cached generation"
+        );
+
+        let old_modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+        tokio::fs::write(&source, b"updated artwork!")
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(old_modified + std::time::Duration::from_secs(1))
+            .unwrap();
+        let refreshed = ensure_cover_cached_at(&cache, &key, CoverSource::File(source.clone()))
+            .await
+            .unwrap();
+        assert_ne!(refreshed, first);
+        assert_eq!(
+            tokio::fs::read(&refreshed).await.unwrap(),
+            b"updated artwork!"
+        );
+
+        let replacement = dir.0.join("other-cover.jpg");
+        tokio::fs::write(&replacement, b"different referenced artwork")
+            .await
+            .unwrap();
+        let changed_ref = ensure_cover_cached_at(&cache, &key, CoverSource::File(replacement))
+            .await
+            .unwrap();
+        assert_ne!(changed_ref, refreshed);
+        assert_eq!(
+            tokio::fs::read(&changed_ref).await.unwrap(),
+            b"different referenced artwork"
+        );
+
+        tokio::fs::remove_file(&source).await.unwrap();
+        assert!(
+            ensure_cover_cached_at(&cache, &key, CoverSource::File(source))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_legacy_cover_cache_is_rebuilt_from_current_source() {
+        let dir = TestDirectory::new();
+        let source = dir.0.join("correct.jpg");
+        let cache = dir.0.join("covers");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("artist-logo-artist.jpg"), b"wrong old artist")
+            .await
+            .unwrap();
+        tokio::fs::write(&source, b"verified artist artwork")
+            .await
+            .unwrap();
+        let path = ensure_cover_cached_at(
+            &cache,
+            &CoverCacheKey::Artist {
+                id: "artist".to_owned(),
+                variant: "logo".to_owned(),
+            },
+            CoverSource::External(source),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            b"verified artist artwork"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_recognizes_versioned_artwork_and_source_records() {
+        let dir = TestDirectory::new();
+        for name in [
+            "album-live.fingerprint.jpg",
+            "album-live.oldfingerprint.jpg",
+            "album-live.jpg",
+            "album-removed.fingerprint.jpg",
+            "artist-cover-removed.fingerprint.png",
+        ] {
+            tokio::fs::write(dir.0.join(name), b"image").await.unwrap();
+        }
+        let albums = HashSet::from(["live".to_owned()]);
+        assert_eq!(
+            prune_cover_cache(
+                &dir.0,
+                &HashSet::new(),
+                &albums,
+                &HashSet::new(),
+                |_| async { Some("fingerprint".to_owned()) }
+            )
+            .await
+            .unwrap(),
+            4
+        );
+        assert!(dir.0.join("album-live.fingerprint.jpg").exists());
+
+        let flat = dir.0.join("logos");
+        tokio::fs::create_dir_all(&flat).await.unwrap();
+        for name in [
+            "live.content.jpg",
+            "live.source",
+            "removed.content.jpg",
+            "removed.source",
+        ] {
+            tokio::fs::write(flat.join(name), b"asset").await.unwrap();
+        }
+        assert_eq!(
+            prune_flat_artist_assets(&flat, &HashSet::from(["live".to_owned()]))
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(flat.join("live.content.jpg").exists());
+        assert!(flat.join("live.source").exists());
+    }
+
+    #[test]
+    fn stable_cover_urls_require_http_cache_revalidation() {
+        let response = cover_response(vec![1, 2, 3], "image/png");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-cache"
+        );
+    }
 }

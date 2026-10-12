@@ -8,6 +8,7 @@ fn metadata_provider_support_retry_policy_and_rate_limit_are_encoded() {
         "crates/server/src/external.rs",
         "crates/server/src/musicbrainz_rate_limit.rs",
         "crates/server/src/musicbrainz_album_artists.rs",
+        "crates/server/src/musicbrainz_http.rs",
     ]);
 
     assert_contains_all(
@@ -18,9 +19,11 @@ fn metadata_provider_support_retry_policy_and_rate_limit_are_encoded() {
             "\"theaudiodb\" | \"audio_db\" | \"audiodb\"",
             "\"musicbrainz\" | \"music_brainz\" | \"mb\"",
             "const MUSICBRAINZ_REQUEST_INTERVAL: Duration = Duration::from_secs(1);",
-            "let tries = 6usize;",
+            "const MAX_ATTEMPTS: usize = 6;",
+            "for attempt in 0..MAX_ATTEMPTS",
             "status.as_u16() == 429 || status.is_server_error()",
-            "tokio::time::sleep(Duration::from_millis(1000 + (attempt as u64 * 500))).await;",
+            "Duration::from_millis(1000 + (attempt as u64 * 500))",
+            "tokio::time::sleep(retry_delay(attempt)).await;",
             ".header(\"User-Agent\", user_agent)",
             "MusicBrainzAlbumArtistResolver",
             "wait_for_slot().await",
@@ -29,7 +32,7 @@ fn metadata_provider_support_retry_policy_and_rate_limit_are_encoded() {
 }
 
 #[test]
-fn metadata_assets_cover_cache_and_long_lived_cache_headers_are_present() {
+fn metadata_assets_cover_cache_and_refreshable_cache_headers_are_present() {
     let source = read_repo_files(&["crates/server/src/scan.rs", "crates/server/src/assets.rs"]);
 
     assert_contains_all(
@@ -48,7 +51,7 @@ fn metadata_assets_cover_cache_and_long_lived_cache_headers_are_present() {
             "\"logo\" => (\"logos\", \"logo\")",
             "\"banner\" => (\"banners\", \"banner\")",
             "metadata_root.join(\"covers\")",
-            "HeaderValue::from_static(\"public, max-age=31536000\")",
+            "HeaderValue::from_static(\"private, no-cache\")",
             "CoverSource::Embedded",
             "CoverSource::File",
             "CoverSource::External",
@@ -138,6 +141,7 @@ fn auth_roles_session_tokens_and_admin_cookie_flows_match_requirements() {
         "crates/server/src/auth.rs",
         "crates/server/src/admin/mod.rs",
         "crates/server/src/admin/auth.rs",
+        "crates/server/src/http.rs",
     ]);
 
     assert_contains_all(
@@ -148,14 +152,17 @@ fn auth_roles_session_tokens_and_admin_cookie_flows_match_requirements() {
             "Admin",
             "User",
             "pub disabled: bool,",
-            "username.trim().is_empty()",
+            "username.is_empty() || username.len() > 128",
             "user.username.eq_ignore_ascii_case(username)",
             "if user.disabled {",
             "let expires_at = now + self.session_ttl.as_secs();",
-            "let mut hasher = Sha256::new();",
+            "Sha256::digest(token.as_bytes())",
+            "struct StoredSession {",
+            "TableDefinition::new(\"auth_users_v1\")",
+            "AuthError::IncompatibleSchema",
             "phonolite_session",
             "HttpOnly; SameSite=Strict; Max-Age={}",
-            "phonolite_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+            "phonolite_session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
             "state.auth.create_superadmin(&form.username, &form.password)",
             "state.auth.create_session(&user.id)",
             "clear_session_cookie()",

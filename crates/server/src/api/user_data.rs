@@ -8,9 +8,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::assets::cover_response;
+use crate::http::{json_error, json_error_response};
 use crate::state::{AppState, CreatePlaylistRequest, JsonResult, Playlist, UpdatePlaylistRequest};
 use crate::user_data::LikeState;
-use crate::utils::{json_error, json_error_response};
 
 const MAX_PLAYLIST_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 

@@ -6,8 +6,8 @@ use axum::{
     Extension, Json,
 };
 
+use crate::http::json_error;
 use crate::state::{AppState, ArtistQuery, AuthContext, JsonResult, ListResponse, Playlist};
-use crate::utils::json_error;
 
 use super::{
     library_or_json_error,
@@ -27,20 +27,39 @@ pub async fn list_artists(
     let offset = params.offset.unwrap_or(0);
     let search = params.search.as_deref();
 
-    let (artists, total) = match library.list_artists(search, limit, offset) {
-        Ok(value) => value,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
+    let (artists, total) =
+        match library.list_artists_for_browse(search, limit, offset, params.include_contributors) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("library error: {}", err),
+                ))
+            }
+        };
 
     let items = build_artist_views(&library, artists)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     Ok(Json(ListResponse { items, total }))
+}
+
+pub async fn list_artist_releases(
+    State(state): State<AppState>,
+    Extension(_ctx): Extension<AuthContext>,
+    AxumPath(artist_id): AxumPath<String>,
+) -> JsonResult<crate::library_views::ArtistReleasesView> {
+    let library = library_or_json_error(&state)?;
+    if library
+        .get_artist(&artist_id)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .is_none()
+    {
+        return Err(json_error(StatusCode::NOT_FOUND, "artist not found"));
+    }
+    crate::library_views::build_artist_releases_view(&library, &artist_id)
+        .map(Json)
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))
 }
 
 pub async fn list_artist_albums(
@@ -86,9 +105,12 @@ pub async fn get_artist(
 ) -> JsonResult<ArtistView> {
     let library = library_or_json_error(&state)?;
     match library.get_artist(&artist_id) {
-        Ok(Some(artist)) => build_artist_view(&library, artist)
-            .map(Json)
-            .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err)),
+        Ok(Some(artist)) => {
+            crate::scan::schedule_artist_enrichment(&state, &library, &artist);
+            build_artist_view(&library, artist)
+                .map(Json)
+                .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))
+        }
         Ok(None) => Err(json_error(
             StatusCode::NOT_FOUND,
             "artist not found".to_string(),

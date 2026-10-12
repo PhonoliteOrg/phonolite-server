@@ -1,42 +1,50 @@
 <header class="nav {{nav_class}}">
-  <div class="brand">
-    <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png" alt="Phonolite logo" />
-    <div>
-      <div class="brand-title">Phonolite</div>
-      <div class="brand-sub">admin console</div>
-    </div>
-  </div>
-  <div class="nav-links">
-    <a href="/library">Library</a>
-    <a href="/">Users</a>
-    <a href="/activity" class="nav-activity">Activity<span class="nav-badge" id="activity-badge" hidden>0</span></a>
-    <a href="/logs">Logs</a>
-    <a href="/settings">Settings</a>
+  <button class="navigation-toggle" id="navigation-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation-drawer">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+  </button>
+  <a class="brand mobile-brand" href="/" aria-label="Phonolite administration">
+    <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png" alt="" />
+    <span><span class="brand-title">Phonolite</span><span class="brand-sub">Server console</span></span>
+  </a>
+  <div class="navigation-drawer" id="navigation-drawer" aria-label="Navigation">
+    <div class="navigation-backdrop" id="navigation-backdrop" aria-hidden="true"></div>
+    <div class="nav-panel">
+      <div class="nav-panel-header">
+        <a class="brand" href="/" aria-label="Phonolite administration">
+          <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png" alt="" />
+          <span><span class="brand-title">Phonolite</span><span class="brand-sub">Server console</span></span>
+        </a>
+        <button class="navigation-close" id="navigation-close" type="button" aria-label="Close navigation">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
+        </button>
+      </div>
+  <nav class="nav-links" id="primary-nav" aria-label="Primary">
+    <a href="/library" {{nav_library_current}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16M9 4v16M14 4v16M18 4l3 16" /></svg><span>Library</span></a>
+    <a href="/users" {{nav_users_current}}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 4v2"/></svg><span>Users</span></a>
+    <a href="/logs" {{nav_logs_current}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5zM9 11h6M9 15h6M9 7h2"/></svg><span>Logs</span></a>
+    <a href="/settings" {{nav_settings_current}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg><span>Settings</span></a>
     <div class="nav-menu">
-      <button class="button ghost nav-icon" type="button" id="nav-menu-toggle" aria-label="Admin actions">
-        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path d="M12 2v8"/>
-          <path d="M7.03 4.47a9 9 0 1 0 9.94 0"/>
-        </svg>
+      <p id="library-index-status" class="nav-library-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      <button class="button ghost nav-icon" type="button" id="nav-menu-toggle" aria-haspopup="dialog" aria-controls="nav-modal">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v8M7.03 4.47a9 9 0 1 0 9.94 0"/></svg><span>Server actions</span>
       </button>
+    </div>
+  </nav>
+      <p id="navigation-error" class="inline-error" role="alert"></p>
     </div>
   </div>
 </header>
-<div class="modal" id="nav-modal" aria-hidden="true">
+<div class="modal" id="nav-modal" role="dialog" aria-modal="true" aria-labelledby="nav-modal-title" aria-hidden="true">
   <div class="modal-backdrop" data-modal-close></div>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <div class="modal-header">
-      <h3>Admin actions</h3>
-      <button class="modal-close" type="button" data-modal-close aria-label="Close">
-        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path d="M18 6 6 18M6 6l12 12" />
-        </svg>
-      </button>
+      <h2 id="nav-modal-title">Server actions</h2>
+      <button class="modal-close" type="button" data-modal-close aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
     </div>
+    <p class="muted">Manage this server or end your admin session.</p>
+    <p id="server-action-error" class="inline-error" role="alert"></p>
     <div class="stack">
-      <form method="post" action="/logout">
-        <button class="nav-item" type="submit">Log out</button>
-      </form>
+      <form method="post" action="/logout"><button class="nav-item" type="submit">Log out</button></form>
       <button class="nav-item" type="button" data-action="restart">Restart server</button>
       <button class="nav-item danger" type="button" data-action="shutdown">Shut down</button>
     </div>

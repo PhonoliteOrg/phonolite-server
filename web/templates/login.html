@@ -1,16 +1,13 @@
-<div class="card auth-card">
-  <div class="page-title">
-    <div>
-      <h2>Admin login</h2>
-      <p class="muted">Sign in to manage users and server settings.</p>
-    </div>
-  </div>
-  {{message}}
+<section class="auth-card" aria-labelledby="auth-title">
+  <div class="auth-brand"><img src="/assets/img/phonolite-logo-nobackground.png" alt="" /><span>Phonolite</span></div>
+  <div class="page-title"><div>
+    <h1 id="auth-title">Welcome back</h1>
+    <p class="muted">Sign in to manage your library and server.</p>
+  </div></div>
   <form method="post" action="/login" class="stack">
-    <label>Username</label>
-    <input name="username" type="text" required />
-    <label>Password</label>
-    <input name="password" type="password" required />
-    <button type="submit">Sign in</button>
+    <div class="form-group"><label for="login-username">Username</label><input id="login-username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required /></div>
+    <div class="form-group"><label for="login-password">Password</label><input id="login-password" name="password" type="password" autocomplete="current-password" required /></div>
+    <div id="auth-error" class="inline-error{{error_class}}" role="alert">{{error}}</div>
+    <button class="button primary" type="submit">Sign in</button>
   </form>
-</div>
+</section>

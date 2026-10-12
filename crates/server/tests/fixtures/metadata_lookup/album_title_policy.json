@@ -1,0 +1,19 @@
+[
+  {"local_title":"Chopin : Nocturnes (1999 remastered)","expected_base":"Chopin : Nocturnes","expected_queries":["Chopin : Nocturnes","Chopin: Nocturnes"],"provider_title":"Nocturnes","provider_title_equivalent":false},
+  {"local_title":"The Bee Gee's Sing & Play 14 Barry Gibb Songs","expected_base":"The Bee Gee's Sing & Play 14 Barry Gibb Songs","expected_queries":["The Bee Gee's Sing and Play 14 Barry Gibb Songs"],"provider_title":"The Bee Gees Sing and Play 14 Barry Gibb Songs","provider_title_equivalent":false},
+  {"local_title":"The Marshall Mathers LP2","expected_base":"The Marshall Mathers LP2","expected_queries":["The Marshall Mathers LP 2"],"provider_title":"The Marshall Mathers LP 2","provider_title_equivalent":true},
+  {"local_title":"Music To Be Murdered By (Explicit)","expected_base":"Music To Be Murdered By","expected_queries":["Music To Be Murdered By"],"provider_title":"Music to Be Murdered By","provider_title_equivalent":true},
+  {"local_title":"Music To Be Murdered By - Side B (Deluxe Edition) (Explicit)","expected_base":"Music To Be Murdered By - Side B","expected_queries":["Music To Be Murdered By - Side B"],"provider_title":"Music to Be Murdered By","provider_title_equivalent":false},
+  {"local_title":"Vivaldi: The Four Seasons","expected_base":"Vivaldi: The Four Seasons","expected_queries":[],"provider_title":"The Four Seasons","provider_title_equivalent":false},
+  {"local_title":"Watch The Throne","expected_base":"Watch The Throne","expected_queries":[],"provider_title":"Watch the Throne","provider_title_equivalent":true},
+  {"local_title":"Untitled (Deluxe)","expected_base":"Untitled","expected_queries":["Untitled","[Untitled]"],"provider_title":"[untitled]","provider_title_equivalent":true},
+  {"local_title":"Gershwin: Rhapsody in Blue","expected_base":"Gershwin: Rhapsody in Blue","expected_queries":[],"provider_title":"Rhapsody in Blue / An American in Paris","provider_title_equivalent":false},
+  {"local_title":"Minutes To Midnight (Explicit)","expected_base":"Minutes To Midnight","expected_queries":["Minutes To Midnight"],"provider_title":"Minutes to Midnight","provider_title_equivalent":true},
+  {"local_title":"Rachmaninov : 24 Preludes","expected_base":"Rachmaninov : 24 Preludes","expected_queries":["Rachmaninov: 24 Preludes"],"provider_title":"24 Preludes","provider_title_equivalent":false},
+  {"local_title":"[Love Symbol]","expected_base":"[Love Symbol]","expected_queries":["Love Symbol"],"provider_title":"Symbol Album","provider_title_equivalent":false},
+  {"local_title":"Around The World In A Day (Deluxe Expanded Edition)","expected_base":"Around The World In A Day","expected_queries":["Around The World In A Day"],"provider_title":"Around the World in a Day","provider_title_equivalent":true},
+  {"local_title":"The Best Of Both Worlds","expected_base":"The Best Of Both Worlds","expected_queries":[],"provider_title":"The Best of Both Worlds","provider_title_equivalent":true},
+  {"local_title":"Unfinished Business","expected_base":"Unfinished Business","expected_queries":[],"provider_title":"Unfinished Business","provider_title_equivalent":true},
+  {"local_title":"Red Hot Chili Peppers","expected_base":"Red Hot Chili Peppers","expected_queries":[],"provider_title":"The Red Hot Chili Peppers","provider_title_equivalent":false},
+  {"local_title":"Flower Boy","expected_base":"Flower Boy","expected_queries":[],"provider_title":"Scum Fuck Flower Boy","provider_title_equivalent":false}
+]

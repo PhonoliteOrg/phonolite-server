@@ -161,14 +161,14 @@ impl LogOutputs {
 
     fn writer_for(&self, meta: &Metadata<'_>) -> MultiWriter {
         let mut writers = Vec::with_capacity(2);
-        writers.push(self.all.clone());
         let target = meta.target();
-        if target == "activity" {
-            writers.push(self.activities.clone());
-            return MultiWriter { writers };
-        }
         if target == "issue" {
             writers.push(self.issues.clone());
+            return MultiWriter { writers };
+        }
+        writers.push(self.all.clone());
+        if target == "activity" {
+            writers.push(self.activities.clone());
             return MultiWriter { writers };
         }
         match *meta.level() {
@@ -377,5 +377,86 @@ fn make_filter(debug_enabled: bool) -> EnvFilter {
         EnvFilter::new("debug")
     } else {
         EnvFilter::new("info")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestLogDirectory(PathBuf);
+
+    impl Drop for TestLogDirectory {
+        fn drop(&mut self) {
+            for name in [
+                LOG_ALL_FILE,
+                LOG_INFO_FILE,
+                LOG_WARN_FILE,
+                LOG_ERROR_FILE,
+                LOG_ISSUE_FILE,
+                LOG_ACTIVITY_FILE,
+                LOG_DEBUG_FILE,
+            ] {
+                let _ = fs::remove_file(self.0.join(name));
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn indexing_issues_stay_in_their_file_and_managed_logs_can_be_cleared() {
+        let directory = TestLogDirectory(
+            std::env::temp_dir().join(format!("phonolite-logging-{}", uuid::Uuid::new_v4())),
+        );
+        let outputs = LogOutputs::new(&directory.0).unwrap();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(LogFormatter::new())
+                .with_writer(outputs.clone())
+                .with_ansi(false),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "issue", "indexing issue diagnostic");
+            tracing::warn!("ordinary warning diagnostic");
+            tracing::info!(target: "activity", "library activity diagnostic");
+        });
+
+        let managed_files = [
+            LOG_ALL_FILE,
+            LOG_INFO_FILE,
+            LOG_WARN_FILE,
+            LOG_ERROR_FILE,
+            LOG_ISSUE_FILE,
+            LOG_ACTIVITY_FILE,
+            LOG_DEBUG_FILE,
+        ];
+        for name in managed_files {
+            let contents = fs::read_to_string(directory.0.join(name)).unwrap();
+            assert_eq!(
+                contents.contains("indexing issue diagnostic"),
+                name == LOG_ISSUE_FILE,
+                "indexing issue routing for {name}"
+            );
+            assert_eq!(
+                contents.contains("ordinary warning diagnostic"),
+                matches!(name, LOG_ALL_FILE | LOG_WARN_FILE),
+                "ordinary warning routing for {name}"
+            );
+            assert_eq!(
+                contents.contains("library activity diagnostic"),
+                matches!(name, LOG_ALL_FILE | LOG_ACTIVITY_FILE),
+                "activity routing for {name}"
+            );
+        }
+
+        outputs.clear_all().unwrap();
+        for name in managed_files {
+            assert_eq!(
+                fs::read_to_string(directory.0.join(name)).unwrap(),
+                "",
+                "managed log was not cleared: {name}"
+            );
+        }
     }
 }

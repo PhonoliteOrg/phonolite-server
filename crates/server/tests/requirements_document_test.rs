@@ -65,7 +65,28 @@ fn requirements_document_records_current_security_transport_and_cache_limits() {
             "LIM-001: Password hashing currently uses plain SHA-256",
             "LIM-010: QUIC peer certificate verification is currently disabled",
             "STREAM-001: The server",
-            "XCODE-021: The current memory-backed stream cache shall enforce a per-entry size limit of `256 MiB`.",
+            "XCODE-021: The shared memory-backed stream cache shall reserve at most sixty-four `5s` ranges of `4 MiB` each, for a total encoded-audio payload budget of `256 MiB`; ephemeral ranges when caching is disabled shall use the same reservations, and exhausted pinned capacity shall return a retryable error.",
+        ],
+    );
+}
+
+#[test]
+fn requirements_document_records_single_page_console_http_and_lifecycle_contracts() {
+    let doc = read_repo_file("REQUIREMENTS.md");
+    assert_contains_all(
+        &doc,
+        &[
+            "ADMIN-057:",
+            "GET requests with `X-Console-View: true`",
+            "subject to the same session and role checks as document requests",
+            "ADMIN-058:",
+            "shall submit asynchronous POST requests",
+            "authentication redirects preserving session-cookie changes",
+            "ADMIN-059:",
+            "Back and Forward shall restore that state",
+            "ADMIN-060:",
+            "Replacing a view shall dispose its listeners, polling, and in-flight requests",
+            "`Cache-Control: private, no-store`",
         ],
     );
 }

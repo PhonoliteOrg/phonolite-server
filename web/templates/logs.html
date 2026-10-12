@@ -1,7 +1,7 @@
 <div class="page-title">
   <div>
-    <h2>Logs</h2>
-    <p class="muted">Live server logs. Showing the most recent {{log_limit}} lines.</p>
+    <h1>Logs</h1>
+    <p class="muted">Live server logs and indexing issues. Showing the most recent {{log_limit}} log lines.</p>
   </div>
   <div class="row">
     <span class="tag">limit {{log_limit}}</span>
@@ -9,20 +9,21 @@
     <button class="button danger small" type="button" id="logs-clear">Clear all logs</button>
   </div>
 </div>
-<div class="row log-tabs" id="log-tabs">
-  <button class="tab-chip active" type="button" data-log="all">All</button>
-  <button class="tab-chip" type="button" data-log="info">Info</button>
-  <button class="tab-chip" type="button" data-log="warnings">Warnings</button>
-  <button class="tab-chip" type="button" data-log="errors">Errors</button>
-  <button class="tab-chip" type="button" data-log="issues">Issues</button>
-  <button class="tab-chip" type="button" data-log="activities">Activities</button>
-  <button class="tab-chip" type="button" data-log="debug">Debug</button>
+<p id="logs-action-error" class="inline-error" role="alert"></p>
+<div class="row log-tabs" id="log-tabs" role="group" aria-label="Log filters">
+  <button class="tab-chip active" type="button" data-log="all" data-log-path="{{log_all_path}}" aria-pressed="true">All</button>
+  <button class="tab-chip" type="button" data-log="info" data-log-path="{{log_info_path}}" aria-pressed="false">Info</button>
+  <button class="tab-chip" type="button" data-log="warnings" data-log-path="{{log_warnings_path}}" aria-pressed="false">Warnings</button>
+  <button class="tab-chip" type="button" data-log="errors" data-log-path="{{log_errors_path}}" aria-pressed="false">Errors</button>
+  <button class="tab-chip" type="button" data-log="issues" data-log-path="{{log_issues_path}}" aria-pressed="false">Indexing issues</button>
+  <button class="tab-chip" type="button" data-log="activities" data-log-path="{{log_activities_path}}" aria-pressed="false">Activities</button>
+  <button class="tab-chip" type="button" data-log="debug" data-log-path="{{log_debug_path}}" aria-pressed="false">Debug</button>
 </div>
-<div class="card log-card" data-log-limit="{{log_limit}}">
+<section class="log-card" data-log-limit="{{log_limit}}" aria-labelledby="server-log-title">
   <div class="row space-between log-header">
     <div>
-      <h3>Server log</h3>
-      <p class="muted">Directory: <code>{{log_dir}}</code></p>
+      <h2 id="server-log-title">Server log</h2>
+      <p class="muted">Log file: <code id="log-file-path">{{log_all_path}}</code></p>
     </div>
     <div class="row log-controls">
       <label class="row log-follow">
@@ -36,11 +37,21 @@
     </div>
   </div>
   <div class="log-panel" id="log-panel">
-    <div class="log-view hidden" id="log-view" aria-live="polite"></div>
+    <div class="log-view hidden" id="log-view" role="region" aria-label="Server log entries" tabindex="0"></div>
     <div class="log-empty hidden" id="log-empty">No logs for this view yet.</div>
-    <div class="log-spinner hidden" id="log-spinner">
+    <div class="log-spinner hidden" id="log-spinner" role="status">
       <div class="spinner"></div>
       <span>Loading log view...</span>
     </div>
   </div>
-</div>
+</section>
+<section class="issues-card hidden" id="indexing-issues-card" aria-labelledby="indexing-issues-title">
+  <div class="row space-between">
+    <div>
+      <h2 id="indexing-issues-title">Indexing issues</h2>
+      <p class="muted">Log file: <code>{{log_issues_path}}</code></p>
+    </div>
+    <span class="tag" id="indexing-issue-count">{{issue_count}} files</span>
+  </div>
+  <div class="table-scroll" id="indexing-issues" role="region" aria-label="Indexing issues" tabindex="0">{{tag_errors}}</div>
+</section>

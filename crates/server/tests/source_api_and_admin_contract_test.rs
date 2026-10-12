@@ -1,15 +1,17 @@
 mod support;
 
-use support::{assert_contains_all, read_repo_file, read_repo_files};
+use support::{assert_contains_all, read_repo_file, read_repo_files, repo_root};
 
 #[test]
 fn api_router_exposes_public_routes_and_protected_contracts() {
     let source = read_repo_file("crates/server/src/api/mod.rs");
+    assert!(!source.contains("/auth/login"));
 
     assert_contains_all(
         &source,
         &[
-            ".route(\"/auth/login\", post(auth::auth_login))",
+            ".route(\"/auth/opaque/start\", post(crate::security::start))",
+            ".route(\"/auth/opaque/finish\", post(crate::security::finish))",
             ".route(\"/auth/logout\", post(auth::auth_logout))",
             ".route(\"/health\", get(health))",
             ".route(\"/server/ports\", get(server::get_ports))",
@@ -26,6 +28,9 @@ fn api_router_exposes_public_routes_and_protected_contracts() {
             ".route(\"/download/tracks/:track_id\", get(library::download_track))",
             ".route(\"/browse/artists\", get(browse::list_artists))",
             ".route(\"/stats\", get(stats::get_stats))",
+            ".route(\"/stats/sync\", get(stats::sync_stats))",
+            ".route(\"/stats/events\", post(stats::ingest_stats))",
+            ".route(\"/stats/preferences\", post(stats::update_stats_preference))",
             ".route(\"/player/settings\", get(player::get_playback_settings))",
             ".route(\"/player/settings\", post(player::update_playback_settings))",
             ".layer(middleware::from_fn_with_state(state.clone(), require_auth));",
@@ -41,6 +46,9 @@ fn offline_metadata_route_and_response_shape_are_encoded() {
         "crates/server/src/api/mod.rs",
         "crates/server/src/api/library.rs",
         "crates/server/src/api/views.rs",
+        "crates/server/src/api/downloads.rs",
+        "crates/server/src/library_views.rs",
+        "crates/server/src/offline_metadata.rs",
     ]);
 
     assert_contains_all(
@@ -55,10 +63,13 @@ fn offline_metadata_route_and_response_shape_are_encoded() {
             "pub genres: Vec<String>",
             "pub album: AlbumView",
             "pub artist: ArtistView",
+            "pub artists: Vec<ArtistView>",
+            "pub collab_album_count: usize",
+            "pub collab_albums: Vec<ArtistReleaseContributionView>",
             "pub async fn get_offline_track_metadata",
             "library.get_track(&track_id)",
             "build_album_view(library, album)",
-            "build_artist_view(library, artist)",
+            "build_artist_views(library, contributors)",
             "OFFLINE_METADATA_SCHEMA_VERSION",
         ],
     );
@@ -69,6 +80,8 @@ fn download_batch_manifest_and_resume_rules_are_encoded() {
     let source = read_repo_files(&[
         "crates/server/src/api/mod.rs",
         "crates/server/src/api/library.rs",
+        "crates/server/src/api/downloads.rs",
+        "crates/server/src/download_files.rs",
     ]);
 
     assert_contains_all(
@@ -103,6 +116,8 @@ fn library_search_shuffle_player_and_stats_rules_are_encoded() {
         "crates/server/src/api/player.rs",
         "crates/server/src/api/stats.rs",
         "crates/server/src/api/auth.rs",
+        "crates/server/src/security.rs",
+        "crates/server/src/api/downloads.rs",
     ]);
 
     assert_contains_all(
@@ -139,6 +154,8 @@ fn admin_router_and_settings_validation_match_requirements() {
     let source = read_repo_files(&[
         "crates/server/src/admin/mod.rs",
         "crates/server/src/admin/settings.rs",
+        "crates/server/src/admin/settings/validation.rs",
+        "crates/server/src/config.rs",
         "crates/server/src/admin/assets.rs",
     ]);
 
@@ -157,6 +174,7 @@ fn admin_router_and_settings_validation_match_requirements() {
             "log_dir is required",
             "quic_port must be a valid number",
             "quic_port must be different from port",
+            "quic_port must be different from admin_port",
             "watch_debounce_secs must be a positive number",
             "session_ttl_secs must be a positive number",
             "external_metadata_min_interval_secs must be a positive number",
@@ -172,9 +190,67 @@ fn admin_router_and_settings_validation_match_requirements() {
 }
 
 #[test]
+fn admin_console_keeps_diagnostics_in_logs_without_a_dedicated_activity_page() {
+    let router = read_repo_file("crates/server/src/admin/mod.rs");
+    assert_contains_all(
+        &router,
+        &[
+            ".route(\"/logs\", get(logs::admin_logs))",
+            ".route(\"/logs/issues\", get(logs::admin_logs_issues))",
+            ".route(\"/logs/tail\", get(logs::admin_logs_tail))",
+            ".route(\"/logs/clear\", post(logs::admin_logs_clear))",
+        ],
+    );
+    for removed in [
+        "pub mod activity;",
+        "\"/activity\"",
+        "\"/activity/clear\"",
+        "\"/status/activity\"",
+    ] {
+        assert!(
+            !router.contains(removed),
+            "obsolete Activity route or module: {}",
+            removed
+        );
+    }
+
+    let shell = read_repo_files(&[
+        "web/templates/partials/nav.html",
+        "web/static/js/app.js",
+        "web/static/js/shell.js",
+        "crates/server/src/admin/presentation.rs",
+    ]);
+    for removed in [
+        "/activity",
+        "activity.js",
+        "setupActivityPage",
+        "activity-badge",
+        "nav_activity_current",
+    ] {
+        assert!(
+            !shell.contains(removed),
+            "obsolete Activity UI hook: {}",
+            removed
+        );
+    }
+    for removed in [
+        "web/templates/activity.html",
+        "web/static/js/activity.js",
+        "crates/server/src/admin/activity.rs",
+    ] {
+        assert!(
+            !repo_root().join(removed).exists(),
+            "obsolete Activity page file: {}",
+            removed
+        );
+    }
+}
+
+#[test]
 fn admin_library_and_user_management_rules_are_encoded() {
     let source = read_repo_files(&[
         "crates/server/src/admin/library.rs",
+        "crates/server/src/admin/library/view.rs",
         "crates/server/src/admin/users.rs",
         "crates/server/src/scan.rs",
     ]);

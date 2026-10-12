@@ -1,32 +1,27 @@
+<div class="page-title">
+  <div><h1>Users</h1><p class="muted">Manage the people who can access your library.</p></div>
+  <div class="row">
+    <button id="toggle-edit" type="button" class="button ghost icon-button" aria-pressed="false" aria-label="Edit mode" title="Edit mode"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm2.92 2.83H5v-.92l9.06-9.06.92.92L5.92 20.08zM20.71 7.04a1.003 1.003 0 0 0 0-1.42l-2.34-2.34a1.003 1.003 0 0 0-1.42 0l-1.83 1.83 3.75 3.75 1.84-1.82z"/></svg></button>
+    <button id="open-add" type="button" class="icon-button primary" aria-label="Add user" title="Add user"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4.42 0-8 2.24-8 5v2h16v-2c0-2.76-3.58-5-8-5zm11-6V5h-2v3h-3v2h3v3h2v-3h3V8h-3z"/></svg></button>
+  </div>
+</div>
 <div class="stack">
-    {{message}}
-    <div class="card" id="users-card" data-current-user-id="{{current_user_id}}" data-current-user-role="{{current_user_role}}">
-        <div class="row space-between">
-            <h2>Users</h2>
-            <div class="row">
-                <button id="toggle-edit" class="button ghost">Edit mode</button>
-                <button id="open-add" class="button primary">Add User</button>
-            </div>
-        </div>
-        <div id="users-inline-message" class="inline-error"></div>
-        <div id="bulk-bar" class="bulk-bar row space-between hidden">
-            <span id="bulk-count">0 selected</span>
-            <button id="bulk-delete" class="button danger small">Delete Selected</button>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th class="select-cell"></th>
-                    <th>Username</th>
-                    <th>Role</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {{user_rows}}
-            </tbody>
-        </table>
+  <div class="stack" id="users-card" data-current-user-id="{{current_user_id}}" data-current-user-role="{{current_user_role}}">
+    <div id="users-inline-message" class="inline-error{{error_class}}" role="alert">{{error}}</div>
+    <div id="bulk-bar" class="bulk-bar row space-between hidden">
+      <span id="bulk-count" aria-live="polite">0 selected</span>
+      <button id="bulk-delete" type="button" class="button danger small">Delete selected</button>
     </div>
+    <div class="table-scroll" role="region" aria-label="User accounts" tabindex="0">
+      <table>
+        <caption class="sr-only">User accounts and access permissions</caption>
+        <thead><tr>
+          <th class="select-cell" scope="col"><span class="sr-only">Select</span></th>
+          <th scope="col">Username</th><th scope="col">Role</th><th scope="col">Actions</th>
+        </tr></thead>
+        <tbody id="user-rows">{{user_rows}}</tbody>
+      </table>
+    </div>
+  </div>
 </div>
 {{modals}}
