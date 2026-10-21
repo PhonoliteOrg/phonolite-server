@@ -11,7 +11,7 @@ use crate::assets::{
     resolve_cover_source, CoverCacheKey,
 };
 use crate::http::{json_error_response, redirect_to, wants_json};
-use crate::scan::{start_cover_sweep, start_enrichment_sweep, start_rescan};
+use crate::scan::start_rescan;
 use crate::state::LibraryStatus;
 use crate::state::{
     AdminLibraryQuery, AlbumMetadataStatus, AppState, ArtistCoverQuery, LibraryStatusResponse,
@@ -43,7 +43,9 @@ pub async fn admin_library_status(State(state): State<AppState>, headers: Header
         return json_error_response(StatusCode::FORBIDDEN, "forbidden");
     }
 
-    Json(library_status_snapshot(&state.library_state).await).into_response()
+    let mut response = library_status_snapshot(&state.library_state).await;
+    response.backup = state.backup_jobs.latest();
+    Json(response).into_response()
 }
 
 async fn library_status_snapshot(
@@ -126,6 +128,7 @@ fn library_status_response(library_status: &LibraryStatus) -> LibraryStatusRespo
         tracks,
         progress,
         metadata: None,
+        backup: None,
     }
 }
 
@@ -244,6 +247,9 @@ pub async fn admin_reindex(State(state): State<AppState>, headers: HeaderMap) ->
 
     let error = match library_for_admin(&state) {
         Ok(library) => {
+            if let Err(err) = library.discard_metadata_imports() {
+                return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
             if let Err(err) = clear_metadata_assets(&state).await {
                 warn!("Failed to clear metadata on reindex: {}", err);
             }
@@ -436,8 +442,9 @@ pub async fn admin_scan(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     let error = match library_for_admin(&state) {
         Ok(library) => {
-            start_enrichment_sweep(state.clone(), library.clone(), false);
-            start_cover_sweep(state.clone(), library);
+            // Local discovery also reconnects retained metadata imports, then
+            // the regular sweep fills fields absent from both tags and backup.
+            start_rescan(state.clone(), library, false);
             None
         }
         Err(message) => Some(message),

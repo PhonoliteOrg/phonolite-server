@@ -39,6 +39,7 @@ pub struct AppState {
     pub stream_cache: StreamCache,
     pub metadata_events: MetadataEventBus,
     pub download_jobs: DownloadJobStore,
+    pub backup_jobs: crate::admin::backup::jobs::Store,
 }
 
 #[derive(Clone)]
@@ -92,6 +93,7 @@ pub struct LibraryStatusResponse {
     pub tracks: Option<usize>,
     pub progress: Option<ScanProgress>,
     pub metadata: Option<AlbumMetadataStatus>,
+    pub backup: Option<crate::admin::backup::jobs::Progress>,
 }
 
 #[derive(Serialize)]
@@ -241,8 +243,6 @@ pub struct AdminLibraryQuery {
     pub offset: Option<usize>,
     pub album_id: Option<String>,
     pub artist_id: Option<String>,
-    #[serde(default)]
-    pub include_contributors: bool,
 }
 
 #[derive(Deserialize)]

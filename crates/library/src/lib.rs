@@ -2,11 +2,13 @@
 //!
 //! The public API is stable; private modules own read queries, enrichment
 //! transactions, storage encoding, and filesystem indexing independently.
+pub mod backup;
 mod credits;
 mod enrichment;
 mod indexing;
 mod normalization;
 mod queries;
+pub mod search;
 mod source_identity;
 mod storage;
 
@@ -117,12 +119,12 @@ impl Library {
             }
             Some(version) => {
                 warn!("Index version mismatch ({}); rescanning", version);
-                library.rescan()?;
+                indexing::scan(&library.roots, &library.db, true, None, None)?;
                 scanned = true;
             }
             None => {
                 warn!("Index missing; scanning");
-                library.rescan()?;
+                indexing::scan(&library.roots, &library.db, true, None, None)?;
                 scanned = true;
             }
         }
@@ -184,7 +186,12 @@ impl Library {
     }
 
     pub fn rescan(&self) -> Result<LibraryStats, LibraryError> {
-        indexing::scan(&self.roots, &self.db, true, None, None)
+        let started = std::time::Instant::now();
+        let _scan = indexing::SCAN_LOCK.lock();
+        let write = self.db.begin_write()?;
+        backup::discard_retained(&write)?;
+        write.commit()?;
+        indexing::scan_locked(&self.roots, &self.db, true, None, started, None)
     }
 
     pub fn incremental_scan(&self) -> Result<LibraryStats, LibraryError> {

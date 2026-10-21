@@ -1,6 +1,8 @@
 import { openModal, closeModal, confirmAction } from "./dialogs.js";
 import { beginBusy, clearInlineError, showInlineError, toParams, fetchJson } from "./shared.js";
 import { setupFolderBrowser } from "./folder-browser.js";
+import { setupMetadataBackup } from "./metadata-backup.js";
+import { setupServerSecurity } from "./server-security.js";
 
 // Requests and listeners belong to one mounted settings view. A late result
 // must never update another page after navigation.
@@ -11,6 +13,7 @@ function createSettingsScope(formError) {
   const pending = new Set();
   const scope = {
     signal: controller.signal,
+    onDispose(callback) { listeners.push(callback); },
     listen(element, name, callback, capture = false) {
       if (!element) return;
       element.addEventListener(name, callback, capture);
@@ -209,7 +212,7 @@ export function setupSettings() {
   if (!form) return;
   const formError = document.getElementById("settings-error");
   const scope = createSettingsScope(formError);
-  setupMusicRoots(scope); setupMetadataSources(scope);
+  setupMusicRoots(scope); setupMetadataSources(scope); setupMetadataBackup(scope);
   const saveButton = document.getElementById("save-settings");
   const saveBar = document.getElementById("settings-save-bar");
   const saveBarObserver = saveBar && typeof ResizeObserver === "function" ? new ResizeObserver(() => {
@@ -321,6 +324,7 @@ export function setupSettings() {
     if (!(await canLeave()) || scope.signal.aborted) return;
     event.target.requestSubmit?.(event.submitter || undefined);
   }, true);
+  setupServerSecurity(scope, canLeave);
   updateDirty();
   return {
     canLeave,

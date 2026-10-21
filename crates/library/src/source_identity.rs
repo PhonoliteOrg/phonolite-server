@@ -29,7 +29,7 @@ pub struct AlbumSourceIdentity {
 }
 
 impl AlbumSourceIdentity {
-    fn validate(&self) -> Result<(), &'static str> {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != ALBUM_SOURCE_IDENTITY_SCHEMA_VERSION {
             return Err("unsupported schema version");
         }

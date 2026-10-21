@@ -147,6 +147,44 @@
   position: relative;
 }
 
+.nav .nav-links .nav-menu > .server-actions-toggle {
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.nav .nav-links .nav-menu > .server-actions-toggle:is(:hover, :focus-visible, :active) {
+  background: transparent;
+  color: var(--accent);
+}
+
+.nav-server-version {
+  width: fit-content;
+  max-width: calc(100% - 28px);
+  margin: 8px auto 0;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
 .nav-library-status {
   margin: 0 0 8px;
   padding: 0 14px;
@@ -158,11 +196,14 @@
 }
 
 .nav-library-status[data-status="scanning"],
+.nav-library-status[data-status="backup"],
+.nav-library-status[data-status="backup-waiting"],
 .nav-library-status[data-status="metadata"] {
   color: var(--accent);
 }
 
 .nav-library-status[data-status="scanning"]::after,
+.nav-library-status[data-status="backup"]::after,
 .nav-library-status[data-status="metadata"]::after {
   content: "";
   display: inline-block;

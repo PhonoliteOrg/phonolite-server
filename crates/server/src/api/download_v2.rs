@@ -509,7 +509,7 @@ async fn resolve_job_items(
             track_id: track.id.clone(),
             status: DownloadJobItemStatus::ReadyToDownload,
             download_url: Some(format!(
-                "/api/v1/download/v2/tracks/{}/file",
+                "/api/download/tracks/{}/file",
                 percent_encode_path_component(&track.id)
             )),
             offline_metadata: Some(offline_metadata),

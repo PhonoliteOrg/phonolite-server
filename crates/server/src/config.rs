@@ -78,6 +78,11 @@ pub struct ServerConfig {
     pub music_roots: Vec<MusicRootConfig>,
     pub index_path: String,
     pub metadata_path: String,
+    /// Per-file compressed limit; larger exports become numbered backup parts.
+    pub metadata_backup_max_archive_mib: u64,
+    /// Aggregate decompressed bound for an entire backup set.
+    pub metadata_backup_max_expanded_mib: u64,
+    pub metadata_backup_max_manifest_mib: u64,
     #[serde(alias = "log_path")]
     pub log_dir: String,
     pub log_debug_enabled: bool,
@@ -123,6 +128,9 @@ impl Default for ServerConfig {
             music_roots: Vec::new(),
             index_path: "library.redb".to_string(),
             metadata_path: "metadata".to_string(),
+            metadata_backup_max_archive_mib: 16 * 1024,
+            metadata_backup_max_expanded_mib: 32 * 1024,
+            metadata_backup_max_manifest_mib: 1024,
             log_dir: "logs".to_string(),
             log_debug_enabled: false,
             port: 3000,
@@ -159,6 +167,7 @@ pub enum ConfigError {
     Yaml(serde_yaml::Error),
     InvalidPorts(&'static str),
     InvalidAdminBind(&'static str),
+    InvalidBackupLimits(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -168,6 +177,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Yaml(err) => write!(f, "yaml error: {}", err),
             ConfigError::InvalidPorts(err) => f.write_str(err),
             ConfigError::InvalidAdminBind(err) => f.write_str(err),
+            ConfigError::InvalidBackupLimits(err) => f.write_str(err),
         }
     }
 }
@@ -184,6 +194,24 @@ impl From<serde_yaml::Error> for ConfigError {
     fn from(err: serde_yaml::Error) -> Self {
         ConfigError::Yaml(err)
     }
+}
+
+pub fn validate_backup_limits(config: &ServerConfig) -> Result<(), &'static str> {
+    for value in [
+        config.metadata_backup_max_archive_mib,
+        config.metadata_backup_max_expanded_mib,
+        config.metadata_backup_max_manifest_mib,
+    ] {
+        if value == 0 || value.checked_mul(1024 * 1024).is_none() {
+            return Err("metadata backup size limits must be positive MiB values without byte-count overflow");
+        }
+    }
+    if config.metadata_backup_max_manifest_mib * 1024 * 1024 > isize::MAX as u64 {
+        return Err(
+            "metadata backup manifest limit exceeds this platform's addressable allocation size",
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_ports(port: u16, admin_port: u16, quic_port: u16) -> Result<(), &'static str> {
@@ -300,6 +328,7 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         config.bind_addr = normalize_bind_addr(legacy_bind_addr);
         validate_ports(config.port, config.admin_port, config.quic_port)
             .map_err(ConfigError::InvalidPorts)?;
+        validate_backup_limits(&config).map_err(ConfigError::InvalidBackupLimits)?;
         config.admin_bind_addr = parse_admin_bind_addr(&config.admin_bind_addr)
             .map_err(ConfigError::InvalidAdminBind)?
             .to_string();
@@ -312,6 +341,7 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
 }
 
 pub fn save_config(path: &Path, config: &ServerConfig) -> Result<(), ConfigError> {
+    validate_backup_limits(config).map_err(ConfigError::InvalidBackupLimits)?;
     validate_ports(config.port, config.admin_port, config.quic_port)
         .map_err(ConfigError::InvalidPorts)?;
     parse_admin_bind_addr(&config.admin_bind_addr).map_err(ConfigError::InvalidAdminBind)?;
@@ -508,6 +538,52 @@ mod tests {
     impl Drop for TemporaryConfig {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn metadata_backup_limits_default_and_roundtrip_without_changing_legacy_configs() {
+        let legacy: ServerConfig = serde_yaml::from_str("music_root: ''\n").unwrap();
+        assert_eq!(legacy.metadata_backup_max_archive_mib, 16 * 1024);
+        assert_eq!(legacy.metadata_backup_max_expanded_mib, 32 * 1024);
+        assert_eq!(legacy.metadata_backup_max_manifest_mib, 1024);
+        let file = TemporaryConfig::new();
+        let config = ServerConfig {
+            metadata_backup_max_archive_mib: 64 * 1024,
+            metadata_backup_max_expanded_mib: 128 * 1024,
+            metadata_backup_max_manifest_mib: 2048,
+            ..legacy
+        };
+        save_config(&file.0, &config).unwrap();
+        let loaded = load_or_create_config(&file.0).unwrap().0;
+        assert_eq!(loaded.metadata_backup_max_archive_mib, 64 * 1024);
+        assert_eq!(loaded.metadata_backup_max_expanded_mib, 128 * 1024);
+        assert_eq!(loaded.metadata_backup_max_manifest_mib, 2048);
+        for manifest in [0, u64::MAX] {
+            let invalid = ServerConfig {
+                metadata_backup_max_manifest_mib: manifest,
+                ..ServerConfig::default()
+            };
+            assert!(matches!(
+                save_config(&file.0, &invalid),
+                Err(ConfigError::InvalidBackupLimits(_))
+            ));
+        }
+        for (archive, expanded) in [(0, 1), (1, 0), (u64::MAX, 1), (1, u64::MAX)] {
+            let invalid = ServerConfig {
+                metadata_backup_max_archive_mib: archive,
+                metadata_backup_max_expanded_mib: expanded,
+                ..ServerConfig::default()
+            };
+            assert!(matches!(
+                save_config(&file.0, &invalid),
+                Err(ConfigError::InvalidBackupLimits(_))
+            ));
+            std::fs::write(&file.0, serde_yaml::to_string(&invalid).unwrap()).unwrap();
+            assert!(matches!(
+                load_or_create_config(&file.0),
+                Err(ConfigError::InvalidBackupLimits(_))
+            ));
         }
     }
 

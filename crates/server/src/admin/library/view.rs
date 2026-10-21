@@ -4,7 +4,8 @@ use crate::admin::presentation::{
     apply_template, escape_html, format_duration_ms, format_track_position, html_error,
     load_template, render_admin_response, truncate_text, url_escape, PageLayout,
 };
-use crate::state::{AdminLibraryQuery, AppState, LibraryStatus};
+use crate::library_search::search_library;
+use crate::state::{AdminLibraryQuery, AppState, LibraryStatus, SearchResult};
 use ::library::{Library, LibraryStats};
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -42,9 +43,7 @@ pub(super) fn admin_library_page(
     let filter = normalize_filter(query.filter.as_deref());
     let offset = query.offset.unwrap_or(0);
     let limit = 24;
-    let include_contributors = query.include_contributors;
-    let mut search_block =
-        render_library_search_block(state, &search_trimmed, filter, include_contributors);
+    let mut search_block = render_library_search_block(state, &search_trimmed, filter);
 
     let content: String;
     let mut pagination = String::new();
@@ -61,12 +60,8 @@ pub(super) fn admin_library_page(
 
     let status = state.library_state.read().status.clone();
     if let LibraryStatus::Ready(stats) = &status {
-        search_block.push_str(&render_library_snapshot(
-            state,
-            stats,
-            &search_trimmed,
-            filter,
-        ));
+        search_block =
+            render_library_snapshot(state, stats, &search_trimmed, filter, &search_block);
     }
 
     if let Some(library) = library {
@@ -74,23 +69,21 @@ pub(super) fn admin_library_page(
             content = render_album_detail(state, &library, &album_id, &mut message);
         } else if let Some(artist_id) = query.artist_id {
             content = render_artist_detail(state, &library, &artist_id, &mut message);
+        } else if !search_trimmed.is_empty() {
+            content = render_ranked_search(state, &library, &search_trimmed, filter, &mut message);
         } else {
-            let (block, total) = render_search_results(
+            let (block, total) = render_browse_results(
                 state,
                 &library,
                 &search_trimmed,
                 filter,
                 limit,
                 offset,
-                include_contributors,
                 &mut message,
             );
             content = block;
             if let Some(total) = total {
-                let mut base = search_base_query(&search_trimmed, filter);
-                if include_contributors {
-                    base.push_str("&include_contributors=true");
-                }
+                let base = search_base_query(&search_trimmed, filter);
                 pagination = render_pagination(state, &base, offset, limit, total);
             }
         }
@@ -181,50 +174,31 @@ fn search_base_query(search: &str, filter: SearchFilter) -> String {
     out
 }
 
-fn render_library_search_block(
-    state: &AppState,
-    search: &str,
-    filter: SearchFilter,
-    include_contributors: bool,
-) -> String {
+fn render_library_search_block(state: &AppState, search: &str, filter: SearchFilter) -> String {
     let value = escape_html(search);
     let hidden_filter = format!(
         "<input type=\"hidden\" name=\"filter\" value=\"{}\" />",
         filter_label(filter)
     );
 
-    let clear_icon = r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>"#;
+    let clear_icon = include_str!("../../../../../web/static/icons/lucide/x.svg");
 
-    let mut clear_link = search_base_query("", filter);
-    if include_contributors {
-        clear_link.push_str("&include_contributors=true");
-    }
-    let clear_button = if !value.is_empty() {
-        format!(
-            r#"<a href="{}" class="icon-button search-clear" data-library-link aria-label="Clear search">{}</a>"#,
-            escape_html(&clear_link),
-            clear_icon
-        )
-    } else {
-        String::new()
-    };
+    let clear_link = search_base_query("", filter);
+    let clear_button = format!(
+        r#"<a href="{}" class="icon-button search-clear" data-library-link aria-label="Clear search"{}>{}</a>"#,
+        escape_html(&clear_link),
+        if value.is_empty() { " hidden" } else { "" },
+        clear_icon
+    );
 
     let template =
         load_template(state, "templates/partials/library_search.html").unwrap_or_default();
-    let contributor_control = if filter == SearchFilter::Artists {
-        format!("<label class=\"library-contributor-filter\"><input type=\"checkbox\" name=\"include_contributors\" value=\"true\" data-library-contributors{} /> Include contributors</label>", if include_contributors { " checked" } else { "" })
-    } else if include_contributors {
-        "<input type=\"hidden\" name=\"include_contributors\" value=\"true\" />".to_string()
-    } else {
-        String::new()
-    };
     apply_template(
         template,
         &[
             ("value", value),
             ("clear_button", clear_button),
             ("hidden_filter", hidden_filter),
-            ("contributor_control", contributor_control),
         ],
     )
 }
@@ -284,27 +258,113 @@ fn render_search_empty_state(search: &str, filter: SearchFilter) -> String {
     }
 }
 
-fn render_search_results(
+fn render_ranked_search(
+    state: &AppState,
+    library: &Library,
+    search: &str,
+    filter: SearchFilter,
+    message: &mut Option<String>,
+) -> String {
+    if search.chars().count() < 2 {
+        return render_empty_state("Search library", "Type at least 2 characters to search.");
+    }
+    let results = match search_library(library, search, 50) {
+        Ok(results) => results,
+        Err(err) => {
+            *message = Some(format!("library error: {err}"));
+            return render_empty_state("Search could not be loaded", "Try searching again.");
+        }
+    };
+    let template =
+        load_template(state, "templates/partials/search_result.html").unwrap_or_default();
+    render_library_matches(library, &results, search, filter, &template)
+}
+
+fn render_library_matches(
+    library: &Library,
+    results: &[SearchResult],
+    search: &str,
+    filter: SearchFilter,
+    template: &str,
+) -> String {
+    if results.is_empty() {
+        return render_empty_state(
+            "No results found",
+            &format!("No matches for \"{search}\". Try another search term."),
+        );
+    }
+    let mut rows = String::new();
+    for result in results {
+        let mut link = search_base_query(search, filter);
+        let (kind, cover_url) = if result.kind == "artist" {
+            link.push_str(&format!("&artist_id={}", url_escape(&result.id)));
+            ("Artist", artist_cover_url(library, &result.id))
+        } else {
+            let album_id = result.album_id.as_deref().unwrap_or(&result.id);
+            link.push_str(&format!("&album_id={}", url_escape(album_id)));
+            if result.kind == "track" {
+                link.push_str(&format!("#track-{}", url_escape(&result.id)));
+            }
+            let cover_url = library
+                .get_album(album_id)
+                .ok()
+                .flatten()
+                .filter(|album| album.cover_ref.is_some())
+                .map(|_| format!("/covers/albums/{}", url_escape(album_id)));
+            (
+                if result.kind == "track" {
+                    "Track"
+                } else {
+                    "Album"
+                },
+                cover_url,
+            )
+        };
+        let kind_icon = match result.kind.as_str() {
+            "artist" => include_str!("../../../../../web/static/icons/lucide/user-round.svg"),
+            "track" => include_str!("../../../../../web/static/icons/lucide/music.svg"),
+            _ => include_str!("../../../../../web/static/icons/lucide/disc-3.svg"),
+        };
+        rows.push_str(&apply_template(
+            template.to_string(),
+            &[
+                ("link", escape_html(&link)),
+                ("cover", render_tile_cover(cover_url.as_deref())),
+                ("title", escape_html(&result.title)),
+                (
+                    "subtitle",
+                    escape_html(result.subtitle.as_deref().unwrap_or_default()),
+                ),
+                ("kind", kind.to_string()),
+                ("result_kind", escape_html(&result.kind)),
+                ("kind_icon", kind_icon.to_string()),
+                (
+                    "chevron",
+                    include_str!("../../../../../web/static/icons/lucide/chevron-right.svg")
+                        .to_string(),
+                ),
+            ],
+        ));
+    }
+    format!(
+        r#"<section class="library-search-results" aria-labelledby="library-results-title"><div class="tile-section-header"><h2 id="library-results-title">Search results</h2><p class="muted" role="status">{} matches</p></div><div class="library-search-results-list" role="list" aria-label="Search results">{rows}</div></section>"#,
+        results.len()
+    )
+}
+
+fn render_browse_results(
     state: &AppState,
     library: &Library,
     search: &str,
     filter: SearchFilter,
     limit: usize,
     offset: usize,
-    include_contributors: bool,
     message: &mut Option<String>,
 ) -> (String, Option<usize>) {
     match filter {
         SearchFilter::Artists => {
-            let (items, total) = render_artist_tiles_section(
-                state,
-                library,
-                search,
-                limit,
-                offset,
-                include_contributors,
-                message,
-            );
+            let (items, total) =
+                render_artist_tiles_section(state, library, search, limit, offset, message);
             (items, Some(total))
         }
         SearchFilter::Albums => {
@@ -326,7 +386,6 @@ fn render_artist_tiles_section(
     search: &str,
     limit: usize,
     offset: usize,
-    include_contributors: bool,
     message: &mut Option<String>,
 ) -> (String, usize) {
     let search_opt = search.trim();
@@ -336,20 +395,19 @@ fn render_artist_tiles_section(
         Some(search_opt)
     };
 
-    let (items, total) =
-        match library.list_artists_for_browse(search_opt, limit, offset, include_contributors) {
-            Ok(result) => result,
-            Err(err) => {
-                *message = Some(format!("library error: {}", err));
-                return (
-                    render_empty_state(
-                        "Artists could not be loaded",
-                        "Refresh the page to try again.",
-                    ),
-                    0,
-                );
-            }
-        };
+    let (items, total) = match library.list_artists_for_browse(search_opt, limit, offset, false) {
+        Ok(result) => result,
+        Err(err) => {
+            *message = Some(format!("library error: {}", err));
+            return (
+                render_empty_state(
+                    "Artists could not be loaded",
+                    "Refresh the page to try again.",
+                ),
+                0,
+            );
+        }
+    };
 
     if items.is_empty() {
         return (
@@ -925,7 +983,8 @@ fn render_album_detail(
             .map(|name| format!("<div class=\"muted\">{}</div>", escape_html(&name)))
             .unwrap_or_default();
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr id=\"track-{}\"><td>{}</td><td>{}{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&track.id),
             escape_html(&pos),
             escape_html(&track.title),
             track_artist,
@@ -978,26 +1037,44 @@ fn render_pagination(
     limit: usize,
     total: usize,
 ) -> String {
-    if total <= limit {
+    if total == 0 || limit == 0 {
         return String::new();
     }
-    let start = offset + 1;
-    let end = (offset + limit).min(total);
-    let total_pages = (total + limit - 1) / limit;
-    let current_page = offset / limit;
-    let mut controls = String::new();
-    if offset > 0 {
-        let prev = offset.saturating_sub(limit);
-        let href = format!("{}&offset={}", base, prev);
-        controls.push_str(&format!(
-            "<a class=\"button ghost\" href=\"{}\" data-library-link rel=\"prev\" aria-label=\"Previous page\">Prev</a>",
-            escape_html(&href)
-        ));
-    }
-    let window = 2usize;
-    let start_page = current_page.saturating_sub(window);
-    let end_page = (current_page + window).min(total_pages.saturating_sub(1));
-    for page in start_page..=end_page {
+    let start = offset.saturating_add(1).min(total);
+    let end = offset.saturating_add(limit).min(total);
+    let total_pages = (total - 1) / limit + 1;
+    let current_page = (offset / limit).min(total_pages - 1);
+    let controls = render_pagination_controls(base, current_page, limit, total_pages);
+    let template = load_template(state, "templates/partials/pagination.html").unwrap_or_default();
+    apply_template(
+        template,
+        &[
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("total", total.to_string()),
+            ("controls", controls),
+        ],
+    )
+}
+
+fn render_pagination_controls(
+    base: &str,
+    current_page: usize,
+    limit: usize,
+    total_pages: usize,
+) -> String {
+    let mut controls = render_pagination_step(
+        base,
+        current_page.checked_sub(1).map(|page| page * limit),
+        "prev",
+        "Previous page",
+        include_str!("../../../../../web/static/icons/lucide/chevron-left.svg"),
+    );
+    let visible_pages = total_pages.min(9);
+    let start_page = current_page
+        .saturating_sub(visible_pages / 2)
+        .min(total_pages - visible_pages);
+    for page in start_page..start_page + visible_pages {
         let page_offset = page * limit;
         let href = format!("{}&offset={}", base, page_offset);
         let class = if page == current_page {
@@ -1019,24 +1096,37 @@ fn render_pagination(
             page + 1
         ));
     }
-    if offset + limit < total {
-        let next = offset + limit;
-        let href = format!("{}&offset={}", base, next);
-        controls.push_str(&format!(
-            "<a class=\"button ghost\" href=\"{}\" data-library-link rel=\"next\" aria-label=\"Next page\">Next</a>",
-            escape_html(&href)
-        ));
+    controls.push_str(&render_pagination_step(
+        base,
+        current_page
+            .checked_add(1)
+            .filter(|page| *page < total_pages)
+            .map(|page| page * limit),
+        "next",
+        "Next page",
+        include_str!("../../../../../web/static/icons/lucide/chevron-right.svg"),
+    ));
+    controls
+}
+
+fn render_pagination_step(
+    base: &str,
+    offset: Option<usize>,
+    relation: &str,
+    label: &str,
+    icon: &str,
+) -> String {
+    let label = escape_html(label);
+    if let Some(offset) = offset {
+        let href = escape_html(&format!("{base}&offset={offset}"));
+        format!(
+            r#"<a class="page-link page-step" href="{href}" data-library-link rel="{relation}" aria-label="{label}">{icon}</a>"#
+        )
+    } else {
+        format!(
+            r#"<button class="page-link page-step" type="button" disabled aria-label="{label}">{icon}</button>"#
+        )
     }
-    let template = load_template(state, "templates/partials/pagination.html").unwrap_or_default();
-    apply_template(
-        template,
-        &[
-            ("start", start.to_string()),
-            ("end", end.to_string()),
-            ("total", total.to_string()),
-            ("controls", controls),
-        ],
-    )
 }
 
 fn format_genres_html(genres: &[String]) -> String {
@@ -1083,6 +1173,7 @@ fn render_library_snapshot(
     stats: &LibraryStats,
     search: &str,
     filter: SearchFilter,
+    search_form: &str,
 ) -> String {
     let template =
         load_template(state, "templates/partials/library_snapshot.html").unwrap_or_default();
@@ -1093,6 +1184,11 @@ fn render_library_snapshot(
             ("artists", stats.artists.to_string()),
             ("albums", stats.albums.to_string()),
             ("tracks", stats.tracks.to_string()),
+            ("search_form", search_form.to_string()),
+            (
+                "tabs_hidden",
+                if search.is_empty() { "" } else { " hidden" }.to_string(),
+            ),
             ("tabs_html", tabs_html),
         ],
     )
@@ -1105,7 +1201,10 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::Json;
 
-    use super::{render_library_tabs, render_search_empty_state, LibraryPageView, SearchFilter};
+    use super::{
+        render_library_tabs, render_pagination_controls, render_search_empty_state,
+        LibraryPageView, SearchFilter,
+    };
 
     #[test]
     fn genre_display_capitalizes_legacy_labels_and_keeps_html_escaped() {
@@ -1174,6 +1273,177 @@ mod tests {
             )));
         }
         assert!(!html.contains("<live>"));
+    }
+
+    #[test]
+    fn pagination_keeps_up_to_nine_page_numbers_at_the_start_middle_and_end() {
+        for (total_pages, current_page, expected) in [
+            (1, 0, vec![1]),
+            (4, 3, vec![1, 2, 3, 4]),
+            (9, 4, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (20, 0, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (20, 4, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (20, 9, vec![6, 7, 8, 9, 10, 11, 12, 13, 14]),
+            (20, 18, vec![12, 13, 14, 15, 16, 17, 18, 19, 20]),
+            (20, 19, vec![12, 13, 14, 15, 16, 17, 18, 19, 20]),
+        ] {
+            let html =
+                render_pagination_controls("/library?filter=albums", current_page, 24, total_pages);
+            let pages: Vec<usize> = html
+                .split("aria-label=\"Page ")
+                .skip(1)
+                .map(|part| part.split('"').next().unwrap().parse().unwrap())
+                .collect();
+            assert_eq!(
+                pages,
+                expected,
+                "page {} of {total_pages}",
+                current_page + 1
+            );
+            assert_eq!(html.matches("aria-current=\"page\"").count(), 1);
+            assert!(html.contains(&format!(
+                "aria-label=\"Page {}\" aria-current=\"page\">{}",
+                current_page + 1,
+                current_page + 1
+            )));
+        }
+    }
+
+    #[test]
+    fn pagination_chevrons_stay_visible_and_only_valid_directions_are_links() {
+        for (total_pages, current_page, previous, next) in [
+            (1, 0, None, None),
+            (20, 0, None, Some(24)),
+            (20, 9, Some(192), Some(240)),
+            (20, 19, Some(432), None),
+        ] {
+            let html = render_pagination_controls(
+                "/library?search=R%26B&filter=tracks",
+                current_page,
+                24,
+                total_pages,
+            );
+            assert_eq!(html.matches("lucide-chevron-left").count(), 1);
+            assert_eq!(html.matches("lucide-chevron-right").count(), 1);
+            for (label, relation, offset) in [
+                ("Previous page", "prev", previous),
+                ("Next page", "next", next),
+            ] {
+                let tag = html
+                    .split('>')
+                    .find(|tag| tag.contains(&format!("aria-label=\"{label}\"")))
+                    .unwrap();
+                if let Some(offset) = offset {
+                    assert!(tag.contains("<a "));
+                    assert!(tag.contains("data-library-link"));
+                    assert!(tag.contains(&format!("rel=\"{relation}\"")));
+                    assert!(tag.contains(&format!(
+                        "href=\"/library?search=R%26B&amp;filter=tracks&amp;offset={offset}\""
+                    )));
+                } else {
+                    assert!(tag.contains("<button "));
+                    assert!(tag.contains(" disabled "));
+                    assert!(!tag.contains("href="));
+                    assert!(!tag.contains("data-library-link"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn web_search_uses_ranked_matches_across_categories_and_renders_linked_rows() {
+        let temp_root = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = temp_root.join(format!(
+            "phonolite-web-search-{}-{nonce}",
+            std::process::id()
+        ));
+        assert!(root.starts_with(&temp_root));
+        for file in [
+            "Radiohead/OK Computer/Paranoid Android.mp3",
+            "Björk/Debut/Human Behaviour.mp3",
+        ] {
+            let path = root.join("music").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"not really audio").unwrap();
+        }
+        let (library, _) = library::Library::load_or_scan(
+            vec![library::LibraryRoot::new(String::new(), root.join("music"))],
+            root.join("library.redb"),
+        )
+        .unwrap();
+        let template = include_str!("../../../../../web/templates/partials/search_result.html");
+        for query in ["Radiohead", "raidohed", "radio head"] {
+            let results = crate::library_search::search_library(&library, query, 50).unwrap();
+            for kind in ["artist", "album", "track"] {
+                assert!(
+                    results.iter().any(|result| result.kind == kind),
+                    "{query}: {kind}"
+                );
+            }
+            let html = super::render_library_matches(
+                &library,
+                &results,
+                query,
+                SearchFilter::Tracks,
+                template,
+            );
+            assert!(html.contains("Search results"));
+            for (kind, icon) in [
+                ("Artist", "user-round"),
+                ("Album", "disc-3"),
+                ("Track", "music"),
+            ] {
+                assert!(html.contains(&format!(
+                    "class=\"library-search-result-badge\" role=\"img\" aria-label=\"{kind}\""
+                )));
+                assert!(html.contains(&format!("class=\"lucide lucide-{icon}\"")));
+            }
+            assert!(!html.contains("library-search-result-kind"));
+            assert_eq!(html.matches("role=\"listitem\"").count(), results.len());
+            assert!(html.contains("&amp;filter=tracks&amp;artist_id="));
+            assert!(html.contains("&amp;filter=tracks&amp;album_id="));
+            assert!(html.contains("#track-"));
+            assert!(!html.contains("tile-grid"));
+            assert!(!html.contains("pagination-controls"));
+        }
+        let best = crate::library_search::search_library(&library, "Radiohead", 1).unwrap();
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0].title, "Radiohead");
+        let empty = super::render_library_matches(
+            &library,
+            &[],
+            "<script>missing</script>",
+            SearchFilter::Albums,
+            template,
+        );
+        assert!(empty.contains("No results found"));
+        assert!(empty.contains("&lt;script&gt;missing&lt;/script&gt;"));
+        assert!(!empty.contains("<script>"));
+        let results = [crate::state::SearchResult {
+            kind: "artist".to_string(),
+            id: "artist&1".to_string(),
+            title: "<script>title</script>".to_string(),
+            subtitle: Some("<img src=x>".to_string()),
+            album_id: None,
+            score: 100,
+        }];
+        let html = super::render_library_matches(
+            &library,
+            &results,
+            "a&b",
+            SearchFilter::Artists,
+            template,
+        );
+        assert!(html.contains("&lt;script&gt;title&lt;/script&gt;"));
+        assert!(html.contains("&lt;img src=x&gt;"));
+        assert!(html.contains("search=a%26b&amp;filter=artists&amp;artist_id=artist%261"));
+        assert!(!html.contains("<script>"));
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

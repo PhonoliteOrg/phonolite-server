@@ -102,8 +102,122 @@ input[type="radio"] {
   cursor: pointer;
 }
 
+/* Shared field surface, matching the listening app's 48 px Library SearchHud. */
+input.obsidian-input:not([type="hidden"]),
+.search-input-wrapper {
+  min-width: 0;
+  min-height: 48px;
+  height: 48px;
+  padding-block: 0;
+  padding-inline: 24px 16px;
+  border: 0;
+  border-radius: 0;
+  background: var(--search-background);
+  box-shadow: inset 0 -1px 0 var(--search-border);
+  transition: box-shadow var(--transition);
+}
+
+input.obsidian-input:not([type="hidden"]):focus,
+.search-input-wrapper:focus-within {
+  outline: 0;
+  box-shadow: inset 0 -1px 0 var(--accent);
+}
+
+input.obsidian-input[aria-invalid="true"],
+input.obsidian-input[aria-invalid="true"]:focus {
+  box-shadow: inset 0 -1px 0 var(--danger);
+}
+
+.search-input-wrapper {
+  display: flex;
+  align-items: center;
+  flex: 1;
+}
+
+input.obsidian-input:not([type="hidden"]),
+.search-input-wrapper input.search-input {
+  color: var(--search-ink);
+  caret-color: var(--accent);
+  font-family: var(--display-font);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: 1px;
+}
+
+.search-input-wrapper input.search-input {
+  align-self: stretch;
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  appearance: none;
+}
+
+input.obsidian-input::placeholder,
+.search-input-wrapper input.search-input::placeholder {
+  color: var(--search-hint);
+  font-weight: 400;
+}
+
+.search-input-wrapper input.search-input:focus {
+  outline: 0;
+  box-shadow: none;
+}
+
+.search-input-wrapper input.search-input::-webkit-search-cancel-button,
+.search-input-wrapper input.search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+}
+
+.search-icon-container {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  flex-shrink: 0;
+}
+
+.search-icon-container:empty {
+  display: none;
+}
+
+.search-input-wrapper .search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  width: 48px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  text-decoration: none;
+  transition: color 200ms ease;
+}
+
+.search-input-wrapper .search-clear:is(:hover, :focus-visible, :active) {
+  background: transparent;
+  color: var(--accent);
+}
+
+.search-input-wrapper .search-clear svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  transition: filter 200ms ease;
+}
+
+.search-input-wrapper .search-clear:hover svg {
+  filter: drop-shadow(0 0 5px var(--search-clear-glow));
+}
+
 button,
-.button {
+.button,
+.file-input::file-selector-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -126,7 +240,8 @@ button,
 }
 
 button:hover,
-.button:hover {
+.button:hover,
+.file-input:not(:disabled)::file-selector-button:hover {
   border-color: var(--accent-hover);
   background: var(--accent-hover);
   color: var(--bg);
@@ -136,6 +251,23 @@ button:disabled,
 .button:disabled,
 .button[aria-disabled="true"] {
   opacity: 0.4;
+  cursor: not-allowed;
+}
+
+input.file-input[type="file"] {
+  min-height: 42px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+}
+
+.file-input::file-selector-button {
+  margin-inline-end: 12px;
+}
+
+.file-input:disabled::file-selector-button {
   cursor: not-allowed;
 }
 
@@ -251,7 +383,42 @@ button:disabled,
   gap: 8px;
 }
 
-.tab-chip,
+/* Shared Library / Logs selector, matching ObsidianToggleOption in the app. */
+.tab-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 88px;
+  min-height: 48px;
+  padding: 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--display-font);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 1.2px;
+  text-decoration: none;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 180ms ease, border-color 180ms ease;
+}
+
+.tab-chip:is(:hover, :focus-visible, :active) {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent);
+}
+
+.tab-chip:is(.active, [aria-current="page"], [aria-pressed="true"], [aria-selected="true"]) {
+  border-bottom-color: var(--accent);
+  background: transparent;
+  color: var(--accent);
+}
+
 .tab-link,
 .filter-pill {
   display: inline-flex;
@@ -271,7 +438,6 @@ button:disabled,
   text-decoration: none;
 }
 
-.tab-chip:hover,
 .tab-link:hover,
 .filter-pill:hover {
   border-color: var(--border-strong);
@@ -279,10 +445,8 @@ button:disabled,
   color: var(--ink);
 }
 
-.tab-chip.active,
 .tab-link.active,
-.filter-pill.active,
-.tab-chip[aria-selected="true"] {
+.filter-pill.active {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);

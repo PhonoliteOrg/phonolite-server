@@ -1,4 +1,7 @@
 //! Direct TLS termination is required: the OPAQUE context uses this connection's exporter.
+mod rotation;
+pub(crate) use rotation::{activate_pending_rotation, prepare_rotation};
+
 use crate::{
     admin::access::AdminAccess,
     config::{resolve_path, ServerConfig},
@@ -131,8 +134,13 @@ pub fn renew(config: &ServerConfig, path: &Path) -> Result<(), Box<dyn std::erro
     let replacement = cert.with_extension(format!("{}.renewed.pem", uuid::Uuid::new_v4()));
     write_secret(&replacement, renewed.pem().as_bytes())?;
     // Preserve the old certificate until the replacement is completely written.
+    replace_file(&replacement, &cert)?;
+    Ok(())
+}
+
+pub(super) fn replace_file(replacement: &Path, target: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
-    fs::rename(&replacement, &cert)?;
+    fs::rename(replacement, target)?;
     #[cfg(windows)]
     unsafe {
         use std::os::windows::ffi::OsStrExt;
@@ -144,14 +152,14 @@ pub fn renew(config: &ServerConfig, path: &Path) -> Result<(), Box<dyn std::erro
             .encode_wide()
             .chain(Some(0))
             .collect();
-        let target: Vec<u16> = cert.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
         if MoveFileExW(
             source.as_ptr(),
             target.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         ) == 0
         {
-            return Err(io::Error::last_os_error().into());
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -294,8 +302,21 @@ async fn serve_connection<T>(
         .await;
         return;
     }
-    let Ok(Ok(stream)) = tokio::time::timeout_at(deadline, acceptor.accept(socket)).await else {
-        return;
+    let stream = match tokio::time::timeout_at(deadline, acceptor.accept(socket)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %peer,
+                port = policy.port,
+                error = %error,
+                "TLS handshake failed"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(%peer, port = policy.port, "TLS handshake timed out");
+            return;
+        }
     };
     let mut binding = [0u8; 32];
     if stream

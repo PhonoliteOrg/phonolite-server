@@ -20,7 +20,7 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
             "UserDataStore::new(Arc::clone(&user_db))",
             "StatsStore::new(Arc::clone(&stats_db))",
             "StreamCache::new(stream_cache_dir, config.stream_cache_enabled)",
-            ".nest(\"/api/v1\", api_router(state.clone()))",
+            ".nest(\"/api\", api_router(state.clone()))",
             "let admin_app = admin_router(state.clone(), admin_address);",
             "tls::Endpoint::Admin",
             "tls::Endpoint::Api",
@@ -28,6 +28,11 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
             "TraceLayer::new_for_http()",
             "LatencyUnit::Millis",
         ],
+    );
+    assert!(
+        main_rs.find("std::env::var(\"PHONOLITE_START_DELAY_MS\")").unwrap()
+            < main_rs.find("Library::open_db(&index_path)?").unwrap(),
+        "a replacement process must wait before acquiring database locks"
     );
 }
 

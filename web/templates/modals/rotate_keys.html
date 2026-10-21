@@ -1,0 +1,20 @@
+<div class="modal" id="modal-rotate-keys" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="rotate-keys-title" aria-describedby="rotate-keys-description">
+  <div class="modal-backdrop" data-modal-close></div>
+  <div class="modal-card" tabindex="-1">
+    <div class="modal-header"><h2 id="rotate-keys-title">Regenerate server keys?</h2></div>
+    <p class="muted" id="rotate-keys-description">The server will restart with a new identity. Playback stops and all sessions end. Your browser will show a new certificate. Apps will require users to sign back in and verify the replacement key during sign-in. This cannot be undone from Settings.</p>
+    <form method="post" action="/settings/security/rotate-keys" id="form-rotate-keys" class="stack">
+      <label for="rotate-keys-password">Your current administrator password</label>
+      <input class="obsidian-input" id="rotate-keys-password" name="password" type="password" autocomplete="current-password" required />
+      <label class="row" for="rotate-keys-confirm">
+        <input id="rotate-keys-confirm" name="confirm" type="checkbox" value="rotate" required />
+        <span>I understand that everyone will be disconnected and must sign back in.</span>
+      </label>
+      <p class="inline-error" id="rotate-keys-error" role="alert"></p>
+      <div class="row right">
+        <button class="button ghost" type="button" data-modal-close autofocus>Cancel</button>
+        <button class="button" type="submit" id="confirm-rotate-keys">Regenerate keys and restart</button>
+      </div>
+    </form>
+  </div>
+</div>

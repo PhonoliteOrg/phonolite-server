@@ -1,9 +1,9 @@
 //! Console templates, escaping, and display formatting.
 use axum::http::StatusCode;
 use axum::response::Response;
-use std::path::PathBuf;
 
 use super::console::{ConsoleError, ConsoleView};
+use super::web_assets::WebAssets;
 use crate::http::html_response;
 use crate::state::AppState;
 
@@ -137,6 +137,7 @@ fn build_page_view(
                 ("nav_users_current", current("users")),
                 ("nav_logs_current", current("logs")),
                 ("nav_settings_current", current("settings")),
+                ("server_version", escape_html(env!("CARGO_PKG_VERSION"))),
             ],
         )
     } else {
@@ -178,57 +179,11 @@ pub fn apply_template(mut template: String, replacements: &[(&str, String)]) -> 
     template
 }
 
-pub fn load_template(state: &AppState, name: &str) -> Result<String, String> {
-    let path = web_root(state).join(name);
-    std::fs::read_to_string(&path)
-        .map_err(|err| format!("failed to read {}: {}", path.display(), err))
-}
-
-pub fn web_root(state: &AppState) -> PathBuf {
-    if let Ok(value) = std::env::var("PHONOLITE_WEB_ROOT") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            let candidate = PathBuf::from(trimmed);
-            if candidate.is_dir() {
-                return candidate;
-            }
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Some(base) = state
-        .config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        candidates.push(base.join("web"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(base) = exe.parent().filter(|p| !p.as_os_str().is_empty()) {
-            candidates.push(base.join("web"));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("web"));
-        candidates.push(cwd.join("server").join("web"));
-    }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("web"),
-    );
-
-    for candidate in &candidates {
-        if candidate.is_dir() {
-            return candidate.clone();
-        }
-    }
-
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| PathBuf::from("web"))
+pub fn load_template(_state: &AppState, name: &str) -> Result<String, String> {
+    WebAssets::configured()
+        .get(name)
+        .ok_or_else(|| format!("template not found: {name}"))?
+        .text()
 }
 
 pub fn url_escape(input: &str) -> String {

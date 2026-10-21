@@ -12,6 +12,18 @@
 - Some items describe operational limits, security tradeoffs, or UI gaps because they materially affect current behavior.
 - Requirement IDs are grouped by concern so future tests, issues, and refactors can trace back to the current server contract.
 
+## Portable Metadata Backups
+- BACKUP-001: Administrators shall be able to download versioned, compressed `.phonolite` metadata backups and upload them through authenticated same-origin preview and restore routes in Settings.
+- BACKUP-002: Backups shall include catalog metadata, source credits, verified display-credit resolutions, provider identity proofs, available downloaded artist artwork, and retained imports; audio, local artwork, credentials, configuration secrets, user data, logs and disposable caches shall remain separate.
+- BACKUP-003: Restore shall fill missing fields without overwriting existing non-empty fields or installing source paths/media IDs. Matching shall verify title, year, artist identities and complete track details before using relative folder hints to disambiguate candidates. Absolute root paths shall be omitted.
+- BACKUP-004: Unmatched and ambiguous imported metadata shall remain outside the playable catalog, survive restarts and re-export, and retry on subsequent local scans. Explicit full reindex shall discard retained imports.
+- BACKUP-005: Imported verified display-credit resolutions shall preserve existing local resolutions, rebuild through normal source-driven indexing, and respect explicit local tags. Provider proofs shall retain normal source-context validation.
+- BACKUP-006: Import shall verify the format version, compressed-payload integrity, compressed/expanded size bounds and artwork paths before committing metadata. Preview shall roll back proposed database changes and shall not write artwork. Artwork shall use content-addressed filenames and reject conflicting existing files.
+- BACKUP-007: The backup format shall be portable and unencrypted. V2 archives shall default to configurable limits of 16 GiB compressed per file, 32 GiB expanded per backup set and 1 GiB for the catalog manifest, with a separate bound of 16 MiB per artwork file. Existing v1 backups shall remain readable within their original decoding bounds. A single Upload backup files button shall open the multi-file picker and start uploading and restoring automatically after selection; complete-set validation shall precede metadata changes. The console shall display matching counts inline and cancel page-owned requests on disposal.
+- BACKUP-008: V2 backups shall deduplicate artwork by content hash and use temporary disk storage for upload, archive creation and artwork validation. Transfers shall stream without buffering the complete archive in server or JavaScript memory. Per-operation scratch files shall be cleaned up when their operation ends; at most eight staged jobs shall be retained for 24 hours after their last use while the server remains running, with request-driven cleanup and explicit removal controls. The console shall apply the configured server upload limit to each file.
+- BACKUP-009: Exports exceeding the per-file limit shall become numbered .phonolite parts with v3 envelopes identifying their backup set, order, count, total bytes, and part/set checksums. Each downloaded file including its envelope shall respect the limit. Uploads shall accept multiple files together or separately in any order, ignore identical retries, reject conflicting or damaged parts, and require every part before applying metadata. Single-file v1/v2 backups shall remain supported.
+- BACKUP-010: Exports and complete-set checking/restores shall process staged disk files in background jobs that survive console navigation. The download button shall remain busy through preparation until the server observes a download request, with bounded recovery and individual links if browser policy blocks automatic downloads. The persistent bottom sidebar shall show upload, missing-part, checking, restore, completion and failure status; completing a restore shall refresh only an active Library view. Restarting the server shall require reuploading incomplete or checked sets, without losing already restored metadata.
+
 ## Runtime, Startup, and Process Model
 - RUN-001: The server shall start from a Tokio multi-thread runtime and initialize configuration, logging, databases, state stores, routers, and listeners before serving requests.
 - RUN-002: The server shall read its primary configuration path from `PHONOLITE_CONFIG` when that variable is non-empty.
@@ -20,7 +32,7 @@
 - RUN-005: Relative config-backed paths shall resolve against the config file directory rather than against the current working directory.
 - RUN-006: The server shall initialize structured logging before binding network listeners.
 - RUN-007: The HTTP server shall bind to the configured host and port using Axum.
-- RUN-008: The HTTP router shall nest the JSON API under `/api/v1` and merge the admin console at the root path.
+- RUN-008: The HTTP router shall nest the JSON API under `/api` and merge the admin console at the root path.
 - RUN-009: The HTTP stack shall add an `X-Request-Id` request ID layer.
 - RUN-010: The HTTP stack shall emit request tracing with response latency recorded in milliseconds.
 - RUN-011: The startup sequence shall create or open the main library index database before serving API or admin traffic.
@@ -34,7 +46,7 @@
 - RUN-019: The process shall support graceful shutdown on `ctrl-c`.
 - RUN-020: On Unix, graceful shutdown shall also respond to `SIGTERM`.
 - RUN-021: If QUIC is enabled in config, the server shall launch the QUIC listener alongside the HTTP server.
-- RUN-022: The server shall expose a web-root lookup mechanism that prefers `PHONOLITE_WEB_ROOT` and otherwise falls back through several filesystem candidates near the config, executable, current working directory, and workspace.
+- RUN-022: Every server build shall embed the console templates and static assets and serve them without an external web directory. A non-empty `PHONOLITE_WEB_ROOT` shall explicitly select a complete disk override limited to known bundled paths, with missing files reported as errors; otherwise the embedded console shall be used without filesystem discovery. Cargo shall rebuild the bundle after source asset edits, additions or removals.
 
 ## Configuration and Defaults
 - CFG-001: The current config schema version shall be `8`.
@@ -138,7 +150,7 @@
 - LIB-045: Artist-folder sidecars shall describe only the matching tagged artist, and genre normalization shall preserve specific subgenres and recognized compound labels. Web library and API genre labels shall use consistent title case with customary acronym casing, including for existing metadata, without rewriting stored tags or matching keys.
 - LIB-046: Explicit track genres shall remain independent of other tracks' genres; aggregate album genres shall supply a fallback only when a track lacks its own genre tags.
 - LIB-047: The artist browser and search shall include main album and song artists and explicitly featured guests by default; supporting contributors shall require an explicit contributor filter. Filtering shall precede pagination and totals.
-- LIB-048: Artist profiles shall distinguish solo headline Albums, Collab albums with joint album billing, Appears on with billed song appearances, and Other credits with supporting roles; each canonical album shall appear once per section with its relevant song scope.
+- LIB-048: Artist profiles shall distinguish solo headline Albums, Collab albums with joint album billing, Appears on with billed song appearances, and Other credits with supporting roles; each canonical album shall appear once per section with its relevant song scope. Albums and Collab albums shall be excluded from Other credits while retaining all detailed album and track credits.
 - LIB-049: Explicit repeated artist tags and dedicated ARTISTS/ALBUMARTISTS fields shall establish separate ordered credits; clear list and featured-artist separators shall identify collaborators, while ambiguous punctuation shall require independent identity evidence and legitimate compound band names shall remain intact.
 - LIB-050: Composer, conductor, performer, and producer tags shall establish inspectable contributor roles, and provider metadata shall not remove local joint credits or promote a track-only guest into an album artist.
 - LIB-051: Artist playback shall include solo and joint headline albums and only the specifically credited songs from other collaborations. Download artist shall include solo and joint headline albums, with guest and contributor albums available through explicit album downloads.
@@ -170,7 +182,7 @@
 - META-023: Artist cover resolution shall prefer an explicit artist logo, then an explicit artist banner, then the first album cover owned by the artist.
 - META-024: Embedded-cover extraction shall use the first front-cover image when available and otherwise the first embedded picture.
 - META-025: Stable cover URLs shall require private HTTP cache revalidation (`private, no-cache`) so corrected artwork can be retrieved. Disk caches shall validate source references and file modification metadata, and replacement artist artwork shall use content-versioned references.
-- META-026: Clearing metadata assets shall remove the entire metadata root directory tree.
+- META-026: Explicit reindex shall remove the entire metadata root directory tree. Provider-source and root maintenance shall preserve independent imported artwork under `restored/`.
 - META-027: External artist enrichment and literal album search fallback shall require a unique normalized identity match; literal album enrichment shall verify both artist credit and title, and missing or ambiguous identities shall be skipped. A verified album release-group identity may establish cross-provider album metadata as specified in META-034 without changing local titles or credits.
 - META-028: MusicBrainz album-artist resolution shall validate the release title and locally indexed artist identity before scoring candidates, including fallback searches; provider credits shall preserve the local primary artist identity and order except for a verified repair of an unstructured combined display credit.
 - META-029: Additional MusicBrainz album artists shall require release-level artist billing and independent local tag support. Repeated song appearances shall not establish album ownership. Track-level collaborators shall require local and remote track titles to align in count and order, and conflicting artist aliases shall not canonicalize names.
@@ -208,34 +220,34 @@
 - AUTH-025: API logout shall revoke the presented bearer token when provided.
 
 ## JSON API Surface and Contracts
-- API-001: The canonical JSON API base path shall be `/api/v1`.
+- API-001: The canonical JSON API base path shall be `/api`. All Phonolite API routes, including download jobs, metadata snapshots/events, and listening counters, shall use this unversioned baseline without versioned URL aliases.
 - API-002: JSON error responses shall use the shape `{ "error": "<message>" }`.
-- API-003: `GET /api/v1/health` shall return `{ "status": "ok" }` without authentication.
-- API-004: `GET /api/v1/server/ports` shall return the configured HTTP port, QUIC port, and QUIC-enabled flag without authentication.
-- API-005: `POST /api/v1/auth/login` shall require `username` and `password` JSON fields.
-- API-006: `POST /api/v1/auth/logout` shall require a presented bearer token and return `400` when the token is missing.
+- API-003: `GET /api/health` shall return `{ "status": "ok" }` without authentication.
+- API-004: `GET /api/server/ports` shall return the configured HTTP port, QUIC port, and QUIC-enabled flag without authentication.
+- API-005: `POST /api/auth/login` shall require `username` and `password` JSON fields.
+- API-006: `POST /api/auth/logout` shall require a presented bearer token and return `400` when the token is missing.
 - API-007: All other current API endpoints shall be protected by the auth middleware.
 - API-008: Protected library endpoints shall return `503` when the library is unconfigured, missing, scanning, or in error.
-- API-009: `GET /api/v1/browse/artists` shall accept optional `search`, `limit`, and `offset` query parameters.
-- API-010: `GET /api/v1/browse/artists` shall default the limit to `200` and clamp the minimum logical limit to `1`.
-- API-011: `GET /api/v1/browse/artists` shall return a `ListResponse` with `items` and `total`.
+- API-009: `GET /api/browse/artists` shall accept optional `search`, `limit`, and `offset` query parameters.
+- API-010: `GET /api/browse/artists` shall default the limit to `200` and clamp the minimum logical limit to `1`.
+- API-011: `GET /api/browse/artists` shall return a `ListResponse` with `items` and `total`.
 - API-012: Artist browse items shall include individual artist ID, name, genres, total distinct headline and billed-appearance album count (`release_count`), solo and joint album counts, summary, logo reference, and banner reference. Supporting credits shall not inflate release or collaboration counts.
-- API-013: `GET /api/v1/browse/artists/:artist_id` shall return the raw artist object or `404`.
-- API-014: `GET /api/v1/browse/artists/:artist_id/albums` shall return solo and joint headline albums with resolved track counts and displayable artist names; `/releases` shall return solo Albums and consolidated Collab albums with roles and credited song scope.
-- API-015: `GET /api/v1/browse/albums/:album_id/tracks` shall return sorted track views and `404` when the album is not found.
+- API-013: `GET /api/browse/artists/:artist_id` shall return the raw artist object or `404`.
+- API-014: `GET /api/browse/artists/:artist_id/albums` shall return solo and joint headline albums with resolved track counts and displayable artist names; `/releases` shall return solo Albums and consolidated Collab albums with roles and credited song scope.
+- API-015: `GET /api/browse/albums/:album_id/tracks` shall return sorted track views and `404` when the album is not found.
 - API-016: Album-track sorting shall order by disc number, then track number, then lowercased title.
-- API-017: `GET /api/v1/browse/tracks/:track_id` shall return a single track view or `404`.
-- API-018: `GET /api/v1/browse/playlists/:playlist_id/tracks` shall return the playlist’s tracks in playlist order or `404`.
-- API-019: `GET /api/v1/browse/likes` shall return liked tracks.
+- API-017: `GET /api/browse/tracks/:track_id` shall return a single track view or `404`.
+- API-018: `GET /api/browse/playlists/:playlist_id/tracks` shall return the playlist’s tracks in playlist order or `404`.
+- API-019: `GET /api/browse/likes` shall return liked tracks.
 - API-020: Track views returned by browse and shuffle endpoints shall include `liked` and `in_playlists` booleans.
-- API-021: `GET /api/v1/library/albums/:album_id` shall return the raw album object or `404`.
-- API-022: `GET /api/v1/library/albums/:album_id/cover` shall return the album cover bytes or a JSON error.
-- API-023: `GET /api/v1/library/artists/:artist_id/cover` shall support optional `kind=logo` and `kind=banner` selection.
-- API-024: `GET /api/v1/library/search` shall require a non-empty `query` parameter.
+- API-021: `GET /api/library/albums/:album_id` shall return the raw album object or `404`.
+- API-022: `GET /api/library/albums/:album_id/cover` shall return the album cover bytes or a JSON error.
+- API-023: `GET /api/library/artists/:artist_id/cover` shall support optional `kind=logo` and `kind=banner` selection.
+- API-024: `GET /api/library/search` shall require a non-empty `query` parameter.
 - API-025: Search shall default to a limit of `40` and clamp the maximum limit to `100`.
 - API-026: Search shall score exact matches above prefix matches, prefix matches above contains matches, contains matches above token coverage, and token coverage above subsequence matches.
 - API-027: Search shall return mixed artist, album, and track result kinds sorted by descending score and then by title.
-- API-028: `GET /api/v1/library/shuffle` shall require a valid `mode` query parameter.
+- API-028: `GET /api/library/shuffle` shall require a valid `mode` query parameter.
 - API-029: Supported shuffle modes shall be `all`, `artist`, `album`, `custom`, and `liked`.
 - API-030: Artist shuffle shall require `artist_id`.
 - API-031: Album shuffle shall require `album_id`.
@@ -245,31 +257,31 @@
 - API-035: Liked shuffle shall draw from the globally stored liked-track set.
 - API-036: Shuffle results shall be randomly ordered before returning.
 - API-037: Empty shuffle results shall return `404 no tracks found`.
-- API-038: `GET /api/v1/library/playlists` shall return all stored playlists.
-- API-039: `POST /api/v1/library/playlists` shall reject empty or whitespace-only playlist names.
-- API-040: `POST /api/v1/library/playlists/:playlist_id` shall update playlist name and/or track IDs when the playlist exists.
-- API-041: `DELETE /api/v1/library/playlists/:playlist_id` shall return `404` when the playlist does not exist.
-- API-042: `POST /api/v1/library/likes/:track_id` shall mark a track ID as liked.
-- API-043: `DELETE /api/v1/library/likes/:track_id` shall remove a track ID from likes.
-- API-044: `GET /api/v1/player/settings` shall currently expose only `repeat_mode`.
-- API-045: `POST /api/v1/player/settings` shall currently accept only `repeat_mode` values `off` and `one`.
+- API-038: `GET /api/library/playlists` shall return all stored playlists.
+- API-039: `POST /api/library/playlists` shall reject empty or whitespace-only playlist names.
+- API-040: `POST /api/library/playlists/:playlist_id` shall update playlist name and/or track IDs when the playlist exists.
+- API-041: `DELETE /api/library/playlists/:playlist_id` shall return `404` when the playlist does not exist.
+- API-042: `POST /api/library/likes/:track_id` shall mark a track ID as liked.
+- API-043: `DELETE /api/library/likes/:track_id` shall remove a track ID from likes.
+- API-044: `GET /api/player/settings` shall currently expose only `repeat_mode`.
+- API-045: `POST /api/player/settings` shall currently accept only `repeat_mode` values `off` and `one`.
 - API-046: Previously recorded statistics and synchronization identity shall remain readable when collection is disabled; ingestion shall return `403`.
-- API-047: `GET /api/v1/stats` shall accept optional `year` and `month` query parameters.
+- API-047: `GET /api/stats` shall accept optional `year` and `month` query parameters.
 - API-048: A provided `month` shall be validated into the range `1..12`.
 - API-049: When neither `year` nor `month` is provided, stats shall default to the current UTC year and month.
 - API-050: When `year` is provided without `month`, stats shall return a year-wide aggregate.
 - API-051: Stats responses shall expose total minutes plus top tracks, artists, and genres.
 - API-052: Stats rankings shall currently be limited to the top five entries in each category.
-- API-053: `GET /api/v1/library/tracks/:track_id/offline-metadata` shall be protected and shall return a schema-versioned fragment containing the track view, owning album, primary artist and individual credited artist profiles for local download hydration.
-- API-054: `POST /api/v1/download/batches` shall be protected and shall accept `track_ids` plus an optional `client_batch_id`.
+- API-053: `GET /api/library/tracks/:track_id/offline-metadata` shall be protected and shall return a schema-versioned fragment containing the track view, owning album, primary artist and individual credited artist profiles for local download hydration.
+- API-054: `POST /api/download/batches` shall be protected and shall accept `track_ids` plus an optional `client_batch_id`.
 - API-055: Download batch responses shall include schema version, batch ID, created timestamp, available items, and unavailable track IDs without failing the whole batch for missing tracks.
 - API-056: Each download batch item shall include track ID, download URL, offline metadata fragment, byte length, content type, ETag, and SHA256 checksum.
 - API-057: Repeated batch manifest requests shall reuse a checksum cache keyed by file path, modified time, and byte length when the source file has not changed.
-- API-058: `GET /api/v1/download/tracks/:track_id` shall support `Range` plus `If-Range`, returning `206` only when the supplied ETag matches and returning a full `200` response when the ETag is stale or mismatched.
+- API-058: `GET /api/download/tracks/:track_id` shall support `Range` plus `If-Range`, returning `206` only when the supplied ETag matches and returning a full `200` response when the ETag is stale or mismatched.
 - API-059: Album and artist cover endpoints shall remain usable by authenticated app clients for offline artwork hydration, including album covers, artist logos, and artist banners.
-- API-060: `GET /api/v1/stats/sync` shall expose authenticated account identity, persistent server identity, collection state, history generation, and at most 200 commit-ordered listening events after a saved cursor.
-- API-061: `POST /api/v1/stats/events` shall authenticate ownership, gate recording by server and installation preferences, acknowledge identical retries, and reject conflicting event contents or session identity.
-- API-062: `POST /api/v1/stats/preferences` shall persist enabled-by-default recording consent per account and installation using monotonic revisions, including when server-wide collection is disabled.
+- API-060: `GET /api/stats/sync` shall expose authenticated account identity, persistent server identity, collection state, history generation, and at most 200 commit-ordered listening events after a saved cursor.
+- API-061: `POST /api/stats/events` shall authenticate ownership, gate recording by server and installation preferences, acknowledge identical retries, and reject conflicting event contents or session identity.
+- API-062: `POST /api/stats/preferences` shall persist enabled-by-default recording consent per account and installation using monotonic revisions, including when server-wide collection is disabled.
 - API-063: The summary response shall preserve the existing minute/ranking fields and expose exact listening milliseconds, qualified plays, unique tracks, and unique artists.
 
 ## Admin Console, HTML Flows, and Operator Actions
@@ -306,7 +318,7 @@
 - ADMIN-031: `GET /status/library` shall expose the current library status as JSON.
 - ADMIN-032: Library status JSON shall distinguish `unconfigured`, `missing`, `scanning`, `ready`, and `error` states.
 - ADMIN-033: `POST /settings/reindex` shall clear metadata assets and launch a full rescan when the library is available.
-- ADMIN-034: `POST /settings/scan` shall launch metadata and cover sweeps without forcing a full library rescan.
+- ADMIN-034: `POST /settings/scan` shall run incremental local discovery, reconnect retained imported metadata, and then launch metadata and cover sweeps without clearing existing enrichment.
 - ADMIN-035: `GET /library` shall render the admin library browser.
 - ADMIN-036: The admin library browser shall support `artists`, `albums`, and `tracks` filters.
 - ADMIN-037: The admin library browser shall support search and pagination.
@@ -336,6 +348,9 @@
 - ADMIN-061: Console page changes shall retain authenticated navigation and avoid page entrance fades or loading dimming. Library searches, filters, pagination, detail navigation, and history changes shall update only changed regions while preserving mounted search controls and newer text edits. User mutations shall reconcile authoritative table rows while retaining unchanged rows, edit mode, selection, and scroll. Settings saves shall retain the form and update its saved baseline in place. Scan completion shall update notices and refresh results only when Library is active.
 
 - ADMIN-062: Authenticated console views shall show indexing and metadata activity above the sidebar's server-actions button, with completed/total track reads and album-folder work during local indexing. Metadata gathering shall show the current sweep position in `[current/total]` format alongside the artist name or album title with its artist, including album-credit resolution. The position shall identify the item currently being processed using the same one-based numbering as the album-credit sweep logs, advance for skipped, failed, and unmatched checks, and reset for each phase/pass. Stored album completeness shall not determine this position. The current target shall remain visible through provider requests, retries, rate-limit waits, and storage, then clear when its lookup ends or the phase changes. Overlapping jobs shall retain independent positions and targets and remain active until all finish. The progress line shall hide when the library is ready and metadata work has stopped, including partial completion, and reappear for later work. This dedicated status shall update across page navigation and filesystem-triggered scans, with polling paused while the document is hidden.
+
+- ADMIN-063: Settings shall offer a separate Server security section with a Regenerate server keys action. `POST /settings/security/rotate-keys` shall require HTTPS, a same-origin authenticated administrator session, the current administrator password, and explicit confirmation. Password verification shall run off the async executor under existing authentication rate and concurrency limits; request decoding errors shall not echo secrets.
+- ADMIN-064: Key regeneration shall stage a fresh certificate/private-key pair shared by HTTPS, administration and QUIC, revoke all sessions and pending authentication attempts, notify connected apps through an authenticated `session_invalidated` event with ID `server_keys_rotated`, and restart the server to terminate existing connections. Before opening listeners, startup shall validate the staged pair, revoke sessions again, replace both identity files, and remove the staged record only after success; an interrupted replacement shall be recoverable on restart. The UI shall explain the restart and mandatory password sign-in to refresh app TLS pins against the retained OPAQUE identity, show the new public-key fingerprint, suppress duplicate submissions, clear password fields, and retain inline errors. Account credentials and library data shall remain intact.
 
 ## Logging, Activity, and Issue Tracking
 - LOG-001: Logging shall write to a log directory resolved from config.

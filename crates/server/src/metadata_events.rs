@@ -36,6 +36,15 @@ impl MetadataEventBus {
         self.tx.subscribe()
     }
 
+    pub fn emit_identity_rotation(&self) -> MetadataUpdateEvent {
+        self.emit(
+            "session_invalidated",
+            "server_keys_rotated".into(),
+            None,
+            None,
+        )
+    }
+
     pub fn emit_artist(&self, artist_id: impl Into<String>) -> MetadataUpdateEvent {
         let artist_id = artist_id.into();
         self.emit("artist", artist_id.clone(), None, Some(artist_id))

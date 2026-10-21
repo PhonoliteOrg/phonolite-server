@@ -8,6 +8,370 @@ use common::{artist_identity_id, Artist, ArtistCredit};
 use crate::normalization::merge_genres;
 use crate::{Library, LibraryRoot, ScanProgress};
 
+fn write_backup_track(workspace: &TestWorkspace, path: &str) {
+    workspace.write_audio(path);
+    fs::write(
+        workspace.path(path),
+        tagged_flac(&[
+            "TITLE=One",
+            "ALBUM=Portable Release",
+            "ALBUMARTIST=Portable Artist",
+            "ARTIST=Portable Artist",
+            "TRACKNUMBER=1",
+            "DATE=2024",
+        ]),
+    )
+    .unwrap();
+}
+
+fn enriched_backup(workspace: &TestWorkspace) -> (Library, Vec<crate::backup::CatalogBackup>) {
+    write_backup_track(workspace, "old/Portable Artist/Portable Release/One.flac");
+    let library = workspace.load_library(&[("old-root", "old")]);
+    let album = library.list_albums(None, 10, 0).unwrap().0.remove(0);
+    library
+        .update_album_enrichment(
+            &album.id,
+            Some("Saved release description".into()),
+            &["Jazz".into()],
+            false,
+        )
+        .unwrap();
+    library
+        .update_artist_enrichment(
+            &album.artist_id,
+            Some("Saved biography".into()),
+            &["Jazz".into()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    library
+        .set_album_source_identity(
+            &album.id,
+            &crate::AlbumSourceIdentity {
+                schema_version: 1,
+                context_fingerprint: "backup-test-source-context".into(),
+                musicbrainz_release_id: "11111111-1111-4111-8111-111111111111".into(),
+                musicbrainz_release_group_id: "22222222-2222-4222-8222-222222222222".into(),
+                canonical_title: "Portable Release".into(),
+                artist_names: vec!["Portable Artist".into()],
+                artist_ids: vec!["33333333-3333-4333-8333-333333333333".into()],
+                verified_at_ms: 123,
+                evidence: "Verified test programme".into(),
+            },
+        )
+        .unwrap();
+    let backup = library.export_metadata().unwrap();
+    (library, backup)
+}
+
+#[test]
+fn metadata_backup_matches_renamed_paths_and_root_ids_without_replacing_local_fields() {
+    let source = TestWorkspace::new("backup-source");
+    let (old, backup) = enriched_backup(&source);
+    let target = TestWorkspace::new("backup-moved");
+    write_backup_track(
+        &target,
+        "new/renamed artist/renamed folder/renamed file.flac",
+    );
+    let library = target.load_library(&[("new-root", "new")]);
+    let album = library.list_albums(None, 10, 0).unwrap().0.remove(0);
+    let original_id = old.list_albums(None, 10, 0).unwrap().0.remove(0).id;
+    assert_ne!(album.id, original_id);
+    let preview = library.preview_metadata(&backup).unwrap();
+    assert_eq!(preview.matched_albums, 1);
+    assert!(library
+        .get_album(&album.id)
+        .unwrap()
+        .unwrap()
+        .summary
+        .is_none());
+    assert_eq!(
+        library.export_metadata().unwrap().len(),
+        1,
+        "preview must not retain the upload"
+    );
+    let report = library.restore_metadata(&backup).unwrap();
+    assert_eq!(report.updated_albums, 1);
+    assert_eq!(report.updated_artists, 1);
+    let restored = library.get_album(&album.id).unwrap().unwrap();
+    assert_eq!(
+        restored.summary.as_deref(),
+        Some("Saved release description")
+    );
+    assert_eq!(restored.folder_relpath, album.folder_relpath);
+    assert_eq!(library.album_metadata_stats().unwrap().completed, 1);
+    assert_eq!(
+        library
+            .get_artist(&album.artist_id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("Saved biography")
+    );
+    assert!(library
+        .get_album_source_identity(&album.id, "backup-test-source-context")
+        .unwrap()
+        .is_some());
+    assert!(library
+        .get_album_source_identity(&album.id, "changed-source-context")
+        .unwrap()
+        .is_none());
+    assert_eq!(library.restore_metadata(&backup).unwrap().updated_albums, 0);
+    assert_eq!(
+        library.export_metadata().unwrap().len(),
+        2,
+        "repeated uploads are deduplicated"
+    );
+    library
+        .update_album_enrichment(
+            &album.id,
+            Some("New local description".into()),
+            &["Rock".into()],
+            true,
+        )
+        .unwrap();
+    library.restore_metadata(&backup).unwrap();
+    assert_eq!(
+        library
+            .get_album(&album.id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("New local description")
+    );
+    assert_eq!(
+        library.get_album(&album.id).unwrap().unwrap().genres,
+        ["Rock"]
+    );
+}
+
+#[test]
+fn metadata_backup_retains_missing_music_across_restart_export_and_later_scan() {
+    let source = TestWorkspace::new("backup-missing-source");
+    let (_old, backup) = enriched_backup(&source);
+    let target = TestWorkspace::new("backup-missing-target");
+    target.write_audio("new/Unrelated/Other/Two.mp3");
+    let library = target.load_library(&[("new-root", "new")]);
+    let report = library.restore_metadata(&backup).unwrap();
+    assert_eq!(report.unmatched_albums, 1);
+    assert_eq!(report.unmatched_artists, 1);
+    assert_eq!(report.library_albums_without_backup, 1);
+    assert_eq!(
+        library.stats().unwrap().albums,
+        1,
+        "unmatched records are never ghost albums"
+    );
+    assert_eq!(
+        library.export_metadata().unwrap()[1].albums[0]
+            .metadata
+            .summary
+            .as_deref(),
+        Some("Saved release description")
+    );
+    drop(library);
+    let library = target.load_library(&[("new-root", "new")]);
+    write_backup_track(&target, "new/moved/Returned/One.flac");
+    library.incremental_scan().unwrap();
+    let restored = library
+        .list_albums(None, 10, 0)
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|album| album.title == "Portable Release")
+        .unwrap();
+    assert_eq!(
+        restored.summary.as_deref(),
+        Some("Saved release description")
+    );
+    assert_eq!(restored.genres, ["Jazz"]);
+    assert!(library
+        .get_album_source_identity(&restored.id, "backup-test-source-context")
+        .unwrap()
+        .is_some());
+    assert_eq!(library.album_metadata_stats().unwrap().completed, 1);
+    // A future export carries unresolved imports too, enabling another redeploy.
+    assert!(library.export_metadata().unwrap().len() >= 2);
+    fs::remove_file(target.path("new/moved/Returned/One.flac")).unwrap();
+    library.incremental_scan().unwrap();
+    write_backup_track(&target, "new/moved/Returned/One.flac");
+    library.incremental_scan().unwrap();
+    assert!(library
+        .list_albums(None, 10, 0)
+        .unwrap()
+        .0
+        .iter()
+        .any(|album| album.summary.as_deref() == Some("Saved release description")));
+    library.scan_with_progress(true, None, &|_| {}).unwrap();
+    assert!(
+        library.export_metadata().unwrap().len() >= 2,
+        "root/schema rebuilds retain imports"
+    );
+    assert!(library
+        .list_albums(None, 10, 0)
+        .unwrap()
+        .0
+        .iter()
+        .any(|album| album.summary.as_deref() == Some("Saved release description")));
+    library.rescan().unwrap();
+    assert_eq!(
+        library.export_metadata().unwrap().len(),
+        1,
+        "explicit reindex clears retained imports"
+    );
+}
+
+#[test]
+fn metadata_backup_rejects_same_path_with_changed_release_or_tracklist() {
+    let source = TestWorkspace::new("backup-identity");
+    let (library, mut backup) = enriched_backup(&source);
+    let album = library.list_albums(None, 10, 0).unwrap().0.remove(0);
+    backup[0].albums[0].tracks[0].track.title = "A different song".into();
+    assert_eq!(
+        library.preview_metadata(&backup).unwrap().unmatched_albums,
+        1
+    );
+    backup[0].albums[0].tracks[0].track.title = "One".into();
+    backup[0].albums[0].source.year = Some(2001);
+    assert_eq!(
+        library.preview_metadata(&backup).unwrap().unmatched_albums,
+        1
+    );
+    assert_eq!(
+        library
+            .get_album(&album.id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("Saved release description")
+    );
+}
+
+#[test]
+fn metadata_backup_keeps_ambiguous_editions_unattached() {
+    let source = TestWorkspace::new("backup-ambiguous-source");
+    let (_old, mut backup) = enriched_backup(&source);
+    let target = TestWorkspace::new("backup-ambiguous-target");
+    write_backup_track(&target, "new/artist/release/One.flac");
+    let library = target.load_library(&[("new-root", "new")]);
+    let mut album = library.list_albums(None, 10, 0).unwrap().0.remove(0);
+    let mut track = library.get_album_tracks(&album.id).unwrap().remove(0);
+    album.id = "other-edition".into();
+    album.folder_relpath = "new-root::artist/other release".into();
+    track.id = "other-track".into();
+    track.album_id = album.id.clone();
+    let db = library.db();
+    let write = db.begin_write().unwrap();
+    write
+        .open_table(crate::storage::ALBUMS_TABLE)
+        .unwrap()
+        .insert(
+            album.id.as_str(),
+            crate::storage::encode_value(&album).unwrap().as_slice(),
+        )
+        .unwrap();
+    write
+        .open_table(crate::storage::TRACKS_TABLE)
+        .unwrap()
+        .insert(
+            track.id.as_str(),
+            crate::storage::encode_value(&track).unwrap().as_slice(),
+        )
+        .unwrap();
+    write.commit().unwrap();
+    backup[0].albums[0].source.folder_relpath = "old-root::no current path hint".into();
+    let report = library.restore_metadata(&backup).unwrap();
+    assert_eq!(report.ambiguous_albums, 1);
+    assert_eq!(report.matched_albums, 0);
+    assert!(library
+        .get_album(&album.id)
+        .unwrap()
+        .unwrap()
+        .summary
+        .is_none());
+}
+
+#[test]
+fn metadata_backup_restores_verified_credit_repairs_through_the_regular_catalog_builder() {
+    let source = TestWorkspace::new("backup-credit-source");
+    let target = TestWorkspace::new("backup-credit-target");
+    let tags = tagged_flac(&[
+        "TITLE=Song",
+        "ALBUM=Album",
+        "ARTIST=Earth, Wind, Fire",
+        "ALBUMARTIST=Earth, Wind, Fire",
+    ]);
+    for (workspace, path) in [
+        (&source, "root/Old/Album/Song.flac"),
+        (&target, "root/New/Album/Song.flac"),
+    ] {
+        workspace.write_audio(path);
+        fs::write(workspace.path(path), &tags).unwrap();
+    }
+    let old = source.load_library(&[("old", "root")]);
+    let album = old.list_albums(None, 1, 0).unwrap().0.remove(0);
+    assert!(old
+        .resolve_album_display_credit(
+            &album.id,
+            &[ArtistCredit {
+                artist_id: "verified-provider-group-id".into(),
+                name: "Earth, Wind & Fire".into(),
+                credited_name: "Earth, Wind, Fire".into(),
+                role: "album_artist".into(),
+                join_phrase: String::new(),
+                source: "musicbrainz".into(),
+            }]
+        )
+        .unwrap());
+    let album = old.get_album(&album.id).unwrap().unwrap();
+    old.update_album_enrichment(
+        &album.id,
+        Some("Verified release".into()),
+        &["Soul".into()],
+        false,
+    )
+    .unwrap();
+    old.update_artist_enrichment(
+        &album.artist_id,
+        Some("Verified group biography".into()),
+        &[],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let backup = old.export_metadata().unwrap();
+    let library = target.load_library(&[("new", "root")]);
+    let report = library.restore_metadata(&backup).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.restored_credit_resolutions, 1);
+    assert_eq!(report.matched_albums, 1);
+    assert_eq!(report.matched_artists, 1);
+    let restored = library.list_albums(None, 1, 0).unwrap().0.remove(0);
+    assert_eq!(restored.artist_names, ["Earth, Wind & Fire"]);
+    assert_eq!(restored.summary.as_deref(), Some("Verified release"));
+    assert_eq!(
+        library
+            .get_artist(&restored.artist_id)
+            .unwrap()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("Verified group biography")
+    );
+    assert_eq!(
+        library
+            .restore_metadata(&backup)
+            .unwrap()
+            .restored_credit_resolutions,
+        0
+    );
+}
+
 #[test]
 fn album_metadata_counts_only_complete_stored_records_and_survives_reload_and_rescans() {
     let workspace = TestWorkspace::new("metadata-counts");
@@ -1265,6 +1629,98 @@ fn startup_repairs_composite_artists_once_without_copying_their_metadata() {
         .open_table(redb::TableDefinition::<&str, &[u8]>::new("file_tags_v3"))
         .is_err());
     assert!(!Library::load_or_scan_with_db(roots, db).unwrap().1);
+}
+
+#[test]
+fn headline_albums_do_not_repeat_in_other_credits() {
+    use crate::storage::{encode_value, ALBUM_CREDITS_TABLE};
+
+    for shared in [false, true] {
+        let workspace = TestWorkspace::new("headline-other-credits");
+        workspace.write_audio("root/Main/Album/01.mp3");
+        let library = workspace.load_library(&[("", "root")]);
+        let names = if shared {
+            vec!["Main", "Partner"]
+        } else {
+            vec!["Main"]
+        };
+        seed_cached_tags(
+            &library,
+            &workspace.path("root/Main/Album/01.mp3"),
+            metadata::TagInfo {
+                album_artist: Some(names.join(" & ")),
+                album_artists: names.iter().map(|name| (*name).into()).collect(),
+                artist: Some("Main".into()),
+                artists: vec!["Main".into()],
+                title: Some("Song".into()),
+                contributions: vec![
+                    metadata::TagContribution {
+                        name: "Main".into(),
+                        role: "composer".into(),
+                    },
+                    metadata::TagContribution {
+                        name: "Partner".into(),
+                        role: "producer".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            b"headline supporting roles fixture",
+        );
+        library.incremental_scan().unwrap();
+        let album = library.list_albums(None, 1, 0).unwrap().0.remove(0);
+        let mut credits = library.album_credits(&album.id).unwrap();
+        credits.credits.extend(
+            crate::credits::source_credits("Main", &["Main".into()], "producer", "local_tags")
+                .credits,
+        );
+        let db = library.db();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(ALBUM_CREDITS_TABLE)
+            .unwrap()
+            .insert(
+                album.id.as_str(),
+                encode_value(&credits).unwrap().as_slice(),
+            )
+            .unwrap();
+        write.commit().unwrap();
+
+        for name in &names {
+            let releases = library
+                .artist_release_relationships(&artist_identity_id(name))
+                .unwrap();
+            assert_eq!(releases.albums.len(), usize::from(!shared));
+            assert_eq!(releases.collab_albums.len(), usize::from(shared));
+            assert!(releases.appears_on.is_empty());
+            assert!(
+                releases.other_credits.is_empty(),
+                "{name} is billed on the album"
+            );
+        }
+        if !shared {
+            let partner = library
+                .artist_release_relationships(&artist_identity_id("Partner"))
+                .unwrap();
+            assert_eq!(partner.other_credits[0].album.id, album.id);
+            assert_eq!(partner.other_credits[0].roles, ["producer"]);
+        }
+        assert!(library
+            .album_credits(&album.id)
+            .unwrap()
+            .credits
+            .iter()
+            .any(|credit| credit.artist_id == artist_identity_id("Main")
+                && credit.role == "producer"));
+        let track = library.get_album_tracks(&album.id).unwrap().remove(0);
+        assert!(library
+            .track_credits(&track.id)
+            .unwrap()
+            .credits
+            .iter()
+            .any(|credit| credit.artist_id == artist_identity_id("Main")
+                && credit.role == "composer"));
+    }
 }
 
 #[test]

@@ -36,17 +36,17 @@ requests cannot choose an account. `server_id` is durable. The local account key
 combines that server identity with the authenticated user ID. Device identifiers
 are random installation identifiers; never reuse one for independent databases.
 
-- `GET /stats/v2/state?device_id=...` returns server/user identity,
+- `GET /stats/state?device_id=...` returns server/user identity,
   `history_generation`, collection and device preferences, `preference_revision`,
   `checkpoint: {last_sequence,last_hash,upgraded}`, and
   `months: [{year,month,revision}]`.
-- `POST /stats/v2/activate` accepts `{device_id,history_generation}` after the
+- `POST /stats/activate` accepts `{device_id,history_generation}` after the
   installation has reconciled all its pending v1 event IDs. It fences future v1
   writes from that device and returns its checkpoint.
-- `POST /stats/v2/batch` accepts the payload below. Each batch contains one month,
+- `POST /stats/batch` accepts the payload below. Each batch contains one month,
   at most 200 contributions, and at most 256 KiB of canonical JSON. Metadata is
   included once for each referenced snapshot.
-- `GET /stats/v2/snapshot?device_id=...&year=2026&month=10&after=...&revision=...`
+- `GET /stats/snapshot?device_id=...&year=2026&month=10&after=...&revision=...`
   returns a bounded page of contributions, their shared metadata, genre reporting
   projections, the month revision, the requesting device's checkpoint, and
   `next_key`/`has_more`. The revision and checkpoint are read in one transaction.

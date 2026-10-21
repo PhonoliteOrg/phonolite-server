@@ -169,7 +169,7 @@ test("the library feature preserves native modified and external link behavior",
 test("library remounts dispose delegated listeners and leave Back/Forward to the router", () => {
   const { window, document, navigations, click, dispose } = libraryHarness();
   dispose();
-  for (const name of ["click", "submit", "change"]) assert.equal(document.listeners.get(name).size, 0);
+  for (const name of ["click", "submit"]) assert.equal(document.listeners.get(name).size, 0);
   click("/library?filter=albums");
   assert.equal(navigations.length, 0);
   const libraryAgain = setupLibrary();
@@ -713,7 +713,7 @@ test("navigation drawers and dialogs trap focus, restore nested focus, and handl
   document.emit("keydown", { key: "Escape", preventDefault() {} });
 });
 
-function settingsHarness() {
+function settingsHarness({ security = false } = {}) {
   const document = new Events();
   document.body = new Element();
   const content = new Element();
@@ -743,6 +743,25 @@ function settingsHarness() {
   content.append(form, saveBar, formError);
   document.body.append(content, unsaved);
   const nodes = { settings: form, "settings-save-bar": saveBar, "save-settings": save, "settings-save-status": status, "settings-error": formError, "modal-unsaved": unsaved, "unsaved-discard": discard, "unsaved-stay": stay };
+  if (security) {
+    for (const id of ["open-rotate-keys", "modal-rotate-keys", "form-rotate-keys", "rotate-keys-password", "rotate-keys-confirm", "confirm-rotate-keys", "rotate-keys-error", "server-security-status", "server-security-error"]) {
+      nodes[id] = new Element(); nodes[id].id = id;
+    }
+    const modal = nodes["modal-rotate-keys"];
+    modal.className = "modal";
+    const card = new Element(); card.className = "modal-card";
+    const rotationForm = nodes["form-rotate-keys"];
+    const password = nodes["rotate-keys-password"];
+    const confirmation = nodes["rotate-keys-confirm"];
+    Object.assign(password, { name: "password", type: "password", value: "" });
+    Object.assign(confirmation, { name: "confirm", type: "checkbox", value: "rotate", checked: false });
+    rotationForm.elements = [password, confirmation];
+    rotationForm.reportValidity = () => Boolean(password.value && confirmation.checked);
+    rotationForm.append(password, confirmation, nodes["confirm-rotate-keys"]);
+    card.append(rotationForm); modal.append(card); document.body.append(modal);
+    content.append(nodes["open-rotate-keys"], nodes["server-security-status"], nodes["server-security-error"]);
+    nodes["open-rotate-keys"].tagName = nodes["confirm-rotate-keys"].tagName = "BUTTON";
+  }
   document.getElementById = (id) => nodes[id] || null;
   document.querySelector = (selector) => selector === ".content" ? content : null;
   document.querySelectorAll = () => [unsaved];
@@ -764,7 +783,7 @@ function settingsHarness() {
   configureNavigation({ refresh() { refreshes++; return Promise.resolve(true); } });
   const lifecycle = setupSettings();
   return {
-    document, window, content, form, formError, port, save, saveBar, status, unsaved, discard, stay, requests, lifecycle,
+    document, window, content, form, formError, port, save, saveBar, status, unsaved, discard, stay, requests, lifecycle, nodes,
     refreshes: () => refreshes,
     edit(value) { port.value = value; form.emit("input"); },
     submit() { form.emit("submit", { submitter: save, preventDefault() {} }); },
@@ -881,4 +900,75 @@ test("disposed Settings requests abort and cannot refresh another mounted view",
   requests[0].resolve(response({ ok: true }));
   await settle();
   assert.equal(refreshes(), 0);
+});
+
+test("server key rotation requires confirmation, suppresses duplicate requests, and clears the password", async () => {
+  const { nodes, requests, lifecycle } = settingsHarness({ security: true });
+  const open = nodes["open-rotate-keys"];
+  const modal = nodes["modal-rotate-keys"];
+  const form = nodes["form-rotate-keys"];
+  const password = nodes["rotate-keys-password"];
+  const confirmation = nodes["rotate-keys-confirm"];
+  const submit = () => form.emit("submit", { preventDefault() {} });
+  try {
+    open.emit("click"); await settle();
+    assert.equal(modal.classList.contains("open"), true);
+    password.value = "admin-password";
+    submit(); await settle();
+    assert.equal(requests.length, 0, "the acknowledgement is required");
+    closeModal(modal);
+    assert.equal(password.value, "", "cancel removes the password");
+    open.emit("click"); await settle();
+    password.value = "admin-password"; confirmation.checked = true;
+    submit(); submit(); await settle();
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "/settings/security/rotate-keys");
+    assert.equal(requests[0].options.body.get("password"), "admin-password");
+    assert.equal(requests[0].options.body.get("confirm"), "rotate");
+    requests[0].resolve(response({ ok: true, fingerprint: "ab".repeat(32), message: "Server restarting." }));
+    await settle();
+    assert.equal(password.value, "");
+    assert.equal(confirmation.checked, false);
+    assert.equal(open.disabled, true);
+    assert.equal(modal.classList.contains("open"), false);
+    assert.match(nodes["server-security-status"].textContent, /Server restarting.*abab/);
+    submit(); await settle();
+    assert.equal(requests.length, 1, "a completed rotation cannot be repeated");
+  } finally { lifecycle.dispose(); }
+});
+
+test("server key rotation respects unsaved changes and disposes in-flight requests", async () => {
+  const { nodes, requests, lifecycle, edit, discard, unsaved } = settingsHarness({ security: true });
+  edit("9000");
+  nodes["open-rotate-keys"].emit("click"); await settle();
+  assert.equal(unsaved.classList.contains("open"), true);
+  assert.equal(nodes["modal-rotate-keys"].classList.contains("open"), false);
+  discard.emit("click"); await settle();
+  assert.equal(nodes["modal-rotate-keys"].classList.contains("open"), true);
+  nodes["rotate-keys-password"].value = "secret";
+  nodes["rotate-keys-confirm"].checked = true;
+  nodes["form-rotate-keys"].emit("submit", { preventDefault() {} }); await settle();
+  assert.equal(requests.length, 1);
+  lifecycle.dispose();
+  assert.equal(requests[0].options.signal.aborted, true);
+  assert.equal(nodes["rotate-keys-password"].value, "");
+  requests[0].resolve(response({ ok: true, message: "Old response", fingerprint: "old" })); await settle();
+  assert.notEqual(nodes["server-security-status"].textContent, "Old response");
+  assert.notEqual(nodes["open-rotate-keys"].disabled, true);
+});
+
+test("failed server key rotation keeps the dialog open without retaining the password", async () => {
+  const { nodes, requests, lifecycle } = settingsHarness({ security: true });
+  try {
+    nodes["open-rotate-keys"].emit("click"); await settle();
+    nodes["rotate-keys-password"].value = "incorrect";
+    nodes["rotate-keys-confirm"].checked = true;
+    nodes["form-rotate-keys"].emit("submit", { preventDefault() {} }); await settle();
+    requests[0].resolve(response({ error: "Current password is incorrect." }, false, 403)); await settle();
+    assert.equal(nodes["modal-rotate-keys"].classList.contains("open"), true);
+    assert.equal(nodes["rotate-keys-error"].textContent, "Current password is incorrect.");
+    assert.equal(nodes["rotate-keys-password"].value, "");
+    assert.equal(nodes["rotate-keys-confirm"].checked, false);
+    assert.equal(requests.length, 1, "failed mutations are never automatically retried");
+  } finally { lifecycle.dispose(); }
 });

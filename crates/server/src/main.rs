@@ -9,6 +9,7 @@ mod download_files;
 mod download_jobs;
 mod external;
 mod http;
+mod library_search;
 mod library_views;
 mod logging;
 mod metadata_events;
@@ -67,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
         Some("--setup-admin") if args.len() == 3 => {}
         Some("--renew-certificate") if args.len() == 2 => {}
-        _ => return Err("usage: server [--setup-admin USER | --renew-certificate]".into()),
+        _ => return Err("usage: phonolite-server [--setup-admin USER | --renew-certificate]".into()),
     }
     let config_path = config_path_from_env();
     let (config, created) = load_or_create_config(&config_path)?;
@@ -111,6 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // A replacement process must wait before acquiring the previous process's
+    // database locks, rather than delaying only after initialization.
+    if let Ok(delay_ms) = std::env::var("PHONOLITE_START_DELAY_MS") {
+        if let Ok(delay_ms) = delay_ms.parse::<u64>() {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
     let db = Library::open_db(&index_path)?;
     tls::harden_file(&index_path)?;
     let auth = AuthStore::new(Arc::clone(&db), session_ttl);
@@ -118,6 +128,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let security = security::SecurityState::new(auth.opaque_setup()?);
     let enrolled = auth.has_any_user()?;
+    if tls::activate_pending_rotation(&config, &config_path, || {
+        auth.clear_sessions().map_err(|error| error.to_string())
+    })? {
+        info!("Server TLS identity rotated; all previous sessions revoked.");
+    }
     let (cert_path, key_path) = tls::identity(&config, &config_path, enrolled)?;
     if args.get(1).map(String::as_str) == Some("--setup-admin") {
         let username = args.get(2).ok_or("provide a username")?;
@@ -191,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_cache,
         metadata_events: MetadataEventBus::new(1024),
         download_jobs,
+        backup_jobs: Default::default(),
     };
     let roots = resolve_music_roots(&state.config_path, &config.music_roots);
     if roots.is_empty() {
@@ -201,17 +217,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_index(state.clone(), roots, false);
     }
 
-    if let Ok(delay_ms) = std::env::var("PHONOLITE_START_DELAY_MS") {
-        if let Ok(delay_ms) = delay_ms.parse::<u64>() {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-        }
-    }
-
     let app = Router::new()
-        .nest("/api/v1", api_router(state.clone()))
-        // .nest("/api/v1", api::api_router(state.clone())) // Removed duplicate
+        .nest("/api", api_router(state.clone()))
         .layer(axum::middleware::from_fn(performance::http_request))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(

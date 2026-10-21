@@ -19,7 +19,7 @@ pub enum UserRole {
     User,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthUser {
     pub id: String,
     pub username: String,
@@ -34,7 +34,7 @@ pub struct SessionToken {
     pub expires_at: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct StoredSession {
     user_id: String,
     expires_at: u64,
@@ -44,6 +44,7 @@ struct StoredSession {
 pub enum AuthError {
     UserNotFound,
     InvalidPassword,
+    CurrentPasswordMismatch,
     InvalidToken,
     TokenExpired,
     UserExists,
@@ -69,6 +70,16 @@ impl std::error::Error for AuthError {}
 pub struct AuthStore {
     db: Arc<Database>,
     session_ttl: Duration,
+}
+
+// The exact records used for reauthentication are compared again at commit.
+// No write transaction is held while the password KDF runs.
+struct PasswordChange {
+    user: AuthUser,
+    session: StoredSession,
+    token_digest: String,
+    previous_record: Vec<u8>,
+    replacement_record: Vec<u8>,
 }
 
 impl AuthStore {
@@ -637,6 +648,120 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Change only the account identified by a live session, with reauthentication.
+    /// A concurrent logout, account edit, disable or password reset makes this fail.
+    pub fn change_own_password(
+        &self,
+        token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), AuthError> {
+        let change = self.prepare_password_change(token, current_password, new_password)?;
+        self.commit_password_change(change)
+    }
+
+    fn prepare_password_change(
+        &self,
+        token: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<PasswordChange, AuthError> {
+        if current_password.len() > 1024 || new_password.len() > 1024 || new_password.is_empty() {
+            return Err(AuthError::InvalidPassword);
+        }
+        let digest = token_digest(token);
+        let (user, session, previous_record) = {
+            let txn = self.db.begin_read().map_err(db_error)?;
+            let sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+            let value = sessions
+                .get(digest.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            let session: StoredSession = bincode::deserialize(value.value()).map_err(db_error)?;
+            if session.expires_at <= unix_seconds() {
+                return Err(AuthError::InvalidToken);
+            }
+            let users = txn.open_table(USERS_TABLE).map_err(db_error)?;
+            let value = users
+                .get(session.user_id.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            let user: AuthUser = bincode::deserialize(value.value()).map_err(db_error)?;
+            if user.disabled {
+                return Err(AuthError::InvalidToken);
+            }
+            let records = txn.open_table(OPAQUE_TABLE).map_err(db_error)?;
+            let record = records
+                .get(user.id.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            (user, session, record.value().to_vec())
+        };
+        let setup = self.opaque_setup()?;
+        if !Self::verify_password_record(&setup, &user.id, &previous_record, current_password)? {
+            return Err(AuthError::CurrentPasswordMismatch);
+        }
+        let replacement_record =
+            crate::security_protocol::enroll(&setup, user.id.as_bytes(), new_password.as_bytes())
+                .map_err(db_error)?;
+        Ok(PasswordChange {
+            user,
+            session,
+            token_digest: digest,
+            previous_record,
+            replacement_record,
+        })
+    }
+
+    fn commit_password_change(&self, change: PasswordChange) -> Result<(), AuthError> {
+        let txn = self.db.begin_write().map_err(db_error)?;
+        {
+            let users = txn.open_table(USERS_TABLE).map_err(db_error)?;
+            let value = users
+                .get(change.user.id.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            let user: AuthUser = bincode::deserialize(value.value()).map_err(db_error)?;
+            if user.disabled || user != change.user {
+                return Err(AuthError::InvalidToken);
+            }
+            let sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+            let value = sessions
+                .get(change.token_digest.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            let session: StoredSession = bincode::deserialize(value.value()).map_err(db_error)?;
+            if session != change.session || session.expires_at <= unix_seconds() {
+                return Err(AuthError::InvalidToken);
+            }
+            let mut records = txn.open_table(OPAQUE_TABLE).map_err(db_error)?;
+            let record = records
+                .get(user.id.as_str())
+                .map_err(db_error)?
+                .ok_or(AuthError::InvalidToken)?;
+            if record.value() != change.previous_record.as_slice() {
+                return Err(AuthError::InvalidToken);
+            }
+            drop(record);
+            records
+                .insert(user.id.as_str(), change.replacement_record.as_slice())
+                .map_err(db_error)?;
+        }
+        self.revoke_user_sessions_in(&txn, &change.user.id)?;
+        {
+            // This exact session was reauthenticated and checked above. Keep its
+            // original expiry, atomically with revoking all other sessions, so
+            // the initiating device can continue playback and downloads.
+            let mut sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+            let bytes = bincode::serialize(&change.session).map_err(db_error)?;
+            sessions
+                .insert(change.token_digest.as_str(), bytes.as_slice())
+                .map_err(db_error)?;
+        }
+        txn.commit().map_err(db_error)?;
+        Ok(())
+    }
+
     pub fn delete_user(&self, id: &str) -> Result<(), AuthError> {
         let txn = self
             .db
@@ -704,21 +829,29 @@ impl AuthStore {
     }
 
     fn verify_opaque_password(&self, id: &str, password: &str) -> Result<bool, AuthError> {
+        let Some(record) = self.opaque_record(id)? else {
+            return Ok(false);
+        };
+        Self::verify_password_record(&self.opaque_setup()?, id, &record, password)
+    }
+
+    fn verify_password_record(
+        setup: &opaque_ke::ServerSetup<crate::security_protocol::Suite>,
+        id: &str,
+        record: &[u8],
+        password: &str,
+    ) -> Result<bool, AuthError> {
         use crate::security_protocol::{ksf, Suite, SERVER_IDENTITY};
         use opaque_ke::{
             ClientLogin, ClientLoginFinishParameters, Identifiers, ServerLogin,
             ServerLoginParameters, ServerRegistration,
         };
-        let Some(record) = self.opaque_record(id)? else {
-            return Ok(false);
-        };
-        let setup = self.opaque_setup()?;
         let mut rng = rand08::rngs::OsRng;
         let first = ClientLogin::<Suite>::start(&mut rng, password.as_bytes()).map_err(db_error)?;
         let response = ServerLogin::start(
             &mut rng,
-            &setup,
-            Some(ServerRegistration::deserialize(&record).map_err(db_error)?),
+            setup,
+            Some(ServerRegistration::deserialize(record).map_err(db_error)?),
             first.message,
             id.as_bytes(),
             ServerLoginParameters {
@@ -773,6 +906,12 @@ impl AuthStore {
 
 fn db_error(error: impl std::fmt::Display) -> AuthError {
     AuthError::DbError(error.to_string())
+}
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 fn remove_sessions(
     table: &mut redb::Table<&str, &[u8]>,
@@ -885,6 +1024,202 @@ mod tests {
         assert_eq!(updated.username, "root");
         assert_eq!(updated.role, UserRole::SuperAdmin);
         assert_eq!(authenticated.id, user.id);
+    }
+
+    #[test]
+    fn self_service_change_reauthenticates_and_preserves_exact_password() {
+        let (store, _db) = test_store();
+        let user = store
+            .create_user("listener", "old-password", UserRole::User)
+            .unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        let second_session = store.create_session(&user.id).unwrap();
+        assert!(matches!(
+            store.change_own_password(&session.token, "incorrect", "replacement password"),
+            Err(super::AuthError::CurrentPasswordMismatch)
+        ));
+        assert!(store.user_from_token(&session.token).unwrap().is_some());
+        // Leading/trailing spaces are part of the password, never normalized away.
+        let replacement = "  replacement password  ";
+        store
+            .change_own_password(&session.token, "old-password", replacement)
+            .unwrap();
+        assert!(store
+            .authenticate("listener", "old-password")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .authenticate("listener", replacement)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .authenticate("listener", replacement.trim())
+            .unwrap()
+            .is_none());
+        assert!(store.user_from_token(&session.token).unwrap().is_some());
+        let read = store.db.begin_read().unwrap();
+        let sessions = read.open_table(super::SESSIONS_TABLE).unwrap();
+        let preserved = sessions
+            .get(super::token_digest(&session.token).as_str())
+            .unwrap()
+            .unwrap();
+        let preserved: super::StoredSession = bincode::deserialize(preserved.value()).unwrap();
+        assert_eq!(preserved.expires_at, session.expires_at);
+        assert!(store
+            .user_from_token(&second_session.token)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.get_user(&user.id).unwrap().unwrap(), user);
+    }
+
+    #[test]
+    fn self_service_policy_rejects_empty_or_oversized_passwords() {
+        let (store, _db) = test_store();
+        // Invalid requests fail before any expensive KDF or database lookup.
+        for (current, replacement) in [
+            ("old".to_owned(), String::new()),
+            ("old".to_owned(), "a".repeat(1025)),
+            ("old".to_owned(), "界".repeat(342)),
+            ("a".repeat(1025), "replacement password".to_owned()),
+        ] {
+            assert!(matches!(
+                store.change_own_password("absent", &current, &replacement),
+                Err(super::AuthError::InvalidPassword)
+            ));
+        }
+        // There is no character-count minimum; the byte limit still applies.
+        for replacement in ["a".to_owned(), "界".to_owned(), "a".repeat(1024)] {
+            assert!(matches!(
+                store.change_own_password("absent", "old", &replacement),
+                Err(super::AuthError::InvalidToken)
+            ));
+        }
+    }
+
+    #[test]
+    fn self_service_change_accepts_single_character_and_unchanged_passwords() {
+        for replacement in ["a", "界", "old-password"] {
+            let (store, _db) = test_store();
+            let user = store
+                .create_user("listener", "old-password", UserRole::User)
+                .unwrap();
+            let session = store.create_session(&user.id).unwrap();
+            let second_session = store.create_session(&user.id).unwrap();
+            store
+                .change_own_password(&session.token, "old-password", replacement)
+                .unwrap();
+            assert!(store
+                .authenticate("listener", replacement)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                store
+                    .authenticate("listener", "old-password")
+                    .unwrap()
+                    .is_some(),
+                replacement == "old-password"
+            );
+            assert!(store.user_from_token(&session.token).unwrap().is_some());
+            assert!(store
+                .user_from_token(&second_session.token)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn self_service_commit_rejects_concurrent_logout_reset_account_edit_disable_and_expiry() {
+        for mutation in ["logout", "reset", "edit", "disable", "expiry", "delete"] {
+            let (store, _db) = test_store();
+            let user = store
+                .create_user("listener", "old-password", UserRole::User)
+                .unwrap();
+            let session = store.create_session(&user.id).unwrap();
+            let pending = store
+                .prepare_password_change(&session.token, "old-password", "replacement password")
+                .unwrap();
+            match mutation {
+                "logout" => store.revoke_session(&session.token).unwrap(),
+                "reset" => store
+                    .update_password(&user.id, "administrator replacement")
+                    .unwrap(),
+                "edit" => store
+                    .update_user(&user.id, "renamed", None, UserRole::Admin)
+                    .unwrap(),
+                "disable" => set_disabled(&store, &user.id, true),
+                "delete" => store.delete_user(&user.id).unwrap(),
+                "expiry" => {
+                    let txn = store.db.begin_write().unwrap();
+                    {
+                        let expired = bincode::serialize(&super::StoredSession {
+                            user_id: user.id.clone(),
+                            expires_at: 0,
+                        })
+                        .unwrap();
+                        txn.open_table(super::SESSIONS_TABLE)
+                            .unwrap()
+                            .insert(
+                                super::token_digest(&session.token).as_str(),
+                                expired.as_slice(),
+                            )
+                            .unwrap();
+                    }
+                    txn.commit().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    store.commit_password_change(pending),
+                    Err(super::AuthError::InvalidToken)
+                ),
+                "{mutation}"
+            );
+            if let Some(record) = store.opaque_record(&user.id).unwrap() {
+                assert!(
+                    !super::AuthStore::verify_password_record(
+                        &store.opaque_setup().unwrap(),
+                        &user.id,
+                        &record,
+                        "replacement password"
+                    )
+                    .unwrap(),
+                    "{mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_self_service_changes_only_commit_once() {
+        let (store, _db) = test_store();
+        let user = store
+            .create_user("listener", "old-password", UserRole::User)
+            .unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        let first = store
+            .prepare_password_change(&session.token, "old-password", "first replacement password")
+            .unwrap();
+        let second = store
+            .prepare_password_change(
+                &session.token,
+                "old-password",
+                "second replacement password",
+            )
+            .unwrap();
+        store.commit_password_change(first).unwrap();
+        assert!(matches!(
+            store.commit_password_change(second),
+            Err(super::AuthError::InvalidToken)
+        ));
+        assert!(store
+            .authenticate("listener", "first replacement password")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .authenticate("listener", "second replacement password")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

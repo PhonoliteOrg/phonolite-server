@@ -35,9 +35,9 @@ pub fn api_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/library/search", get(library::search))
-        .route("/library/v2/events", get(download_v2::metadata_events))
+        .route("/library/events", get(download_v2::metadata_events))
         .route(
-            "/library/v2/metadata/snapshots/:kind/:id",
+            "/library/metadata/snapshots/:kind/:id",
             get(download_v2::metadata_snapshot),
         )
         .route("/library/shuffle", get(library::shuffle_tracks))
@@ -78,22 +78,22 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/download/batches", post(library::create_download_batch))
         .route("/download/tracks/:track_id", get(library::download_track))
-        .route("/download/v2/jobs", post(download_v2::create_download_job))
-        .route("/download/v2/jobs", get(download_v2::list_download_jobs))
+        .route("/download/jobs", post(download_v2::create_download_job))
+        .route("/download/jobs", get(download_v2::list_download_jobs))
         .route(
-            "/download/v2/jobs/:job_id",
+            "/download/jobs/:job_id",
             get(download_v2::get_download_job),
         )
         .route(
-            "/download/v2/jobs/:job_id/actions",
+            "/download/jobs/:job_id/actions",
             post(download_v2::apply_download_job_action),
         )
         .route(
-            "/download/v2/jobs/:job_id/events",
+            "/download/jobs/:job_id/events",
             get(download_v2::download_job_events),
         )
         .route(
-            "/download/v2/tracks/:track_id/file",
+            "/download/tracks/:track_id/file",
             get(download_v2::download_track_file),
         )
         .route("/browse/artists", get(browse::list_artists))
@@ -125,10 +125,10 @@ pub fn api_router(state: AppState) -> Router {
             get(library::get_album_cover),
         )
         .route("/stats", get(stats::get_stats))
-        .route("/stats/v2/state", get(stats::counter_state))
-        .route("/stats/v2/snapshot", get(stats::counter_snapshot))
-        .route("/stats/v2/batch", post(stats::ingest_counters))
-        .route("/stats/v2/activate", post(stats::activate_counters))
+        .route("/stats/state", get(stats::counter_state))
+        .route("/stats/snapshot", get(stats::counter_snapshot))
+        .route("/stats/batch", post(stats::ingest_counters))
+        .route("/stats/activate", post(stats::activate_counters))
         .route("/stats/sync", get(stats::sync_stats))
         .route("/stats/events", post(stats::ingest_stats))
         .route("/stats/preferences", post(stats::update_stats_preference))
@@ -141,6 +141,7 @@ pub fn api_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/server/capabilities", get(download_v2::get_capabilities))
         .route("/server/ports", get(server::get_ports))
+        .merge(auth::password_router())
         .merge(auth)
         .merge(protected)
         .with_state(state)

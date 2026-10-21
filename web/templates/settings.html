@@ -22,25 +22,25 @@
       Paths are relative to the config file when not absolute. All folders must exist.
     </p>
     <label for="settings-index-path">Index path (relative to config file if not absolute)</label>
-    <input id="settings-index-path" name="index_path" type="text" value="{{index_path}}" required />
+    <input class="obsidian-input" id="settings-index-path" name="index_path" type="text" value="{{index_path}}" required />
     <p class="hint">Default index location: <code>{{index_full_path}}</code></p>
     <label for="settings-metadata-path">Metadata assets path (relative to config file if not absolute)</label>
-    <input id="settings-metadata-path" name="metadata_path" type="text" value="{{metadata_path}}" required />
+    <input class="obsidian-input" id="settings-metadata-path" name="metadata_path" type="text" value="{{metadata_path}}" required />
     <p class="hint">Default metadata location: <code>{{metadata_full_path}}</code></p>
     <div class="divider"></div>
     <label for="settings-log-dir">Log directory (relative to config file if not absolute)</label>
-    <input id="settings-log-dir" name="log_dir" type="text" value="{{log_dir}}" required />
+    <input class="obsidian-input" id="settings-log-dir" name="log_dir" type="text" value="{{log_dir}}" required />
     <p class="hint">Default log directory: <code>{{log_full_path}}</code>. Restart to apply changes.</p>
   </div>
   <div class="card server-card">
     <h2>Server</h2>
     <div class="field-row">
       <label for="port">API port (HTTPS)</label>
-      <input id="port" name="port" type="number" min="1" max="65535" value="{{port}}" required />
+      <input class="obsidian-input" id="port" name="port" type="number" min="1" max="65535" value="{{port}}" required />
     </div>
     <div class="field-row">
       <label for="admin_port">Admin port (HTTPS)</label>
-      <input
+      <input class="obsidian-input"
         id="admin_port"
         name="admin_port"
         type="number"
@@ -52,11 +52,11 @@
     </div>
     <div class="field-row">
       <label for="admin_bind_addr">Admin bind IP</label>
-      <input id="admin_bind_addr" name="admin_bind_addr" type="text" value="{{admin_bind_addr}}" placeholder="0.0.0.0" required />
+      <input class="obsidian-input" id="admin_bind_addr" name="admin_bind_addr" type="text" value="{{admin_bind_addr}}" placeholder="0.0.0.0" required />
     </div>
     <div class="field-row">
       <label for="quic_port">QUIC port</label>
-      <input
+      <input class="obsidian-input"
         id="quic_port"
         name="quic_port"
         type="number"
@@ -68,7 +68,7 @@
     </div>
     <div class="field-row">
       <label for="session_ttl_secs">Session TTL (seconds)</label>
-      <input
+      <input class="obsidian-input"
         id="session_ttl_secs"
         name="session_ttl_secs"
         type="number"
@@ -85,7 +85,7 @@
       Watch music folder for changes
     </label>
     <label for="settings-watch-debounce-secs">Watch debounce (seconds)</label>
-    <input id="settings-watch-debounce-secs" name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
+    <input class="obsidian-input" id="settings-watch-debounce-secs" name="watch_debounce_secs" type="number" min="1" value="{{watch_debounce_secs}}" required />
   </div>
   <div class="card">
     <h2>Logging</h2>
@@ -110,7 +110,7 @@
     <p class="hint">Disabled by default. When enabled, the server aggregates playtime by month/year.</p>
   </div>
   <div class="card">
-    <div class="row space-between">
+    <div class="row space-between settings-section-heading">
       <div>
         <h2>External metadata</h2>
         <p class="muted">Add providers to fill missing summaries and genres.</p>
@@ -121,7 +121,7 @@
       {{metadata_sources}}
     </div>
     <label for="settings-external-metadata-min-interval-secs">Retry interval (seconds)</label>
-    <input id="settings-external-metadata-min-interval-secs"
+    <input class="obsidian-input" id="settings-external-metadata-min-interval-secs"
       name="external_metadata_min_interval_secs"
       type="number"
       min="1"
@@ -129,7 +129,7 @@
       required
     />
     <label for="settings-external-metadata-timeout-secs">Request timeout (seconds)</label>
-    <input id="settings-external-metadata-timeout-secs"
+    <input class="obsidian-input" id="settings-external-metadata-timeout-secs"
       name="external_metadata_timeout_secs"
       type="number"
       min="1"
@@ -141,7 +141,7 @@
       Enrich when tag reading fails
     </label>
     <label for="settings-external-metadata-scan-limit">Max items to enrich per scan phase</label>
-    <input id="settings-external-metadata-scan-limit" name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
+    <input class="obsidian-input" id="settings-external-metadata-scan-limit" name="external_metadata_scan_limit" type="number" min="0" value="{{external_scan_limit}}" required />
     <p class="hint">
       Normal scans apply this limit separately to artists, MusicBrainz album-artist fixes, and albums.
       Reindex ignores the limit.
@@ -171,6 +171,32 @@
       </div>
     </div>
   </div>
+<section class="card" aria-labelledby="metadata-backup-title">
+  <h2 id="metadata-backup-title">Metadata backup</h2>
+  <p class="muted">Download descriptions, genres, credits and downloaded artist artwork in portable .phonolite files. Large backups split automatically at the per-file limit.</p>
+  <p class="hint">On a new server, add your music folders and finish scanning, then upload the backup. Restore fills missing fields and keeps unmatched records for future scans. The file is compressed, not encrypted.</p>
+  <div class="stack" id="metadata-backup-controls" data-max-upload-bytes="{{backup_max_upload_bytes}}" data-upload-limit="{{backup_upload_limit}}">
+    <div><button class="button" type="button" id="metadata-backup-download">Download backup</button></div>
+    <div>
+      <button class="button" type="button" id="metadata-backup-upload" aria-describedby="metadata-backup-upload-hint">Upload backup files</button>
+      <input id="metadata-backup-file" type="file" accept=".phonolite,application/vnd.phonolite.metadata" multiple hidden aria-label="Backup files" />
+    </div>
+    <p class="hint" id="metadata-backup-upload-hint">Up to {{backup_upload_limit}} per file. Choose all parts together, or upload them separately in any order. Restore starts automatically once every part is present and validated. Staged files are kept for 24 hours while this server stays running. Music files and account data are separate.</p>
+    <p class="hint" id="metadata-backup-report" role="status" aria-live="polite"></p>
+    <p class="inline-error" id="metadata-backup-error" role="alert"></p>
+    <div class="stack" id="metadata-backup-jobs" aria-label="Staged backups"></div>
+  </div>
+</section>
+<section class="card" aria-labelledby="server-security-title">
+  <h2 id="server-security-title">Server security</h2>
+  <div class="stack">
+    <p class="muted">Regenerate the certificate and key shared by the API, administration console and audio stream.</p>
+    <p class="hint">This restarts the server, stops playback and signs everyone out. Apps refresh the server key securely when users sign back in. Account passwords, music and library data are preserved.</p>
+    <div><button class="button" type="button" id="open-rotate-keys">Regenerate server keys</button></div>
+    <p class="hint" id="server-security-status" role="status" aria-live="polite"></p>
+    <p class="inline-error" id="server-security-error" role="alert"></p>
+  </div>
+</section>
 </form>
 <div class="card settings-save" id="settings-save-bar" hidden>
   <div class="row space-between">

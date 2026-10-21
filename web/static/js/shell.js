@@ -3,6 +3,9 @@ import { beginBusy, clearInlineError, fetchJson, navigateConsole, refreshAfterSu
 
 export function libraryIndexStatusText(data) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  const backup = data?.backup;
+  const workingBackup = ["preparing", "uploading", "checking", "restoring"].includes(backup?.phase);
+  if (workingBackup && backup.message) return backup.message;
   if (data?.status === "scanning") {
     const progress = data.progress;
     if (progress?.phase === "discovering") return "Finding albums…";
@@ -15,6 +18,7 @@ export function libraryIndexStatusText(data) {
     }
     return "Indexing library…";
   }
+  if (data?.status === "ready" && backup?.message) return backup.message;
   if (data?.status === "ready") {
     const metadata = data.metadata;
     if (!metadata?.phase) return "";
@@ -203,7 +207,12 @@ export function setupShell() {
     if (status.textContent !== text) status.textContent = text;
     const hidden = text.length === 0;
     if (status.hidden !== hidden) status.hidden = hidden;
-    const state = data?.status === "ready" && data.metadata?.phase ? "metadata" : data?.status || "unavailable";
+    const backup = data?.backup;
+    const backupWorking = ["preparing", "uploading", "checking", "restoring"].includes(backup?.phase);
+    const backupIdle = data?.status === "ready" && backup?.message;
+    const state = backupWorking ? "backup" : backupIdle && backup.phase === "failed" ? "error"
+      : backupIdle ? "backup-waiting"
+      : data?.status === "ready" && data.metadata?.phase ? "metadata" : data?.status || "unavailable";
     if (status.dataset.status !== state) status.dataset.status = state;
   }
 
@@ -218,11 +227,13 @@ export function setupShell() {
         const wasScanning = libraryStatus?.status === "scanning" ||
           (!libraryStatus && Boolean(document.querySelector('[data-library-scanning="true"]')));
         const wasGatheringMetadata = Boolean(libraryStatus?.metadata?.phase);
+        const backupRestored = data?.backup?.kind === "restore" && data.backup.phase === "complete" &&
+          (libraryStatus?.backup?.id !== data.backup.id || libraryStatus?.backup?.phase !== "complete");
         libraryStatus = data;
         updateIndexStatus(data);
         const scanFinished = wasScanning && data?.status && data.status !== "scanning";
         // Refresh Library when stored data changes; retain other mounted pages.
-        if ((scanFinished || (data?.status === "ready" && wasGatheringMetadata && !data.metadata?.phase)) && document.body.dataset.page === "library") await refreshAfterSuccess();
+        if ((scanFinished || backupRestored || (data?.status === "ready" && wasGatheringMetadata && !data.metadata?.phase)) && document.body.dataset.page === "library") await refreshAfterSuccess();
       } catch (error) {
         if (error.name !== "AbortError" && !signal.aborted && !disposed) updateIndexStatus({ status: "unavailable" });
       }
@@ -236,6 +247,13 @@ export function setupShell() {
     watchLibrary();
   }
   document.addEventListener("library:scan-started", scanStarted);
+  function backupUpdated(event) {
+    if (disposed || !navigationNode) return;
+    updateIndexStatus({ ...libraryStatus, backup: event.detail });
+    stopWatchingLibrary();
+    watchLibrary();
+  }
+  document.addEventListener("library:backup-updated", backupUpdated);
 
   function sync() {
     if (disposed) return;
@@ -255,6 +273,7 @@ export function setupShell() {
     disposed = true;
     stopWatchingLibrary();
     document.removeEventListener("library:scan-started", scanStarted);
+    document.removeEventListener("library:backup-updated", backupUpdated);
     disposeBindings?.();
   }
   dispose.sync = sync;

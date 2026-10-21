@@ -2,12 +2,14 @@
 pub(crate) mod access;
 pub mod assets;
 pub mod auth;
+pub(crate) mod backup;
 mod console;
 pub mod library;
 pub mod logs;
 pub(crate) mod presentation;
 pub mod settings;
 pub mod users;
+mod web_assets;
 
 use crate::state::LibraryStatus;
 use ::library::Library;
@@ -35,6 +37,7 @@ pub fn admin_router(state: AppState, address: std::net::SocketAddr) -> Router {
         .route("/assets/*file", get(assets::admin_asset))
         .route("/actions/restart", post(settings::admin_restart))
         .route("/actions/shutdown", post(settings::admin_shutdown))
+        .merge(settings::security_router())
         .route(
             "/setup",
             get(auth::admin_setup_form).post(auth::admin_setup_submit),
@@ -92,6 +95,21 @@ pub fn admin_router(state: AppState, address: std::net::SocketAddr) -> Router {
         )
         .route("/settings/reindex", post(library::admin_reindex))
         .route("/settings/scan", post(library::admin_scan))
+        .route("/settings/backup/export", post(backup::export))
+        .route("/settings/backup/jobs", get(backup::list_jobs))
+        .route("/settings/backup/jobs/:id", get(backup::job_status))
+        .route("/settings/backup/jobs/:id/remove", post(backup::remove_job))
+        .route(
+            "/settings/backup/jobs/:id/restore",
+            post(backup::restore_job),
+        )
+        .route(
+            "/settings/backup/jobs/:id/parts/:index",
+            get(backup::download_part),
+        )
+        .route("/settings/backup/limits", get(backup::limits))
+        .route("/settings/backup/preview", post(backup::preview))
+        .route("/settings/backup/restore", post(backup::restore))
         .route("/library", get(library::admin_library))
         .route("/covers/albums/:album_id", get(library::admin_album_cover))
         .route(

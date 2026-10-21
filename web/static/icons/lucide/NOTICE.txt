@@ -1,0 +1,6 @@
+Lucide 1.52.0
+Official source: https://lucide.dev/guide/static
+The chevron-left, chevron-right, x, user-round, disc-3, and music SVGs are copied from the listening app's
+bundled Lucide assets. Accessibility attributes are added for inline use in
+the server console's labeled pagination, clear-search controls, and search-result badges.
+LICENSE contains the Lucide ISC and inherited Feather MIT notices.

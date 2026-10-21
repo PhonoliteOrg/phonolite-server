@@ -1,37 +1,31 @@
 // crates/server/src/admin/assets.rs
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::Path as AxumPath,
     http::{header, HeaderValue, StatusCode},
     response::Response,
 };
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
-use crate::admin::presentation::web_root;
+use super::web_assets::WebAssets;
 use crate::http::json_error_response;
-use crate::state::AppState;
 
-pub async fn admin_asset(
-    State(state): State<AppState>,
-    AxumPath(file): AxumPath<String>,
-) -> Response {
-    let static_root = web_root(&state).join("static");
-    let mut relpath = PathBuf::new();
-    for component in PathBuf::from(&file).components() {
-        match component {
-            Component::Normal(value) => relpath.push(value),
-            _ => return json_error_response(StatusCode::FORBIDDEN, "forbidden"),
-        }
-    }
-    let path = static_root.join(&relpath);
-    if !path.starts_with(&static_root) {
+pub async fn admin_asset(AxumPath(file): AxumPath<String>) -> Response {
+    asset_response(&WebAssets::configured(), &file).await
+}
+
+async fn asset_response(assets: &WebAssets, file: &str) -> Response {
+    if file.contains('\\') || file.split('/').any(|part| matches!(part, "" | "." | "..")) {
         return json_error_response(StatusCode::FORBIDDEN, "forbidden");
     }
-    let data = match tokio::fs::read(&path).await {
+    let Some(asset) = assets.get(&format!("static/{file}")) else {
+        return json_error_response(StatusCode::NOT_FOUND, "asset not found");
+    };
+    let data = match asset.bytes().await {
         Ok(data) => data,
         Err(_) => return json_error_response(StatusCode::NOT_FOUND, "asset not found"),
     };
-    let mime = asset_content_type(&file);
+    let mime = asset_content_type(file);
     let mut response = Response::new(Body::from(data));
     response
         .headers_mut()
@@ -63,7 +57,59 @@ fn asset_content_type(file: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::asset_content_type;
+    use super::{asset_content_type, asset_response, WebAssets};
+    use axum::{
+        body::to_bytes,
+        http::{header, StatusCode},
+    };
+
+    #[tokio::test]
+    async fn serves_bundled_console_files_without_a_web_directory() {
+        let assets = WebAssets::default();
+        for (file, mime) in [
+            ("css/admin.css", "text/css"),
+            ("js/app.js", "text/javascript"),
+            ("fonts/Poppins-Regular.ttf", "font/ttf"),
+            ("img/phonolite-logo-nobackground.png", "image/png"),
+            ("icons/lucide/x.svg", "image/svg+xml"),
+        ] {
+            let response = asset_response(&assets, file).await;
+            assert_eq!(response.status(), StatusCode::OK, "{file}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime, "{file}");
+            let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!body.is_empty(), "{file}");
+            if file.ends_with(".png") {
+                assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_assets_and_template_traversal_are_rejected() {
+        let assets = WebAssets::default();
+        for file in ["js/missing.js", "templates/login.html", "config.yaml"] {
+            assert_eq!(
+                asset_response(&assets, file).await.status(),
+                StatusCode::NOT_FOUND,
+                "{file}"
+            );
+        }
+        for file in [
+            "../templates/login.html",
+            "/js/app.js",
+            "js/../../config.yaml",
+            "js\\app.js",
+            "js/./app.js",
+        ] {
+            assert_eq!(
+                asset_response(&assets, file).await.status(),
+                StatusCode::FORBIDDEN,
+                "{file}"
+            );
+        }
+    }
 
     #[test]
     fn browser_assets_use_their_font_and_image_content_types() {

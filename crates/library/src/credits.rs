@@ -819,7 +819,9 @@ impl Library {
             } else if !appearance.track_ids.is_empty() {
                 result.appears_on.push(appearance);
             }
-            if !other.roles.is_empty() {
+            // Headline releases already have a section; retain their supporting
+            // roles in detailed album/song credits without another album card.
+            if !is_headline && !other.roles.is_empty() {
                 result.other_credits.push(other);
             }
             if is_headline && shared_headline {

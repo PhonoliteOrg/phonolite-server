@@ -1,8 +1,8 @@
 //! HTTP-facing bindings for catalog metadata and user personalization.
 use crate::http::json_error;
 pub use crate::library_views::{
-    album_artist_name, build_album_view, build_album_views, build_artist_view, build_artist_views,
-    build_track_views, AlbumView, ArtistView, TrackView,
+    build_album_view, build_album_views, build_artist_view, build_artist_views, build_track_views,
+    AlbumView, ArtistView, TrackView,
 };
 use crate::state::{AppState, Playlist};
 use axum::{http::StatusCode, Json};

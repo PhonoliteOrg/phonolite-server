@@ -64,6 +64,7 @@ struct Limits {
 pub struct SecurityState {
     pub setup: ServerSetup<Suite>,
     limits: Mutex<Limits>,
+    password_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl SecurityState {
@@ -71,6 +72,7 @@ impl SecurityState {
         Arc::new(Self {
             setup,
             limits: Mutex::new(Limits::default()),
+            password_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
     fn reserve(&self, peer: IpAddr, username: &str) -> Result<(), StatusCode> {
@@ -98,6 +100,44 @@ impl SecurityState {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn reserve_password_change(
+        &self,
+        peer: IpAddr,
+        username: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
+        // Share sign-in budgets so changing endpoints cannot bypass throttling.
+        self.reserve(peer, username)?;
+        let now = Instant::now();
+        let mut limits = self.limits.lock();
+        for (key, maximum) in [
+            (format!("password-ip:{peer}"), 5),
+            (format!("password-user:{username}"), 5),
+            ("password-global".to_string(), 30),
+        ] {
+            let rate = limits.rates.entry(key).or_insert((now, 0));
+            rate.1 += 1;
+            if rate.1 > maximum {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+        // No unbounded blocking work queue, even when a request is cancelled.
+        self.password_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)
+    }
+
+    pub(crate) fn invalidate_user_attempts(&self, user_id: &str) {
+        self.limits
+            .lock()
+            .attempts
+            .retain(|_, attempt| attempt.user_id.as_deref() != Some(user_id));
+    }
+
+    pub(crate) fn invalidate_all_attempts(&self) {
+        self.limits.lock().attempts.clear();
     }
 }
 
@@ -415,6 +455,54 @@ mod tests {
             .unwrap();
         assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
         assert!(f.auth.user_from_token(&session.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn self_service_change_invalidates_pending_proof_but_preserves_current_session() {
+        for replacement in ["replacement password", "correct password"] {
+            let f = Fixture::new();
+            let p = proof(&f, "listener", "correct password", 1).unwrap();
+            let user = f.auth.get_user_by_username("listener").unwrap().unwrap();
+            let session = f.auth.create_session(&user.id).unwrap();
+            f.auth
+                .change_own_password(&session.token, "correct password", replacement)
+                .unwrap();
+            // Even before optional in-memory cleanup, a proof against the old
+            // credential cannot mint a session after the atomic credential update.
+            assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
+            assert!(f.auth.user_from_token(&session.token).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn password_work_is_bounded_and_shares_sign_in_limits() {
+        let f = Fixture::new();
+        let first = f
+            .security
+            .reserve_password_change(tls(1).peer, "listener")
+            .unwrap();
+        let second = f
+            .security
+            .reserve_password_change(tls(1).peer, "listener")
+            .unwrap();
+        assert!(matches!(
+            f.security.reserve_password_change(tls(1).peer, "listener"),
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        ));
+        drop(first);
+        drop(second);
+        for _ in 0..2 {
+            drop(
+                f.security
+                    .reserve_password_change(tls(1).peer, "listener")
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            f.security.reserve_password_change(tls(1).peer, "listener"),
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        ));
+        assert_eq!(f.security.limits.lock().rates["user:listener"].1, 6);
     }
     #[test]
     fn attempts_expire_and_online_guesses_are_bounded() {

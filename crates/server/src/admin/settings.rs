@@ -1,7 +1,9 @@
 mod folders;
+mod security;
 mod validation;
 
 pub use folders::admin_browse_folders;
+pub(super) use security::router as security_router;
 
 use validation::validate_settings;
 // crates/server/src/admin/settings.rs
@@ -20,7 +22,7 @@ use crate::admin::presentation::{
     apply_template, escape_html, html_error, load_template, render_admin_response, truncate_text,
     PageLayout,
 };
-use crate::assets::clear_metadata_assets;
+use crate::assets::clear_provider_metadata_assets;
 use crate::config::{
     new_music_root_id, normalize_music_roots, resolve_path, save_config, MetadataSourceConfig,
     MusicRootConfig,
@@ -502,7 +504,7 @@ pub async fn admin_delete_metadata_source(
     }
     *state.config.write() = config;
     let library = state.library_state.read().library.clone();
-    if let Err(err) = clear_metadata_assets(&state).await {
+    if let Err(err) = clear_provider_metadata_assets(&state).await {
         warn!(
             "Failed to clear metadata assets after source delete: {}",
             err
@@ -760,6 +762,7 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
         load_template(state, "templates/modals/metadata_edit.html").unwrap_or_default(),
         load_template(state, "templates/modals/reindex_confirm.html").unwrap_or_default(),
         load_template(state, "templates/modals/unsaved_changes.html").unwrap_or_default(),
+        load_template(state, "templates/modals/rotate_keys.html").unwrap_or_default(),
     ]
     .join("");
 
@@ -773,6 +776,17 @@ fn admin_settings_page(state: &AppState, message: Option<String>) -> Response {
             ("index_full_path", escape_html(&index_full_path)),
             ("metadata_path", escape_html(&config.metadata_path)),
             ("metadata_full_path", escape_html(&metadata_full_path)),
+            (
+                "backup_max_upload_bytes",
+                config
+                    .metadata_backup_max_archive_mib
+                    .saturating_mul(1024 * 1024)
+                    .to_string(),
+            ),
+            (
+                "backup_upload_limit",
+                super::backup::limit_label(config.metadata_backup_max_archive_mib),
+            ),
             ("log_dir", escape_html(&config.log_dir)),
             ("log_full_path", escape_html(&log_full_path)),
             ("log_debug_checked", log_debug_checked),

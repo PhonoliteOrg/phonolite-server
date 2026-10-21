@@ -1,0 +1,20 @@
+[Unit]
+Description=Phonolite music server
+After=network.target
+
+[Service]
+Type=simple
+User=phonolite
+Group=phonolite
+StateDirectory=phonolite
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/phonolite
+Environment=PHONOLITE_CONFIG=/var/lib/phonolite/config.yaml
+ExecStart=/usr/local/bin/phonolite-server
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

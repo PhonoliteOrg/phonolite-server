@@ -9,8 +9,9 @@ use tracing::{info, warn};
 
 use crate::activity_store::ActivityStore;
 use crate::assets::{
-    clear_metadata_assets, image_ext_from_mime, image_ext_from_url, metadata_root_path,
-    prune_stale_metadata_assets, resolve_cover_source, warm_cover_cache, CoverCacheKey,
+    clear_metadata_assets, clear_provider_metadata_assets, image_ext_from_mime, image_ext_from_url,
+    metadata_root_path, prune_stale_metadata_assets, resolve_cover_source, warm_cover_cache,
+    CoverCacheKey,
 };
 use crate::config::{resolve_music_roots, resolve_path, MusicRootConfig};
 use crate::external::{self, ExternalConfig, ExternalSource, Provider};
@@ -43,7 +44,7 @@ pub fn start_index(state: AppState, roots: Vec<LibraryRoot>, force_rescan: bool)
     tokio::spawn(async move {
         let _ = state.activity.add_activity("Library rescan started.");
         if force_rescan {
-            if let Err(e) = clear_metadata_assets(&state).await {
+            if let Err(e) = clear_provider_metadata_assets(&state).await {
                 warn!("Failed to clear metadata: {}", e);
             }
         }

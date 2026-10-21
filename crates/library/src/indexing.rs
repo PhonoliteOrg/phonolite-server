@@ -346,6 +346,17 @@ pub(super) fn scan_locked(
     } else {
         InvalidatedSources::default()
     };
+    // Imported metadata is not a source of playable records. Retry it against
+    // the completed source catalog before publishing this scan atomically.
+    {
+        let catalogs = crate::backup::retained(&db.begin_read()?)?;
+        if !catalogs.is_empty() {
+            let restore = staged.begin_write()?;
+            replace_source_records(&restore, LOCAL_ALBUMS, &local_albums)?;
+            crate::backup::apply(&restore, &catalogs)?;
+            restore.commit()?;
+        }
+    }
     let stats = read_stats(&staged)?;
     crate::enrichment::album_metadata_stats(&staged)?;
     let staging_read = staged.begin_read()?;
@@ -386,6 +397,17 @@ pub(super) fn scan_locked(
                 .map(|old| old.value() != value.value())
                 .unwrap_or(true);
             if changed {
+                target.insert(key.value(), value.value())?;
+            }
+        }
+    }
+    // Staged restores may reconnect provider proofs for music that was absent
+    // during upload. This optional sidecar normally survives scans unchanged.
+    if let Ok(source) = staging_read.open_table(crate::storage::ALBUM_SOURCE_IDENTITY_TABLE) {
+        let mut target = write.open_table(crate::storage::ALBUM_SOURCE_IDENTITY_TABLE)?;
+        for entry in source.iter()? {
+            let (key, value) = entry?;
+            if target.get(key.value())?.is_none() {
                 target.insert(key.value(), value.value())?;
             }
         }

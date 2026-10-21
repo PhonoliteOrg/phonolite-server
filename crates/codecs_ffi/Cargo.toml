@@ -10,4 +10,4 @@ ffi-opus = []
 [dependencies]
 
 [build-dependencies]
-cc = "1.0"
+cmake = "0.1"

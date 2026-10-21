@@ -1,7 +1,7 @@
 import { setupShell } from "./shell.js";
 import { setupUsers } from "./users.js";
 import { setupSettings } from "./settings.js";
-import { setupLibrary } from "./library.js";
+import { setupLibrary } from "./library.js?v=20261020-ranked-search";
 import { setupLogsPage } from "./logs.js";
 import { setupAuth } from "./auth.js";
 import { setupConsoleNavigation } from "./navigation.js";

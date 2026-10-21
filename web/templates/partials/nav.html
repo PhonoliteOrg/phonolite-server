@@ -3,7 +3,7 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
   </button>
   <a class="brand mobile-brand" href="/" aria-label="Phonolite administration">
-    <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png" alt="" />
+    <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png?v=20261021" alt="" />
     <span><span class="brand-title">Phonolite</span><span class="brand-sub">Server console</span></span>
   </a>
   <div class="navigation-drawer" id="navigation-drawer" aria-label="Navigation">
@@ -11,7 +11,7 @@
     <div class="nav-panel">
       <div class="nav-panel-header">
         <a class="brand" href="/" aria-label="Phonolite administration">
-          <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png" alt="" />
+          <img class="brand-mark" src="/assets/img/phonolite-logo-nobackground.png?v=20261021" alt="" />
           <span><span class="brand-title">Phonolite</span><span class="brand-sub">Server console</span></span>
         </a>
         <button class="navigation-close" id="navigation-close" type="button" aria-label="Close navigation">
@@ -25,28 +25,43 @@
     <a href="/settings" {{nav_settings_current}}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg><span>Settings</span></a>
     <div class="nav-menu">
       <p id="library-index-status" class="nav-library-status" role="status" aria-live="polite" aria-atomic="true" hidden></p>
-      <button class="button ghost nav-icon" type="button" id="nav-menu-toggle" aria-haspopup="dialog" aria-controls="nav-modal">
+      <button class="nav-icon server-actions-toggle" type="button" id="nav-menu-toggle" aria-haspopup="dialog" aria-controls="nav-modal">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v8M7.03 4.47a9 9 0 1 0 9.94 0"/></svg><span>Server actions</span>
       </button>
+      <p class="nav-server-version" aria-label="Server version {{server_version}}">v{{server_version}}</p>
     </div>
   </nav>
       <p id="navigation-error" class="inline-error" role="alert"></p>
     </div>
   </div>
 </header>
-<div class="modal" id="nav-modal" role="dialog" aria-modal="true" aria-labelledby="nav-modal-title" aria-hidden="true">
+<div class="modal server-actions-modal" id="nav-modal" role="dialog" aria-modal="true" aria-labelledby="nav-modal-title" aria-describedby="nav-modal-description" aria-hidden="true">
   <div class="modal-backdrop" data-modal-close></div>
-  <div class="modal-card" tabindex="-1">
+  <div class="modal-card server-actions-card" tabindex="-1">
     <div class="modal-header">
-      <h2 id="nav-modal-title">Server actions</h2>
+      <div class="server-actions-heading">
+        <svg class="server-actions-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v8M7.03 4.47a9 9 0 1 0 9.94 0"/></svg>
+        <h2 id="nav-modal-title">Server actions</h2>
+      </div>
       <button class="modal-close" type="button" data-modal-close aria-label="Close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
     </div>
-    <p class="muted">Manage this server or end your admin session.</p>
+    <p class="muted server-actions-description" id="nav-modal-description">Manage this server or end your admin session.</p>
     <p id="server-action-error" class="inline-error" role="alert"></p>
-    <div class="stack">
-      <form method="post" action="/logout"><button class="nav-item" type="submit">Log out</button></form>
-      <button class="nav-item" type="button" data-action="restart">Restart server</button>
-      <button class="nav-item danger" type="button" data-action="shutdown">Shut down</button>
+    <div class="server-action-list">
+      <form class="server-action-form" method="post" action="/logout">
+        <button class="server-action" type="submit">
+          <svg class="server-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+          <span class="server-action-copy"><span class="server-action-label">Log out</span><span class="server-action-description">End your admin session.</span></span>
+        </button>
+      </form>
+      <button class="server-action" type="button" data-action="restart">
+        <svg class="server-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10a9 9 0 1 1 2.6 8.4M3 4v6h6"/></svg>
+        <span class="server-action-copy"><span class="server-action-label">Restart server</span><span class="server-action-description">Restart Phonolite and interrupt active streams.</span></span>
+      </button>
+      <button class="server-action danger" type="button" data-action="shutdown">
+        <svg class="server-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v8M7.03 4.47a9 9 0 1 0 9.94 0"/></svg>
+        <span class="server-action-copy"><span class="server-action-label">Shut down</span><span class="server-action-description">Stop Phonolite and end active streams.</span></span>
+      </button>
     </div>
   </div>
 </div>

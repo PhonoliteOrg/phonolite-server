@@ -563,7 +563,7 @@ mod tests {
                 position: 0,
                 track_id: "track-1".to_string(),
                 status: DownloadJobItemStatus::ReadyToDownload,
-                download_url: Some("/api/v1/download/v2/tracks/track-1/file".to_string()),
+                download_url: Some("/api/download/tracks/track-1/file".to_string()),
                 offline_metadata: None,
                 byte_length: Some(123),
                 content_type: Some("audio/mpeg".to_string()),

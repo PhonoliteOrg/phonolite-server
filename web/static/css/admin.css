@@ -1,6 +1,6 @@
 /* Obsidian console: foundations first, page compositions last. */
-@import url("./tokens.css?v=20261011-library-glow");
+@import url("./tokens.css?v=20261020-search");
 @import url("./base.css");
-@import url("./layout.css");
-@import url("./components.css");
-@import url("./pages.css?v=20261011-borderless-banner");
+@import url("./layout.css?v=20261020-centered-actions");
+@import url("./components.css?v=20261020-settings-fields");
+@import url("./pages.css?v=20261021-action-dividers");

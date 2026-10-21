@@ -255,7 +255,7 @@ pub async fn create_download_batch(
         items.push(DownloadBatchItem {
             track_id: track.id.clone(),
             download_url: format!(
-                "/api/v1/download/tracks/{}",
+                "/api/download/tracks/{}",
                 percent_encode_path_component(&track.id)
             ),
             offline_metadata,

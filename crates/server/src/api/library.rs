@@ -10,7 +10,7 @@ use axum::{
     response::Response,
     Json,
 };
-use common::{Album, Artist, Track};
+use common::Track;
 use serde::{Deserialize, Serialize};
 use strsim::normalized_levenshtein;
 use tokio::sync::broadcast;
@@ -28,10 +28,7 @@ use crate::state::{
 
 use super::{
     library_or_json_error, library_or_response,
-    views::{
-        album_artist_name, build_album_view, build_track_views, liked_set, playlist_set, AlbumView,
-        TrackView,
-    },
+    views::{build_album_view, build_track_views, liked_set, playlist_set, AlbumView, TrackView},
 };
 
 const DEFAULT_SEARCH_LIMIT: usize = 40;
@@ -90,136 +87,12 @@ pub async fn search(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
 
-    let mut results: Vec<SearchResult> = Vec::new();
-    let normalized = normalize_search(query);
-
-    let artists = match fetch_artists_for_search(&library, query, limit) {
-        Ok(items) => items,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-    for artist in artists {
-        let score = score_match(&normalized, &artist.name);
-        if score > 0 {
-            results.push(SearchResult {
-                kind: "artist".to_string(),
-                album_id: None,
-                id: artist.id,
-                title: artist.name,
-                subtitle: None,
-                score,
-            });
-        }
-    }
-
-    let albums = match fetch_albums_for_search(&library, query, limit) {
-        Ok(items) => items,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-    let album_artist_ids = albums
-        .iter()
-        .map(|album| album.artist_id.clone())
-        .collect::<HashSet<_>>();
-    let album_artist_names = library.artist_name_map(&album_artist_ids).map_err(|err| {
+    let results = crate::library_search::search_library(&library, query, limit).map_err(|err| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("library error: {}", err),
+            format!("library error: {err}"),
         )
     })?;
-    for album in albums {
-        let credits = library
-            .album_credits(&album.id)
-            .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        let artist_name = if credits.display_name.trim().is_empty() {
-            album_artist_name(&album, album_artist_names.get(&album.artist_id).cloned())
-        } else {
-            credits.display_name
-        };
-        let combined = format!("{} {}", album.title, artist_name);
-        let score = score_match(&normalized, &combined);
-        if score > 0 {
-            results.push(SearchResult {
-                kind: "album".to_string(),
-                album_id: Some(album.id.clone()),
-                id: album.id,
-                title: album.title,
-                subtitle: Some(artist_name),
-                score,
-            });
-        }
-    }
-
-    let tracks = match fetch_tracks_for_search(&library, query, limit) {
-        Ok(items) => items,
-        Err(err) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-    let track_artist_ids = tracks
-        .iter()
-        .map(|track| track.artist_id.clone())
-        .collect::<HashSet<_>>();
-    let track_album_ids = tracks
-        .iter()
-        .map(|track| track.album_id.clone())
-        .collect::<HashSet<_>>();
-    let track_artist_names = library.artist_name_map(&track_artist_ids).map_err(|err| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("library error: {}", err),
-        )
-    })?;
-    let track_album_titles = library.album_title_map(&track_album_ids).map_err(|err| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("library error: {}", err),
-        )
-    })?;
-    for track in tracks {
-        let credits = library
-            .track_credits(&track.id)
-            .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        let artist_name = if credits.display_name.trim().is_empty() {
-            track_artist_names
-                .get(&track.artist_id)
-                .cloned()
-                .unwrap_or_else(|| "Unknown Artist".to_string())
-        } else {
-            credits.display_name
-        };
-        let album_title = track_album_titles
-            .get(&track.album_id)
-            .cloned()
-            .unwrap_or_else(|| "Unknown Album".to_string());
-        let combined = format!("{} {} {}", track.title, artist_name, album_title);
-        let score = score_match(&normalized, &combined);
-        if score > 0 {
-            results.push(SearchResult {
-                kind: "track".to_string(),
-                album_id: Some(track.album_id.clone()),
-                id: track.id,
-                title: track.title,
-                subtitle: Some(format!("{} - {}", artist_name, album_title)),
-                score,
-            });
-        }
-    }
-
-    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-    results.truncate(limit);
-
     Ok(Json(results))
 }
 
@@ -417,39 +290,6 @@ pub async fn metadata_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn fetch_artists_for_search(
-    library: &library::Library,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<Artist>, String> {
-    library
-        .list_artists_for_browse(Some(query), limit, 0, false)
-        .map(|(items, _)| items)
-        .map_err(|err| err.to_string())
-}
-
-fn fetch_albums_for_search(
-    library: &library::Library,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<Album>, String> {
-    library
-        .list_albums(Some(query), limit, 0)
-        .map(|(items, _)| items)
-        .map_err(|err| err.to_string())
-}
-
-fn fetch_tracks_for_search(
-    library: &library::Library,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<Track>, String> {
-    library
-        .list_tracks(Some(query), limit, 0)
-        .map(|(items, _)| items)
-        .map_err(|err| err.to_string())
-}
-
 #[derive(Clone)]
 struct TrackMatchCandidate {
     track: Track,
@@ -628,70 +468,6 @@ fn split_list_param(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn normalize_search(value: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
-            out.push(ch);
-            last_space = false;
-        } else if !last_space {
-            out.push(' ');
-            last_space = true;
-        }
-    }
-    out.trim().to_string()
-}
-
-fn score_match(query: &str, candidate: &str) -> u32 {
-    if query.is_empty() {
-        return 0;
-    }
-    let target = normalize_search(candidate);
-    if target.is_empty() {
-        return 0;
-    }
-
-    if target == query {
-        return 100;
-    }
-    if target.starts_with(query) {
-        return 90;
-    }
-    if target.contains(query) {
-        return 80;
-    }
-
-    let query_tokens: Vec<&str> = query.split_whitespace().collect();
-    if !query_tokens.is_empty() && query_tokens.iter().all(|token| target.contains(token)) {
-        return 70;
-    }
-
-    if is_subsequence(query, &target) {
-        return 60;
-    }
-
-    0
-}
-
-fn is_subsequence(query: &str, target: &str) -> bool {
-    let mut q = query.chars().filter(|ch| !ch.is_whitespace());
-    let mut current = q.next();
-    for ch in target.chars().filter(|ch| !ch.is_whitespace()) {
-        if let Some(needle) = current {
-            if ch == needle {
-                current = q.next();
-                if current.is_none() {
-                    return true;
-                }
-            }
-        } else {
-            return true;
-        }
-    }
-    current.is_none()
-}
-
 pub async fn get_album(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
@@ -753,6 +529,7 @@ pub async fn get_album_cover(
 mod tests {
     use super::*;
     use common::Codec;
+    use library::search::LibrarySearchQuery;
 
     fn descriptor() -> TrackMatchDescriptor {
         TrackMatchDescriptor {
@@ -817,10 +594,9 @@ mod tests {
 
     #[test]
     fn search_scoring_preserves_non_latin_names() {
-        assert_eq!(normalize_search("東京"), "東京");
-        assert_eq!(score_match(&normalize_search("東京"), "東京"), 100);
-        assert_eq!(score_match(&normalize_search("東京"), "大阪"), 0);
-        assert_eq!(score_match(&normalize_search("Björk"), "BJÖRK"), 100);
+        assert_eq!(LibrarySearchQuery::new("東京").score("東京"), 100);
+        assert_eq!(LibrarySearchQuery::new("東京").score("大阪"), 0);
+        assert_eq!(LibrarySearchQuery::new("Björk").score("BJÖRK"), 100);
     }
 
     #[test]

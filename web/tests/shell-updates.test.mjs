@@ -330,6 +330,65 @@ test("metadata status ignores obsolete targets and handles missing names safely"
   assert.equal(libraryIndexStatusText({ status: "ready", metadata: { ...metadata, progress: { phase: "artists", current: { artist: "<b>Artist & Friends</b>" } } } }), "Artist sweep: <b>Artist & Friends</b>");
 });
 
+test("backup work and missing-part messages stay in the bottom sidebar across pages", async () => {
+  const state = harness({ page: "users" });
+  const shell = setupShell();
+  cleanups.push(shell);
+  const status = state.elements.get("library-index-status");
+  const nodes = [...state.main.children];
+  for (const phase of ["uploading", "preparing", "checking", "restoring"]) {
+    await state.poll({ status: "ready", backup: { id: "backup", kind: "restore", phase, message: `${phase} backup` } });
+    assert.equal(status.textContent, `${phase} backup`);
+    assert.equal(status.dataset.status, "backup", "active work uses the sidebar spinner");
+    assert.equal(status.hidden, false);
+  }
+  await state.poll({ status: "ready", backup: { phase: "waiting", message: "Backup received: 2/3 parts" } });
+  assert.equal(status.textContent, "Backup received: 2/3 parts");
+  assert.equal(status.dataset.status, "backup-waiting", "waiting for another upload does not spin endlessly");
+  await state.poll({ status: "ready", backup: { phase: "failed", message: "Backup integrity check failed" } });
+  assert.equal(status.dataset.status, "error");
+  assert.equal(status.textContent, "Backup integrity check failed");
+  assert.deepEqual(state.main.children, nodes);
+  assert.equal(state.refreshes, 0);
+});
+
+test("completing a backup restore refreshes Library once while export completion does not", async () => {
+  const state = harness({ page: "library" });
+  const shell = setupShell();
+  cleanups.push(shell);
+  const backup = { id: "restore", kind: "restore", phase: "restoring", message: "Applying saved metadata…" };
+  await state.poll({ status: "ready", backup });
+  await state.poll({ status: "ready", backup: { ...backup, phase: "complete", message: "Backup restored" } });
+  assert.equal(state.refreshes, 1);
+  await state.poll({ status: "ready", backup: { ...backup, phase: "complete", message: "Backup restored" } });
+  assert.equal(state.refreshes, 1);
+  await state.poll({ status: "ready", backup: { id: "export", kind: "export", phase: "ready", message: "Backup ready" } });
+  assert.equal(state.refreshes, 1);
+  assert.equal(libraryIndexStatusText({ status: "scanning", backup: { phase: "waiting", message: "Waiting for parts" } }), "Indexing library…");
+  assert.equal(libraryIndexStatusText({ status: "missing", backup: { phase: "complete", message: "Backup restored" } }), "Music folder unavailable");
+});
+
+test("backup events update the sidebar immediately and replace the old status poll", async () => {
+  const state = harness({ page: "settings" });
+  const pending = [];
+  globalThis.fetch = (_url, options) => {
+    const request = Promise.withResolvers();
+    pending.push({ ...request, signal: options.signal });
+    return request.promise;
+  };
+  const shell = setupShell();
+  cleanups.push(shell);
+  const backup = { id: "backup", kind: "restore", phase: "restoring", message: "Restoring artwork from disk…" };
+  state.document.dispatchEvent({ type: "library:backup-updated", detail: backup });
+  assert.equal(state.elements.get("library-index-status").textContent, backup.message);
+  assert.equal(pending[0].signal.aborted, true);
+  pending[0].resolve({ ok: true, json: async () => ({ status: "ready" }) });
+  pending[1].resolve({ ok: true, json: async () => ({ status: "ready", backup }) });
+  await settle();
+  assert.equal(state.elements.get("library-index-status").dataset.status, "backup");
+  assert.equal(state.timers.size, 1);
+});
+
 test("sweep positions match the current item number in logs rather than saved album counts", () => {
   const metadata = { phase: "album_artists", completed: 0, total: 149 };
   const current = { artist: "Björk", album: "Homogenic" };

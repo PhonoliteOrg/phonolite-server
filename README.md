@@ -4,6 +4,19 @@ Self-hosted music streaming server for Jellyfin-style music folders.
 
 Indexing uses a local `redb` database (no external services).
 
+`GET /library/search` uses the same typo-tolerant matching rules as the app's local
+library search. A compact comparison form ignores punctuation and spacing, while
+Damerau–Levenshtein matching handles missing, extra, replaced, and swapped letters.
+Word/span lengths of 4–7 allow one edit, 8 or more allow two, and 1–3 stay literal.
+Fuzzy comparisons are bounded to 64 characters per word/span; longer literal
+queries still work. Exact and spacing-equivalent matches rank above fuzzy matches.
+Candidate discovery scans existing name indexes and the result limit applies only
+after ranking; no database migration, rescan, or external search service is needed.
+The paginated browse/admin filters retain their literal matching behavior.
+
+The library's `search/testdata/library_search_vectors.json` and the app's matching
+test fixture contain identical scoring vectors to keep Dart and Rust aligned.
+
 Genre labels use consistent title case in the web library and API views, including
 existing metadata: `alternative rock` becomes `Alternative Rock`, while acronyms
 such as `R&B`, `EDM`, and `IDM` retain their customary casing. Stored tags,
@@ -15,6 +28,8 @@ featured guests by default. Supporting contributors remain available through
 the optional contributor filter and detailed credits. Profiles separate
 **Albums** for solo headline releases, **Collab albums** for joint album billing,
 **Appears on** for billed song appearances and **Other credits** for supporting roles.
+Solo and joint headline releases do not repeat under Other credits; their detailed
+album and song credits remain available. This grouping needs no rescan.
 Each shared album retains one canonical ID and appears once per main artist with that artist's roles
 and credited songs. **Download artist** and downloaded album removal selection
 cover solo and joint headline albums; guest credits do not select unrelated
@@ -83,6 +98,93 @@ Opt-in HTTP and QUIC performance measurements are documented in
 
 For module responsibilities, dependency boundaries, and refactoring verification, see the [architecture log](ARCHITECTURE_REFACTOR.md). Console design and interaction contracts are documented in [web/README.md](web/README.md).
 
+## Portable metadata backups
+
+In **Settings → Metadata backup**, choose **Download backup** to save a compressed
+`.phonolite` backup. If it exceeds the configured per-file limit, the server splits
+it into numbered files and starts a browser download for each. The button keeps
+its spinner until preparation finishes and a download request reaches the server.
+Browsers may ask permission for multiple downloads; individual save links remain
+available in Settings. It includes artist biographies and genres, album descriptions
+and genres, track metadata, source credits, verified artist-credit repairs,
+provider identity proofs, and available downloaded artist logos and banners.
+Retained imports are included in subsequent exports. Music/audio files, local
+embedded or folder artwork, user accounts, credentials, provider API keys,
+playlists, likes, listening history, logs, and disposable caches are separate.
+
+To redeploy, configure the music folders on the destination server and let its
+initial scan finish. Choose **Upload backup files** and select one or multiple files.
+Uploading, validation and restore run automatically through that single action;
+the matching report appears when processing finishes. Existing non-empty
+fields take precedence. Parts can arrive separately, in any order; duplicate
+parts are harmless, and incomplete or conflicting sets cannot restore. The server
+stages uploads on disk, checks a complete set, and restores in a background job.
+The bottom sidebar status shows upload, missing-part, checking, restore, and
+completion messages across console pages. Leaving Settings does not interrupt a
+job already accepted by the server; keep it open while files are still uploading.
+An interrupted upload can be retried without resending previously accepted parts.
+The upload is stored and its field changes commit in
+one database transaction; artwork is validated and written first to immutable
+content-addressed files. A failed artwork write does not apply database changes.
+Verified credit repairs run through the regular source-driven catalog builder,
+where explicit local artist tags keep their normal precedence. A repair failure
+is reported without discarding the retained metadata.
+
+Absolute music roots are omitted. Original root IDs and relative paths are kept
+as hints and never installed as destination paths. Matching verifies the local
+album title, year, artist identities, and complete track list (title, disc/track
+numbers and durations within 1.5 seconds). A relative folder hint can disambiguate
+otherwise identical candidates. Renamed roots, folders and filenames work when
+the embedded identities remain the same. Changed or missing tags and ambiguous
+editions are retained rather than guessed; this is metadata matching, not an
+audio fingerprint, so recordings with indistinguishable tags remain limited by
+the available source identity.
+
+Unmatched records stay outside the playable catalog, survive restarts, and are
+retried during later local scans. They do not create unavailable songs or albums.
+**Scan library** checks local files and retries these records before normal
+provider enrichment. Adding or moving configured roots and automatic schema
+rebuilds retain imported metadata and artwork. Library items without backup metadata keep their local tags
+and can gather missing fields normally. Explicit **Reindex library** clears
+retained imports along with downloaded metadata/artwork; keep an exported file
+if you want to restore it afterward.
+
+The v2 format contains a bounded JSON manifest and deduplicated binary artwork,
+compressed with gzip and protected by Phonolite headers and BLAKE3 checksums.
+Split files use v3 envelopes with a set UUID, part number/count, total size, and
+part/set checksums around that v2 archive. All parts are required before applying
+any metadata. Existing v1/v2 single-file backups remain readable. It is portable between installations and is
+**not encrypted**; a custom extension does not make its contents secret. Imports
+are admin-only and use the console's same-origin protections.
+
+The defaults are **16 GiB per compressed file and 32 GiB expanded per backup set**, with a separate
+configurable 1 GiB catalog-manifest limit and 16 MiB per artwork file. Archive sizes
+are configurable in `config.yaml` (MiB units):
+
+```yaml
+metadata_backup_max_archive_mib: 16384
+metadata_backup_max_expanded_mib: 32768
+metadata_backup_max_manifest_mib: 1024
+```
+
+Settings displays the configured per-file upload limit. Uploads and downloads use disk
+streams; artwork is processed one image at a time, and identical image content
+is stored once per archive. The browser saves downloads directly through its
+download manager. Temporary disk space is required for the archive and validated
+artwork during preview/restore. Splitting and assembly temporarily need space for
+both the compressed archive and its parts. At most eight staged jobs are retained
+for 24 hours after their last use while the server remains running; cleanup runs
+on subsequent backup/status requests. **Remove staged files** frees them earlier
+without undoing restored metadata. A server restart requires uploading incomplete
+or checked backup files again. Accepted metadata remains in the database normally.
+Per-operation scratch files are removed when processing ends. The catalog manifest is held in memory; its separate limit
+controls that allocation independently of the artwork/archive sizes. The optional preview endpoint
+validates all artwork in temporary storage and rolls back proposed database
+changes without installing artwork. Existing v1 files
+retain their original 64/256 MiB decoding bounds. Archive paths are never
+extracted; downloaded images receive validated, content-addressed filenames under
+`metadata/restored/`.
+
 ## Quickstart
 
 ## Setup After Cloning
@@ -96,8 +198,17 @@ git submodule update --init --recursive
 
 3. Install platform build prerequisites for the QUIC dependency:
    - Windows: install NASM and ensure `nasm.exe` is on `PATH`
-   - Linux: install a working C/C++ toolchain for `quiche`/BoringSSL
-   - If `config.yaml` lives outside the binary directory, set `PHONOLITE_WEB_ROOT` to the `web` folder location
+   - Linux: install a working C/C++ toolchain and CMake for Opus and `quiche`/BoringSSL
+
+The admin HTML, CSS, JavaScript, fonts, icons and images are embedded in the server
+executable by every build, including release builds. Deploy the executable without
+a separate `web` directory. Configuration, databases, certificates, metadata and
+music remain external persistent files.
+
+Windows builds also embed the Phonolite executable icon from
+`web/static/img/favicon.ico`, sharing the console's logo asset. The Windows SDK
+resource compiler is discovered through Visual Studio for MSVC builds; GNU builds
+use `windres` (override its path with `WINDRES` when cross-compiling).
 
 From `phonolite-server/`:
 
@@ -125,15 +236,70 @@ $env:PHONOLITE_CONFIG="C:\path\to\config.yaml"
 
 ```bash
 export PHONOLITE_CONFIG=/path/to/config.yaml
-export PHONOLITE_WEB_ROOT=/path/to/phonolite-server/web
 ```
+
+For console development only, set `PHONOLITE_WEB_ROOT` to a complete source `web`
+directory to read templates and assets from disk without rebuilding. Unset it (or
+leave it empty) to use the bundled console. The override serves only files present
+in the build's asset catalog; missing override files return errors instead of
+mixing disk and bundled versions. Rebuild after adding or removing console files.
+Edits, additions and removals under `web/templates` and `web/static` automatically
+update the bundle on the next `cargo build`.
 
 The server watches `music_root` by default and will debounce file events before rescanning.
 
 ## Build Dependencies
 
+Install CMake for the vendored Opus and QUIC/BoringSSL native builds. Opus uses
+its upstream CMake configuration to select the floating-point library sources,
+detect platform headers and enable supported SIMD implementations.
+
 Windows: install NASM (Netwide Assembler) and ensure `nasm.exe` is on `PATH`. It is required
 by the QUIC dependency (BoringSSL) when building `quiche`.
+
+## Linux release packages
+
+From `phonolite-server/` in a Linux build environment, create a release archive:
+
+```bash
+bash scripts/package-linux.sh
+```
+
+The script requires Python 3.9+, Rust stable, a C/C++ toolchain, CMake and the
+initialized `vendor/opus` submodule. It uses Cargo's resolved server version
+(inherited from `[workspace.package].version`), builds with `--release --locked`,
+and writes these files under `dist/`:
+
+```text
+phonolite-server-<version>-linux-<architecture>-<runtime>.tar.gz
+phonolite-server-<version>-linux-<architecture>-<runtime>.tar.gz.sha256
+```
+
+For example, `phonolite-server-0.1.0-linux-x86_64-gnu.tar.gz`. The runtime is
+`gnu` or `musl`; the complete Rust target is recorded inside `BUILD-INFO.txt`.
+
+The default target is the Rust host target. Explicit targets and output paths
+are supported; cross builds require the matching Rust target and native C/C++
+cross toolchain, including any needed linker/CMake configuration:
+
+```bash
+bash scripts/package-linux.sh --target x86_64-unknown-linux-musl
+bash scripts/package-linux.sh --output-dir /path/to/releases
+```
+
+Supported targets are x86-64 and ARM64 Linux with GNU or musl. Build GNU releases
+on the oldest distribution you intend to support and verify their shared-library
+requirements. A musl target alone does not verify that every native dependency
+was linked statically. Windows developers should run the script in their Linux
+build environment, or invoke `python scripts/package-linux.py --target TARGET`
+with a configured Linux cross toolchain.
+
+Cargo builds the executable as `phonolite-server` (`phonolite-server.exe` on Windows).
+Archives contain `phonolite-server`, an optional systemd unit, installation and
+upgrade instructions, build information, `Cargo.lock`, the project license and
+available dependency license/notice files. Configuration, databases, certificates
+and music are kept outside the archive. Packaging never executes the server or
+installs or starts the service. See [the included installation instructions](packaging/linux/INSTALL.md).
 
 ## Authentication
 
@@ -147,7 +313,7 @@ login submissions and API writes are rejected.
 On a new installation, create the initial account locally while the server is stopped:
 
 ```powershell
-.\server.exe --setup-admin listener
+.\phonolite-server.exe --setup-admin listener
 ```
 
 The command prompts twice without echoing the password, generates the shared TLS
@@ -190,7 +356,7 @@ browser step is unnecessary for app sign-in. Use the admin console to add users,
 or `/settings` to configure the library. Host headers must match the active admin
 binding and port; forms require the matching HTTPS origin. Arbitrary DNS names
 are rejected to prevent DNS rebinding.
-Admin UI templates are loaded from the `web` folder next to the server binary.
+Admin UI templates and static assets are bundled in the server executable.
 
 ### New authentication schema
 
@@ -214,11 +380,33 @@ do not delete keys to repair a connection failure. To renew the self-signed
 certificate while keeping the same public-key pin, stop the server and run:
 
 ```powershell
-.\server.exe --renew-certificate
+.\phonolite-server.exe --renew-certificate
 ```
 
 This command also exits without starting the server. Replacing an expired public
 certificate with another certificate using the same private key preserves app trust.
+
+To replace the public/private key pair, open **Settings → Server security →
+Regenerate server keys** in the administration console. Enter your current
+administrator password and acknowledge the client trust change, then choose
+**Regenerate keys and restart**. This rotates the shared HTTPS/API, administration
+and QUIC identity, stops playback, and revokes every session. The response shows
+the replacement public-key SHA-256 fingerprint. Reload the console, verify the
+new browser certificate, and sign in again. Connected apps receive a sign-out
+notice before restart, stop remote playback and downloads, clear saved bearer
+sessions, and open password sign-in. Apps that missed the notice detect the
+changed TLS key when reconnecting. Password sign-in verifies the remembered
+OPAQUE server identity on the new TLS connection before saving the replacement
+TLS pin. No manual trust reset is needed; a changed OPAQUE identity remains blocked.
+
+The replacement is staged in `<config filename>.tls-rotation.json` with private
+file permissions. Startup validates the pair, revokes sessions again, replaces
+both configured identity files before opening any listener, and removes the
+staged file. An interrupted replacement resumes from this file on the next
+startup; do not delete it after activation has begun. If automatic restart fails,
+start the server manually. Accounts, passwords, OPAQUE credentials, music, and
+library data are retained. The OPAQUE server setup is a separate identity and is
+not regenerated by this action.
 
 ### Protocol and security properties
 
@@ -226,10 +414,13 @@ The fixed `phonolite-opaque-v1` profile uses `opaque-ke` 4.0.1, Ristretto255,
 3DH/SHA-512 and Argon2id (64 MiB, three passes, one lane). Two bounded JSON proof
 messages go over the same TLS connection. The OPAQUE context includes the normalized
 username and that connection's RFC 9266 TLS exporter, derived independently at both
-ends. Before authentication, requests carry only the username and OPAQUE handshake;
-the app password never
-appears in a remote HTTP request. Local account creation/reset supplies a password
-to the trusted server process for enrollment; it is not retained as a password hash.
+ends. Sign-in requests carry only the username and OPAQUE handshake, never the
+password. Once signed in, self-service password changes submit the current and new
+passwords only inside the existing authenticated, pinned TLS connection to the
+trusted server. Local account creation/reset also supplies a password to that
+trusted process for enrollment. These operations store only an OPAQUE credential
+record, never the plaintext password or a separate password hash; password request
+fields are not logged and their owned strings are cleared from memory on drop.
 
 After successful mutual authentication, the app pins both the TLS SubjectPublicKeyInfo
 SHA-256 digest and the OPAQUE server key. API calls, SSE, artwork and downloads require
@@ -237,7 +428,7 @@ pinned HTTPS; QUIC verifies the same TLS key before sending its bearer token or 
 application data. Redirects cannot move authenticated requests to another origin.
 TLS 1.3/QUIC provide authenticated encryption and forward secrecy, using their native
 AES-GCM/ChaCha20-Poly1305 implementations and hardware acceleration where available.
-Argon2 runs only during enrollment/sign-in, away from the app UI thread; media is not
+Argon2 runs during enrollment/sign-in/password changes, away from the app UI thread; media is not
 encrypted with password hashing or per-chunk public-key operations.
 
 OPAQUE attempts expire after 90 seconds, are single-use and limited to 20 per minute
@@ -246,6 +437,28 @@ receive dummy OPAQUE responses. Password changes and account updates revoke sess
 atomically; active QUIC sessions recheck revocation/expiry at least once per second.
 Bearer tokens have 256 bits of cryptographic randomness and only their SHA-256 digests
 are stored in the server database. The app keeps tokens and pins in OS secure storage.
+
+The connected app exposes **Reset user password** under **Settings > User**.
+`POST /api/auth/password` accepts exactly `current_password` and `new_password`
+JSON strings and requires an explicit bearer token over direct HTTPS; cookie-only
+authorization, target account fields, redirects and plaintext transport are refused.
+The server reauthenticates the current password using its existing OPAQUE profile.
+The new password must be nonempty and fit in 1024 UTF-8 bytes. There are no password
+strength, character-count, complexity or reuse requirements. Spaces are preserved.
+Requests are bounded to 16 KiB, use shared sign-in throttles plus limits of five
+password changes per minute per IP/account and 30 globally, and allow at most two
+concurrent password KDF tasks on blocking workers. Responses use
+`Cache-Control: no-store`.
+
+A successful change returns **204 No Content**, atomically replaces the credential
+and revokes the account's other sessions. The reauthenticated initiating session
+keeps its original token and expiry, so its playback, downloads and remembered
+sign-in continue. Pending OPAQUE proofs against the old credential cannot create
+sessions. The commit rechecks the exact credential, account state and live session
+used for reauthentication, so a concurrent logout, reset, disable or account edit
+cannot authorize a stale change. Invalid requests return 400, invalid sessions 401,
+an incorrect current password 403 and throttled requests 429. The endpoint does not
+provide forgotten-password recovery; local administrators can still reset accounts.
 
 This requires direct TLS termination in Phonolite. A TCP/UDP forwarding proxy can
 pass the encrypted connection through; a reverse proxy that terminates TLS cannot
@@ -299,21 +512,41 @@ stricter matcher. Audio files are unchanged; a full reindex is not required.
 Older tag-reader caches are discarded so date, repeated-credit, and empty-tag
 corrections also apply to media whose files have not changed.
 
-Compatible clients exchange OPAQUE proofs at `/api/v1/auth/opaque/start` and
-`/api/v1/auth/opaque/finish` over one TLS connection. They must authenticate its TLS
+Compatible clients exchange OPAQUE proofs at `/api/auth/opaque/start` and
+`/api/auth/opaque/finish` over one TLS connection. They must authenticate its TLS
 exporter before accepting the returned bearer token and server pin. Password
 login endpoints are not provided.
 
 ## Endpoints
 
-Base path: `/api/v1`
+Base path: `/api`
+
+All Phonolite API routes share this unversioned baseline. Download jobs,
+metadata snapshots/events, and listening counters use the same `/api` prefix.
+App and server builds must be updated together; versioned URL aliases are not
+provided. Payload and storage schema versions are independent of URL paths.
 
 - GET /health
+- GET /server/capabilities
+- GET /server/ports
+- POST /auth/password
 - GET /library/albums/{album_id}
 - GET /library/albums/{album_id}/cover
 - GET /library/artists/{artist_id}/cover
 - GET /library/search?query=&limit=
 - GET /library/shuffle?mode=
+- GET /library/metadata-events
+- GET /library/events?cursor=
+- GET /library/metadata/snapshots/{kind}/{id}
+- GET /library/tracks/{track_id}/offline-metadata
+- POST /download/batches
+- GET /download/tracks/{track_id}
+- POST /download/jobs
+- GET /download/jobs?client_id=&scope_kind=&scope_id=
+- GET /download/jobs/{job_id}
+- POST /download/jobs/{job_id}/actions
+- GET /download/jobs/{job_id}/events?cursor=
+- GET /download/tracks/{track_id}/file
 - GET /library/playlists
 - POST /library/playlists
 - POST /library/playlists/{playlist_id}
@@ -330,12 +563,13 @@ Base path: `/api/v1`
 - GET /browse/likes
 - GET /stats
 - GET /stats/sync
-- GET /stats/v2/state
-- GET /stats/v2/snapshot
-- POST /stats/v2/batch
-- POST /stats/v2/activate
+- GET /stats/state
+- GET /stats/snapshot
+- POST /stats/batch
+- POST /stats/activate
 - POST /stats/events
 - POST /stats/preferences
+- POST /stats/reset
 - GET /player/settings
 - POST /player/settings
 - POST /auth/opaque/start
@@ -365,14 +599,15 @@ Config keys:
 ## Covers
 
 ```bash
-curl --cacert quic_cert.pem -H "Authorization: Bearer <OPAQUE session token>" https://localhost:3000/api/v1/library/albums/<album_id>/cover --output cover.jpg
+curl --cacert quic_cert.pem -H "Authorization: Bearer <OPAQUE session token>" https://localhost:3000/api/library/albums/<album_id>/cover --output cover.jpg
 ```
 
 ## FFI codecs
 
 The `codecs_ffi` crate provides feature-gated FFI hooks.
 
-- `ffi-opus` (off): expects libopus sources under `vendor/opus`
+- `ffi-opus`: builds static libopus from `vendor/opus` using CMake. The server
+  enables this feature; standalone `codecs_ffi` builds leave it off by default.
 
 Static musl build example:
 

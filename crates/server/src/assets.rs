@@ -11,6 +11,9 @@ use library::Library;
 use crate::config::resolve_path;
 use crate::state::AppState;
 
+// Archive reads/restores and destructive asset maintenance must not overlap.
+pub(crate) static METADATA_ARCHIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Clone)]
 pub enum CoverSource {
     Embedded(PathBuf),
@@ -265,11 +268,47 @@ pub fn cover_response(data: Vec<u8>, mime: &str) -> Response {
 }
 
 pub async fn clear_metadata_assets(state: &AppState) -> Result<(), String> {
+    let _archive = METADATA_ARCHIVE_LOCK.lock().await;
     let root = metadata_root_path(state);
     if root.exists() {
         tokio::fs::remove_dir_all(&root)
             .await
             .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Provider/root maintenance must not discard independent imported artwork.
+pub async fn clear_provider_metadata_assets(state: &AppState) -> Result<(), String> {
+    let _archive = METADATA_ARCHIVE_LOCK.lock().await;
+    let root = metadata_root_path(state);
+    clear_provider_assets_at(&root).await
+}
+
+async fn clear_provider_assets_at(root: &Path) -> Result<(), String> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(|err| err.to_string())? {
+        if entry.file_name() == "restored" {
+            continue;
+        }
+        if entry
+            .file_type()
+            .await
+            .map_err(|err| err.to_string())?
+            .is_dir()
+        {
+            tokio::fs::remove_dir_all(entry.path())
+                .await
+                .map_err(|err| err.to_string())?;
+        } else {
+            tokio::fs::remove_file(entry.path())
+                .await
+                .map_err(|err| err.to_string())?;
+        }
     }
     Ok(())
 }
@@ -531,6 +570,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_maintenance_preserves_imported_artwork() {
+        let dir = TestDirectory::new();
+        for folder in ["logos", "covers", "restored"] {
+            tokio::fs::create_dir_all(dir.0.join(folder)).await.unwrap();
+            tokio::fs::write(dir.0.join(folder).join("image.png"), b"image")
+                .await
+                .unwrap();
+        }
+        clear_provider_assets_at(&dir.0).await.unwrap();
+        assert!(dir.0.join("restored/image.png").exists());
+        assert!(!dir.0.join("logos").exists());
+        assert!(!dir.0.join("covers").exists());
+        clear_provider_assets_at(&dir.0.join("missing"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

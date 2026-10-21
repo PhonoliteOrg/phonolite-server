@@ -1,7 +1,11 @@
 [package]
 name = "server"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
+
+[[bin]]
+name = "phonolite-server"
+path = "src/main.rs"
 
 [dependencies]
 common = { path = "../common" }
@@ -50,6 +54,10 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
 rpassword = "7"
 zeroize = "1"
+flate2 = "1.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+[build-dependencies]
+cc = "1.0"
