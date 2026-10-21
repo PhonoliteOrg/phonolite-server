@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -21,7 +20,6 @@ TARGETS = {
     "aarch64-unknown-linux-gnu": 183,
     "aarch64-unknown-linux-musl": 183,
 }
-LICENSE_NAME = re.compile(r"^(licen[cs]e|copying|copyright|notice)([._-].*)?$", re.I)
 
 
 def run_command(command, capture=False):
@@ -52,50 +50,6 @@ def verify_binary(binary, target):
         raise ValueError(f"Executable architecture does not match {target}: {binary}")
 
 
-def copy_licenses(source_root, destination):
-    """Keep notices in vendored native libraries as well as crate-level licenses."""
-    for directory, subdirs, files in os.walk(source_root, followlinks=False):
-        subdirs[:] = [name for name in subdirs if name not in {".git", "target"}]
-        for name in files:
-            if LICENSE_NAME.fullmatch(name):
-                source = Path(directory) / name
-                if source.is_file() and not source.is_symlink():
-                    output = destination / source.relative_to(source_root)
-                    output.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, output)
-
-
-def dependency_notices(metadata, package_root):
-    lines = [
-        "Third-party dependencies",
-        "",
-        "Declared licenses and available license/notice files from Cargo dependencies",
-        "are included below and in licenses/. This inventory includes build dependencies.",
-        "Cargo.lock records the dependency versions used by this build.",
-        "",
-    ]
-    for package in sorted(metadata["packages"], key=lambda item: (item["name"], item["version"])):
-        if package.get("source") is None:
-            continue
-        label = f"{package['name']}-{package['version']}"
-        destination = package_root / "licenses" / label
-        crate_root = Path(package["manifest_path"]).parent
-        copy_licenses(crate_root, destination)
-        license_file = package.get("license_file")
-        if license_file:
-            source = crate_root / license_file
-            if source.is_file():
-                destination.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, destination / "DECLARED-LICENSE")
-        lines.append(f"{label}: {package.get('license') or 'see license files / upstream source'}")
-        lines.append(f"  Source: {package['source']}")
-        if package.get("repository"):
-            lines.append(f"  Repository: {package['repository']}")
-    lines.extend(["", "Vendored Opus: see licenses/opus/ and https://opus-codec.org/.", ""])
-    copy_licenses(ROOT / "vendor" / "opus", package_root / "licenses" / "opus")
-    (package_root / "THIRD_PARTY_NOTICES.txt").write_text("\n".join(lines), encoding="utf-8")
-
-
 def create_package(metadata, target, output_dir):
     manifest = (ROOT / "crates" / "server" / "Cargo.toml").resolve()
     package = next(
@@ -117,14 +71,6 @@ def create_package(metadata, target, output_dir):
         package_root.mkdir()
         shutil.copyfile(binary, package_root / "phonolite-server")
         shutil.copyfile(ROOT / "packaging" / "linux" / "phonolite.service", package_root / "phonolite.service")
-        shutil.copyfile(ROOT / "packaging" / "linux" / "INSTALL.md", package_root / "INSTALL.md")
-        shutil.copyfile(ROOT / "LICENSE", package_root / "LICENSE")
-        shutil.copyfile(ROOT / "Cargo.lock", package_root / "Cargo.lock")
-        dependency_notices(metadata, package_root)
-        (package_root / "BUILD-INFO.txt").write_text(
-            f"Phonolite server {version}\nTarget: {target}\nProfile: release\n",
-            encoding="utf-8",
-        )
 
         def archive_permissions(member):
             member.uid = member.gid = 0
@@ -159,12 +105,10 @@ def main():
         parser.error("Run in a Linux build environment, or pass --target with a configured Linux cross toolchain.")
     if not (ROOT / "vendor" / "opus" / "src" / "opus.c").is_file():
         parser.error("Opus sources are missing. Run: git submodule update --init --recursive")
-    if not (ROOT / "vendor" / "opus" / "COPYING").is_file():
-        parser.error("The vendored Opus COPYING license is missing.")
 
-    # Full metadata provides resolved inherited versions, target_directory and licenses.
+    # Cargo resolves the inherited version and configured target_directory.
     metadata = json.loads(run_command(cargo_command(
-        "metadata", "--locked", "--format-version", "1", "--filter-platform", target,
+        "metadata", "--locked", "--no-deps", "--format-version", "1",
     ), capture=True).stdout)
     run_command(cargo_command(
         "build", "--locked", "--package", "server", "--bin", "phonolite-server",

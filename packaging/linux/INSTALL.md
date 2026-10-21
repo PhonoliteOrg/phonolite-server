@@ -1,8 +1,8 @@
 # Phonolite server for Linux
 
-This archive contains the release executable, embedded web console, an optional
-systemd service, build information, the Cargo dependency lockfile and license
-notices. Install the archive matching your CPU architecture and Linux runtime.
+This archive contains only the release executable (including the embedded web
+console) and the optional systemd service file. Install the archive matching
+your CPU architecture and Linux runtime.
 GNU builds require compatible system libraries; musl builds must be checked for
 their final native-library requirements before being distributed as fully static.
 

@@ -276,7 +276,7 @@ phonolite-server-<version>-linux-<architecture>-<runtime>.tar.gz.sha256
 ```
 
 For example, `phonolite-server-0.1.0-linux-x86_64-gnu.tar.gz`. The runtime is
-`gnu` or `musl`; the complete Rust target is recorded inside `BUILD-INFO.txt`.
+`gnu` or `musl`.
 
 The default target is the Rust host target. Explicit targets and output paths
 are supported; cross builds require the matching Rust target and native C/C++
@@ -295,11 +295,10 @@ build environment, or invoke `python scripts/package-linux.py --target TARGET`
 with a configured Linux cross toolchain.
 
 Cargo builds the executable as `phonolite-server` (`phonolite-server.exe` on Windows).
-Archives contain `phonolite-server`, an optional systemd unit, installation and
-upgrade instructions, build information, `Cargo.lock`, the project license and
-available dependency license/notice files. Configuration, databases, certificates
-and music are kept outside the archive. Packaging never executes the server or
-installs or starts the service. See [the included installation instructions](packaging/linux/INSTALL.md).
+Archives contain only `phonolite-server` and `phonolite.service` inside the release
+folder. The SHA-256 checksum is written beside the archive. Packaging never
+executes the server or installs or starts the service. Installation and upgrade
+instructions are available in [packaging/linux/INSTALL.md](packaging/linux/INSTALL.md).
 
 ## Authentication
 
