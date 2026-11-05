@@ -175,8 +175,8 @@ uncached offset discontinuity cancels the previous span and opens a new stream.
 Symphonia's media-source buffer and format reader sit above that interface, so
 the container can fetch headers, seek tables or an MP4 index at nonsequential
 positions without downloading the whole file. Every complete native decoder read
-or seek shares one five-second budget across its partial fills; opening and
-probing share a fifteen-second budget. Positive short reads cannot renew the
+or seek shares one fifteen-second budget across its partial fills; opening and
+probing share a twenty-second budget. Positive short reads cannot renew the
 complete operation indefinitely. These deadlines do not limit the total duration
 of a continuously played file. A monotonic operation epoch interrupts an obsolete
 read before a new seek; parent-owned cancellation can end a read before the child
@@ -185,9 +185,11 @@ cancels and joins the socket-owning thread. An OS DNS lookup can finish separate
 that resolver owns only the address string, not a socket or credentials.
 
 Route hints use an independent owner generation, so a network change does not
-cancel an active seek or decoder operation. Early transport repair reopens at
+cancel an active seek or decoder operation. A hint alone does not replace a
+working connection; demanded delivery stalls and transport failure trigger repair.
+The stall allowance is 5–8 seconds, extended for measured RTT up to 12 seconds. Early transport repair reopens at
 the unreturned source-byte offset inside the existing operation deadline. One
-recovery episode shares a fifteen-second monotonic budget and three connection
+recovery episode shares a thirty-second monotonic budget and three connection
 attempts across native retries and replacement decoders. Source version and
 length remain pinned; authorization and identity rejection bypass retries.
 
@@ -198,7 +200,7 @@ and the shared output, then opens a fresh pinned decoder at the next presentatio
 frame committed to the PCM queue. Native frame seeks apply format preroll and
 exact frame trimming. Lossless fixture checks require bit-exact samples; lossy
 decoder resets preserve frame placement without asserting identical codec state.
-An exhausted episode falls through to the established stopped/restart boundary.
+An exhausted episode enters a controller-owned waiting/retry state with capped backoff, preserving the selected track, position and user intent. Pause, Stop and newer selections cancel obsolete retries.
 
 Client cleanup also emits a best-effort QUIC connection close. On receiving a
 peer close, the server immediately clears authentication, presence, pending
@@ -206,8 +208,9 @@ sources and outgoing producers. Only the transport tombstone remains during
 QUIC draining; source files and queues do not wait for that deadline.
 
 Original decoding fills the shared session media-time read-ahead horizon: eight
-seconds normally, two seconds while user-paused or preparing an unheard gapless
-successor, and three seconds for a loopback host. Unlike the compact Opus packet
+seconds normally, two seconds while user-paused, and three seconds for a
+loopback host. Unheard gapless successors retain two seconds normally or five
+seconds with a protected network profile. Unlike the compact Opus packet
 cache, this read-ahead contains decoded PCM32 and is capped at 16 MiB per source.
 For high sample rates, the byte cap can shorten the available media horizon.
 The producer stops requesting/decoding when that buffer is full. Startup does
@@ -281,6 +284,45 @@ available. The client incrementally parses those bytes, retains bounded encoded
 ranges, decodes Opus to PCM16, discards priming samples and trims final padding.
 Adjacent server ranges use preroll and exact sample counts to avoid replaying
 or dropping audible audio at boundaries.
+
+## Negotiated Auto ranges
+
+`/api/server/capabilities` advertises `adaptive_audio_ranges: true`. A capable
+client explicitly requests `adaptive_ranges: true` with `mode: "auto"` on the
+QUIC `open` command. The server acknowledges acceptance with `adaptive_ranges`
+on every `stream` announcement. Missing/false flags retain legacy fixed-quality
+behavior. An old client never opts in; an old server ignores the new open field.
+
+Auto begins at 96 kbit/s. Buffer reports below three seconds after a five-second
+cooldown reduce the desired rendition one level (160/96/48 kbit/s). A reserve
+of 8–12 seconds, according to the requested horizon, must remain healthy for
+thirty seconds before upgrading one level. Intentionally small paused/prepared
+horizons do not drive adaptation. New independently encoded five-second ranges
+use the selected quality; in-flight ranges retain their original encoder and
+cache key. Renditions remain isolated by quality. The client validates the
+source identity and output format while permitting negotiated bitrate changes,
+then applies each range's preroll and exact presentation trimming as usual.
+Original and manually selected HQ/MQ/LQ retain their requested quality.
+
+## Poor-network verification
+
+These are user-run physical-device checks. Compilation and listener-free tests
+can run independently; agents do not start the app, a simulator or the server.
+Keep the phone locked and test both the selected track and automatic next song
+through wired CarPlay. Preserve iPhone and matching server logs, including
+`PHONOLITE_PROFILE=1` transport samples when investigating throughput.
+
+| Scenario | In/out bandwidth (kbps) | In/out delay | In/out packet loss | Expected behavior |
+| --- | --- | --- | --- | --- |
+| Latency and loss with ample bandwidth | 50000 / 50000 | 300 / 300 ms | 3% / 3% | Buffer as needed; avoid reconnecting for short stalls; recover without app restart |
+| Limited cellular capacity | 256 / 128 | 150 / 150 ms | 1% / 1% | Auto can reduce rendition quality; Original preserves its selected source |
+| Brief outage | Retain prior limits | Retain prior delay | 100% / 100% for 5–10 s, then restore | Keep track/position/intent and resume automatically |
+| Recovery and cancellation | Restore normal profile | 0 / 0 ms | 0% / 0% | Pause/Stop/new track overrides pending repair; artwork arrival cannot restart audio |
+
+Vary profiles during playback rather than relying only on one steady condition.
+Check that a cover request which never completes cannot delay source preparation.
+Original still requires adequate average useful bandwidth for its source bitrate;
+buffering absorbs interruptions but cannot overcome a sustained throughput deficit.
 
 ## Gapless and the physical output
 

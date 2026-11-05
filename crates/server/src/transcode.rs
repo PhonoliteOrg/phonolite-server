@@ -780,6 +780,97 @@ mod tests {
     use symphonia::core::audio::{AsAudioBufferRef, AudioBuffer, Channels, Signal, SignalSpec};
 
     #[test]
+    fn independently_encoded_auto_renditions_preserve_exact_range_frames() {
+        let frames = 19200u32;
+        let path = std::env::temp_dir().join(format!("phonolite-auto-{}.wav", uuid::Uuid::new_v4()));
+        let mut wave = Vec::new();
+        wave.extend_from_slice(b"RIFF");
+        wave.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        wave.extend_from_slice(&16u32.to_le_bytes());
+        wave.extend_from_slice(&1u16.to_le_bytes());
+        wave.extend_from_slice(&1u16.to_le_bytes());
+        wave.extend_from_slice(&48000u32.to_le_bytes());
+        wave.extend_from_slice(&96000u32.to_le_bytes());
+        wave.extend_from_slice(&2u16.to_le_bytes());
+        wave.extend_from_slice(&16u16.to_le_bytes());
+        wave.extend_from_slice(b"data");
+        wave.extend_from_slice(&(frames * 2).to_le_bytes());
+        for frame in 0..frames {
+            let sample = ((f64::from(frame) * 0.0576).sin() * 10000.0) as i16;
+            wave.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&path, wave).unwrap();
+        let cache = StreamCache::new(PathBuf::new(), true);
+        let mut rendered = 0u64;
+        let mut version = None;
+        for (start, end, quality) in [
+            (0, 100, TranscodeQuality::High),
+            (100, 200, TranscodeQuality::Medium),
+            (200, 400, TranscodeQuality::Low),
+        ] {
+            let key = CacheKey::new("auto", 20, TranscodeMode::Fixed, quality)
+                .with_range(start)
+                .with_source(&path)
+                .unwrap();
+            if let Some(previous) = &version {
+                assert_eq!(&key.source_version(), previous);
+            }
+            version = Some(key.source_version());
+            let mut writer = cache.writer(key.clone()).unwrap().unwrap();
+            transcode_raw_opus_range_cache(
+                &path,
+                BitrateSelector {
+                    quality,
+                    fixed_bitrate_bps: None,
+                },
+                20,
+                RawOpusMeta {
+                    track_id: "auto".into(),
+                    title: "tone".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration_ms: 400,
+                    codec: "pcm".into(),
+                    container: "wav".into(),
+                },
+                start,
+                end,
+                &mut writer,
+            )
+            .unwrap();
+            writer.finalize().unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            cache
+                .reader(&key)
+                .unwrap()
+                .unwrap()
+                .stream_to(start, &tx)
+                .unwrap();
+            let header = rx.try_recv().unwrap().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(header[18..22].try_into().unwrap()),
+                quality_bitrate(quality)
+            );
+            assert_eq!(header[9] & 1, 1);
+            let audible = u64::from_le_bytes(header[header.len() - 8..].try_into().unwrap());
+            let skip = u16::from_le_bytes(header[26..28].try_into().unwrap()) as usize;
+            assert_eq!(audible, u64::from(end - start) * 48);
+            let mut decoder = OpusDecoderWrapper::new(48000, 1).unwrap();
+            let mut samples = Vec::new();
+            while let Ok(Ok(packet)) = rx.try_recv() {
+                if packet.as_ref() != [0, 0] {
+                    samples.extend(decoder.decode(&packet[2..]).unwrap());
+                }
+            }
+            assert!(samples.len() >= skip + audible as usize);
+            rendered += samples[skip..skip + audible as usize].len() as u64;
+        }
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(rendered, u64::from(frames));
+    }
+
+    #[test]
     fn interleaved_conversion_reuses_capacity_and_keeps_only_current_packet_samples() {
         let mut reused = None;
         for (capacity, frames, channels, rate) in [

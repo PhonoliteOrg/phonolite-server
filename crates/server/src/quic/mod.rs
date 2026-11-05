@@ -19,6 +19,7 @@ use crate::transcode::{TranscodeMode, TranscodeQuality};
 
 #[cfg(test)]
 mod migration_tests;
+mod adaptive;
 mod source;
 mod udp;
 
@@ -50,6 +51,8 @@ enum ControlMessage {
         request_id: Option<u64>,
         track_id: String,
         mode: Option<String>,
+        #[serde(default)]
+        adaptive_ranges: bool,
         quality: Option<String>,
         frame_ms: Option<u32>,
         queue: Option<Vec<String>>,
@@ -122,6 +125,7 @@ enum ControlResponse<'a> {
         range_end_ms: u32,
         end_of_track: bool,
         source_version: &'a str,
+        adaptive_ranges: bool,
     },
     #[serde(rename = "open_ok")]
     OpenOk { track_id: &'a str },
@@ -331,6 +335,7 @@ struct SessionState {
     track_streams: HashMap<String, u64>,
     playback_frame_ms: u32,
     playback_quality: TranscodeQuality,
+    adaptive_quality: Option<adaptive::AdaptiveQuality>,
     buffer_target_ms: u32,
     client_buffer_ms: u32,
     last_buffer_report: Instant,
@@ -367,6 +372,7 @@ impl SessionState {
             track_streams: HashMap::new(),
             playback_frame_ms: 20,
             playback_quality: TranscodeQuality::High,
+            adaptive_quality: None,
             buffer_target_ms: 8000,
             client_buffer_ms: 0,
             last_buffer_report: now,
@@ -1048,6 +1054,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             request_id,
             track_id,
             mode,
+            adaptive_ranges,
             quality,
             frame_ms,
             queue,
@@ -1071,6 +1078,11 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 );
                 return;
             }
+            client.session.adaptive_quality = adaptive::AdaptiveQuality::negotiate(
+                mode.as_deref(),
+                adaptive_ranges,
+                Instant::now(),
+            );
             client.session.open_request_id = request_id;
             cancel_source_ranges(&mut client.session, &mut client.conn);
             client.session.pending_seek_id = None;
@@ -1161,6 +1173,13 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
         } => {
             if request_id.is_some() && request_id != client.session.open_request_id {
                 return;
+            }
+            if let Some(auto) = client.session.adaptive_quality.as_mut() {
+                auto.observe(
+                    buffer_ms,
+                    target_ms.unwrap_or(client.session.buffer_target_ms),
+                    Instant::now(),
+                );
             }
             client.session.client_buffer_ms = buffer_ms;
             client.session.last_buffer_report = Instant::now();
@@ -1555,7 +1574,15 @@ fn start_track_stream(
 
     let _requested_mode = parse_transcode_mode(mode).unwrap_or(TranscodeMode::Auto);
     let mode = TranscodeMode::Fixed;
-    let quality = parse_transcode_quality(quality).unwrap_or(TranscodeQuality::High);
+    let quality = client
+        .session
+        .adaptive_quality
+        .as_ref()
+        .map(|auto| auto.quality())
+        .unwrap_or_else(|| parse_transcode_quality(quality).unwrap_or(TranscodeQuality::High));
+    if client.session.adaptive_quality.is_some() && quality != client.session.playback_quality {
+        tracing::info!(?quality, track_id, start_ms, "QUIC Auto selected rendition");
+    }
     let frame_ms = parse_frame_ms(Some(frame_ms)).unwrap_or(20);
     if role == StreamRole::Active {
         client.session.playback_frame_ms = frame_ms;
@@ -1625,6 +1652,7 @@ fn start_track_stream(
             range_end_ms: prepared.range_end_ms,
             end_of_track: prepared.end_of_track,
             source_version: &prepared.source_version,
+            adaptive_ranges: client.session.adaptive_quality.is_some(),
         },
     );
 
@@ -2808,6 +2836,7 @@ mod streaming_tests {
             range_end_ms: 60000,
             end_of_track: false,
             source_version: "version",
+            adaptive_ranges: false,
         };
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["request_id"], 42);

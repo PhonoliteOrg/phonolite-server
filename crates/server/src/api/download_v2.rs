@@ -35,6 +35,7 @@ pub struct ServerCapabilitiesResponse {
     pub last_track: &'static str,
     pub playback_resume: &'static str,
     pub playback_presence: bool,
+    pub adaptive_audio_ranges: bool,
     pub session_management: &'static str,
     pub catalogue_events: &'static str,
 
@@ -90,6 +91,7 @@ pub async fn get_capabilities() -> Json<ServerCapabilitiesResponse> {
         last_track: "1",
         playback_resume: "1",
         playback_presence: true,
+        adaptive_audio_ranges: true,
         session_management: "1",
         catalogue_events: "1",
 
