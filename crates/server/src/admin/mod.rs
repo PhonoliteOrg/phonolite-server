@@ -6,6 +6,7 @@ pub(crate) mod backup;
 mod console;
 pub mod library;
 pub mod logs;
+mod performance;
 pub(crate) mod presentation;
 pub mod settings;
 pub mod users;
@@ -52,6 +53,8 @@ pub fn admin_router(state: AppState, address: std::net::SocketAddr) -> Router {
             get(settings::admin_settings).post(settings::admin_update_settings),
         )
         .route("/logs", get(logs::admin_logs))
+        .route("/performance", get(performance::page))
+        .route("/performance/data", get(performance::data))
         .route("/logs/clear", post(logs::admin_logs_clear))
         .route("/logs/tail", get(logs::admin_logs_tail))
         .route("/logs/issues", get(logs::admin_logs_issues))
@@ -121,12 +124,51 @@ pub fn admin_router(state: AppState, address: std::net::SocketAddr) -> Router {
             get(users::admin_users).post(users::admin_create_user),
         )
         .route("/users/bulk-delete", post(users::admin_bulk_delete))
+        .route("/users/activity", get(users::admin_user_activity))
         .route("/users/:user_id/update", post(users::admin_update_user))
         .route("/users/:user_id/password", post(users::admin_set_password))
         .route("/users/:user_id/delete", post(users::admin_delete_user))
+        .route("/users/:user_id/sessions/revoke-all", post(users::admin_revoke_sessions))
         .layer(middleware::from_fn(console::console_response))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admit_catalogue_work,
+        ))
         .layer(middleware::from_fn_with_state(access, admin_origin))
+        .layer(middleware::from_fn(crate::metadata_requests::log_request))
         .with_state(state)
+}
+
+/// Administration and API browsing share the same finite workload pools.
+async fn admit_catalogue_work(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let artwork = path.starts_with("/covers/");
+    if !artwork && path != "/library" {
+        return next.run(request).await;
+    }
+    let user = match admin_user_from_headers(&state, request.headers()) {
+        Ok(Some(user)) if is_admin(&user) => user,
+        _ => return next.run(request).await,
+    };
+    let gate = if artwork {
+        &state.resources.artwork
+    } else {
+        &state.resources.catalogue
+    };
+    match gate.acquire(&user.id, &state.shutdown).await {
+        Ok(permit) => {
+            let permit = std::sync::Arc::new(permit);
+            request
+                .extensions_mut()
+                .insert(std::sync::Arc::clone(&permit));
+            permit.retain_response(next.run(request).await)
+        }
+        Err(error) => error.response(),
+    }
 }
 
 // Binding an interface alone does not stop DNS rebinding or cross-site forms.

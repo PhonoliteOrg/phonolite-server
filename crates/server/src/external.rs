@@ -55,8 +55,17 @@ pub async fn fetch_artist(
     config: &ExternalConfig,
     artist_name: &str,
 ) -> Result<Option<ExternalMetadata>, String> {
+    fetch_artist_with_policy(client, config, artist_name, None).await
+}
+
+pub async fn fetch_artist_with_policy(
+    client: &Client,
+    config: &ExternalConfig,
+    artist_name: &str,
+    policy: Option<&crate::metadata_policy::Lookup<'_>>,
+) -> Result<Option<ExternalMetadata>, String> {
     if !known_artist_name(artist_name) {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_lookup_skipped",
             kind = "artist",
             artist = artist_name,
@@ -68,7 +77,11 @@ pub async fn fetch_artist(
     let mut found = false;
     let mut last_error: Option<String> = None;
     let results = fetch_sources(&config.sources, |source| {
-        Box::pin(fetch_artist_source(client, source, artist_name))
+        Box::pin(with_lookup(
+            policy,
+            source,
+            fetch_artist_source(client, source, artist_name),
+        ))
     })
     .await;
     for (source, result) in config.sources.iter().zip(results) {
@@ -76,7 +89,7 @@ pub async fn fetch_artist(
         let result = match result {
             Ok(result) => result,
             Err(err) => {
-                warn!(
+                warn!(target: "metadata_external",
                     event = "metadata_source_failed", provider = provider_name(source.provider),
                     kind = "artist", artist = artist_name, error = %err,
                     "External artist metadata source failed"
@@ -116,8 +129,19 @@ pub async fn fetch_album_with_identity(
     album_title: &str,
     identity: Option<&AlbumSourceIdentity>,
 ) -> Result<Option<ExternalMetadata>, String> {
+    fetch_album_with_policy(client, config, artist_name, album_title, identity, None).await
+}
+
+pub async fn fetch_album_with_policy(
+    client: &Client,
+    config: &ExternalConfig,
+    artist_name: &str,
+    album_title: &str,
+    identity: Option<&AlbumSourceIdentity>,
+    policy: Option<&crate::metadata_policy::Lookup<'_>>,
+) -> Result<Option<ExternalMetadata>, String> {
     if !known_artist_name(artist_name) || normalized_identity(album_title).is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_lookup_skipped",
             kind = "album",
             artist = artist_name,
@@ -130,7 +154,7 @@ pub async fn fetch_album_with_identity(
     let mut found = false;
     let mut last_error: Option<String> = None;
     if config.sources.is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_lookup_skipped",
             kind = "album",
             artist = artist_name,
@@ -139,7 +163,7 @@ pub async fn fetch_album_with_identity(
         );
     }
     let results = fetch_sources(&config.sources, |source| {
-        Box::pin(async move {
+        Box::pin(with_lookup(policy, source, async move {
             match identity {
                 Some(identity) => {
                     fetch_album_source_by_identity(
@@ -153,7 +177,7 @@ pub async fn fetch_album_with_identity(
                 }
                 None => fetch_album_source(client, source, artist_name, album_title).await,
             }
-        })
+        }))
     })
     .await;
     for (source, result) in config.sources.iter().zip(results) {
@@ -167,7 +191,7 @@ pub async fn fetch_album_with_identity(
         let result = match result {
             Ok(result) => result,
             Err(err) => {
-                warn!(
+                warn!(target: "metadata_external",
                     event = "metadata_source_failed", provider = provider_name(source.provider),
                     kind = "album", artist = artist_name, album = album_title, error = %err,
                     "External album metadata source failed"
@@ -182,7 +206,7 @@ pub async fn fetch_album_with_identity(
         }
     }
     if found {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_album_merge", artist = artist_name, album = album_title,
             description_present = combined.summary.is_some(), genre_count = combined.genres.len(),
             complete = combined.summary.is_some() && !combined.genres.is_empty(),
@@ -198,6 +222,36 @@ pub async fn fetch_album_with_identity(
 }
 
 type SourceResult = Result<Option<ExternalMetadata>, String>;
+
+async fn with_lookup(
+    policy: Option<&crate::metadata_policy::Lookup<'_>>,
+    source: &ExternalSource,
+    fetch: impl Future<Output = SourceResult>,
+) -> SourceResult {
+    let attempt = match policy {
+        Some(policy) => match policy.claim(source)? {
+            Some(attempt) => Some(attempt),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let result = fetch.await;
+    if let (Some(policy), Some(attempt)) = (policy, attempt) {
+        let outcome = match &result {
+            Ok(Some(metadata))
+                if !metadata.genres.is_empty()
+                    && (source.provider == Provider::MusicBrainz || metadata.summary.is_some()) =>
+            {
+                "matched"
+            }
+            Ok(Some(_)) => "partial",
+            Ok(None) => "no_usable_metadata",
+            Err(_) => "request_failed",
+        };
+        policy.received(attempt, outcome);
+    }
+    result
+}
 
 fn provider_name(provider: Provider) -> &'static str {
     match provider {
@@ -224,7 +278,7 @@ fn log_source_result(
         Ok(None) => ("no_usable_metadata", false, 0, false, false),
         Err(_) => ("request_failed", false, 0, false, false),
     };
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_source_result",
         provider = provider_name(provider),
         kind,
@@ -254,7 +308,41 @@ fn request_error(stage: &'static str, error: reqwest::Error) -> String {
     } else {
         "request"
     };
-    format!("{stage}: {reason}: {}", error.without_url())
+    let error = error.without_url().to_string();
+    warn!(target: "metadata_external", event = "metadata_provider_request_failed",
+        stage, reason, error, "Metadata provider request could not complete");
+    format!("{stage}: {reason}: {error}")
+}
+
+// Endpoint labels deliberately exclude TheAudioDB's API-key path segment and
+// every provider's query string, credentials, and request/response headers.
+async fn send_provider_request(
+    request: reqwest::RequestBuilder,
+    provider: Provider,
+    endpoint: &'static str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let request_id = performance::next_id();
+    let started = Instant::now();
+    tracing::debug!(target: "metadata_external", event = "metadata_provider_request",
+        request_id, provider = provider_name(provider), endpoint, method = "GET",
+        "Sending metadata provider request");
+    let result = request.send().await;
+    if let Ok(response) = &result {
+        info!(target: "metadata_external", event = "metadata_provider_response",
+            request_id, provider = provider_name(provider), endpoint,
+            http_status = response.status().as_u16(),
+            content_length = response.content_length(),
+            elapsed_ms = performance::milliseconds(started.elapsed()),
+            "Metadata provider returned HTTP response");
+    } else if let Err(error) = &result {
+        warn!(target: "metadata_external", event = "metadata_provider_request_failed",
+            request_id, provider = provider_name(provider), endpoint, stage = "send",
+            reason = if error.is_timeout() { "timeout" } else if error.is_connect() { "connection" } else if error.is_builder() { "request_builder" } else { "request" },
+            http_status = error.status().map(|status| status.as_u16()),
+            elapsed_ms = performance::milliseconds(started.elapsed()),
+            "Metadata provider request failed before receiving a response");
+    }
+    result
 }
 
 // The two independent providers can overlap. Entries for the same provider
@@ -336,7 +424,7 @@ async fn fetch_album_source_by_identity(
             fetch_musicbrainz_album_by_identity(client, source, identity).await
         }
     };
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_album_identity_lookup",
         provider = provider_name(source.provider),
         artist = artist_name,
@@ -367,7 +455,7 @@ fn record_source_timing(
         Err(_) => "error",
     };
     tracing::info!(
-        target: "performance",
+        target: "metadata_external",
         event = "metadata_source_fetch",
         provider,
         kind,
@@ -387,12 +475,13 @@ pub async fn test_source(client: &Client, source: &ExternalSource) -> Result<(),
                 "https://www.theaudiodb.com/api/v1/json/{}/search.php?s=radiohead",
                 api_key.trim()
             );
-            let response = client
-                .get(&url)
-                .timeout(source.timeout)
-                .send()
-                .await
-                .map_err(|err| request_error("source_test_send", err))?;
+            let response = send_provider_request(
+                client.get(&url).timeout(source.timeout),
+                source.provider,
+                "source_test",
+            )
+            .await
+            .map_err(|err| request_error("source_test_send", err))?;
             if response.status().is_success() {
                 Ok(())
             } else {
@@ -407,13 +496,16 @@ pub async fn test_source(client: &Client, source: &ExternalSource) -> Result<(),
             let url =
                 "https://musicbrainz.org/ws/2/artist/?query=artist:radiohead&fmt=json&limit=1";
             musicbrainz_rate_limit::wait_for_slot().await;
-            let response = client
-                .get(url)
-                .timeout(source.timeout)
-                .header("User-Agent", user_agent.trim())
-                .send()
-                .await
-                .map_err(|err| request_error("source_test_send", err))?;
+            let response = send_provider_request(
+                client
+                    .get(url)
+                    .timeout(source.timeout)
+                    .header("User-Agent", user_agent.trim()),
+                source.provider,
+                "source_test",
+            )
+            .await
+            .map_err(|err| request_error("source_test_send", err))?;
             if response.status().is_success() {
                 Ok(())
             } else {
@@ -541,7 +633,7 @@ async fn fetch_theaudiodb_artist(
 ) -> Result<Option<ExternalMetadata>, String> {
     let api_key = source.api_key.as_deref().unwrap_or("").trim();
     if api_key.is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_source_skipped",
             provider = "theaudiodb",
             kind = "artist",
@@ -555,12 +647,13 @@ async fn fetch_theaudiodb_artist(
         api_key,
         url_escape(artist_name.trim())
     );
-    let response = client
-        .get(&url)
-        .timeout(source.timeout)
-        .send()
-        .await
-        .map_err(|err| request_error("artist_search_send", err))?;
+    let response = send_provider_request(
+        client.get(&url).timeout(source.timeout),
+        source.provider,
+        "artist_search",
+    )
+    .await
+    .map_err(|err| request_error("artist_search_send", err))?;
     if !response.status().is_success() {
         return Err(format!("artist_search_http: http {}", response.status()));
     }
@@ -568,6 +661,10 @@ async fn fetch_theaudiodb_artist(
         .json::<TheAudioDbArtistResponse>()
         .await
         .map_err(|err| request_error("artist_search_decode", err))?;
+    info!(target: "metadata_external", event = "metadata_provider_response_decoded",
+        provider = "theaudiodb", endpoint = "artist_search",
+        records = payload.artists.as_ref().map_or(0, Vec::len),
+        "Metadata provider response decoded");
     let artist = match payload.into_match(artist_name) {
         Some(artist) => artist,
         None => return Ok(None),
@@ -575,7 +672,7 @@ async fn fetch_theaudiodb_artist(
 
     let summary = clean_text_field(artist.bio, &artist.fields, "strBiography");
     if summary.is_none() {
-        warn!(
+        warn!(target: "metadata_external",
             event = "metadata_fields_missing",
             provider = "theaudiodb",
             kind = "artist",
@@ -613,7 +710,7 @@ async fn fetch_theaudiodb_album(
 ) -> Result<Option<ExternalMetadata>, String> {
     let api_key = source.api_key.as_deref().unwrap_or("").trim();
     if api_key.is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_source_skipped",
             provider = "theaudiodb",
             kind = "album",
@@ -625,7 +722,7 @@ async fn fetch_theaudiodb_album(
     }
     let mut best = None;
     let candidates = album_title_candidates(album_title);
-    info!(event = "metadata_album_lookup", provider = "theaudiodb", artist = artist_name, album = album_title, attempted_titles = ?candidates);
+    info!(target: "metadata_external", event = "metadata_album_lookup", provider = "theaudiodb", artist = artist_name, album = album_title, attempted_titles = ?candidates);
     for (index, candidate) in candidates.iter().enumerate() {
         let metadata =
             fetch_theaudiodb_album_candidate(client, source, api_key, artist_name, candidate)
@@ -636,7 +733,7 @@ async fn fetch_theaudiodb_album(
                         diagnostic_text(candidate)
                     )
                 })?;
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_album_title_attempt",
             provider = "theaudiodb",
             artist = artist_name,
@@ -677,7 +774,7 @@ fn log_theaudiodb_album_incomplete(
     } else {
         "no_verified_album_match"
     };
-    warn!(
+    warn!(target: "metadata_external",
         event = "metadata_album_lookup_incomplete", provider = "theaudiodb",
         artist = artist_name, album = album_title, reason,
         attempted_titles = ?candidates,
@@ -698,12 +795,13 @@ async fn fetch_theaudiodb_album_candidate(
         url_escape(artist_name.trim()),
         url_escape(album_title)
     );
-    let response = client
-        .get(&url)
-        .timeout(source.timeout)
-        .send()
-        .await
-        .map_err(|err| request_error("album_search_send", err))?;
+    let response = send_provider_request(
+        client.get(&url).timeout(source.timeout),
+        source.provider,
+        "album_search",
+    )
+    .await
+    .map_err(|err| request_error("album_search_send", err))?;
     if !response.status().is_success() {
         return Err(format!("album_search_http: http {}", response.status()));
     }
@@ -711,6 +809,10 @@ async fn fetch_theaudiodb_album_candidate(
         .json::<TheAudioDbAlbumResponse>()
         .await
         .map_err(|err| request_error("album_search_decode", err))?;
+    info!(target: "metadata_external", event = "metadata_provider_response_decoded",
+        provider = "theaudiodb", endpoint = "album_search",
+        records = payload.album.as_ref().map_or(0, Vec::len),
+        "Metadata provider response decoded");
     let album = match payload.into_match(artist_name, album_title) {
         Some(album) => album,
         None => return Ok(None),
@@ -741,12 +843,13 @@ async fn fetch_theaudiodb_album_by_identity(
         return Ok(None);
     };
     let url = format!("https://www.theaudiodb.com/api/v1/json/{api_key}/album-mb.php?i={group_id}");
-    let response = client
-        .get(&url)
-        .timeout(source.timeout)
-        .send()
-        .await
-        .map_err(|err| request_error("album_mbid_send", err))?;
+    let response = send_provider_request(
+        client.get(&url).timeout(source.timeout),
+        source.provider,
+        "album_verified_group",
+    )
+    .await
+    .map_err(|err| request_error("album_mbid_send", err))?;
     if !response.status().is_success() {
         return Err(format!("album_mbid_http: http {}", response.status()));
     }
@@ -754,6 +857,10 @@ async fn fetch_theaudiodb_album_by_identity(
         .json::<TheAudioDbAlbumResponse>()
         .await
         .map_err(|err| request_error("album_mbid_decode", err))?;
+    info!(target: "metadata_external", event = "metadata_provider_response_decoded",
+        provider = "theaudiodb", endpoint = "album_verified_group",
+        records = payload.album.as_ref().map_or(0, Vec::len),
+        "Metadata provider response decoded");
     Ok(theaudiodb_album_identity_metadata(payload, &group_id))
 }
 
@@ -786,7 +893,7 @@ fn theaudiodb_album_identity_metadata(
     } else {
         "verified_provider_group"
     };
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_provider_group_result",
         provider = "theaudiodb",
         release_group_id = group_id,
@@ -798,7 +905,7 @@ fn theaudiodb_album_identity_metadata(
     }
     let album = first?;
     let metadata = theaudiodb_album_metadata(album);
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_verified_record",
         provider = "theaudiodb",
         kind = "album",
@@ -834,7 +941,7 @@ async fn fetch_musicbrainz_album_by_identity(
             .await
             .map_err(|error| format!("album_verified_group_detail: {error}"))?;
     if let Some(reason) = cached_musicbrainz_group_rejection(identity, &detail) {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_detail_rejected",
             provider = "musicbrainz",
             kind = "album",
@@ -989,7 +1096,7 @@ async fn fetch_musicbrainz_artist(
 ) -> Result<Option<ExternalMetadata>, String> {
     let user_agent = source.user_agent.as_deref().unwrap_or("").trim();
     if user_agent.is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_source_skipped",
             provider = "musicbrainz",
             kind = "artist",
@@ -1024,7 +1131,7 @@ async fn fetch_musicbrainz_album(
 ) -> Result<Option<ExternalMetadata>, String> {
     let user_agent = source.user_agent.as_deref().unwrap_or("").trim();
     if user_agent.is_empty() {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_source_skipped",
             provider = "musicbrainz",
             kind = "album",
@@ -1083,7 +1190,7 @@ where
         return Ok(None);
     };
     let Some(id) = musicbrainz_id(artist.id.as_deref()) else {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_detail_rejected",
             provider = "musicbrainz",
             kind = "artist",
@@ -1094,7 +1201,7 @@ where
     };
     let detail = lookup(id.clone()).await?;
     if let Some(reason) = musicbrainz_artist_detail_rejection(&id, artist_name, &detail) {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_detail_rejected",
             provider = "musicbrainz",
             kind = "artist",
@@ -1125,7 +1232,7 @@ where
         return Ok(None);
     };
     let Some(id) = musicbrainz_id(album.id.as_deref()) else {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_detail_rejected",
             provider = "musicbrainz",
             kind = "album",
@@ -1138,7 +1245,7 @@ where
     let detail = lookup(id.clone()).await?;
     if let Some(reason) = musicbrainz_album_detail_rejection(&id, artist_name, album_title, &detail)
     {
-        info!(
+        info!(target: "metadata_external",
             event = "metadata_detail_rejected",
             provider = "musicbrainz",
             kind = "album",
@@ -1202,7 +1309,7 @@ fn log_musicbrainz_verified_fields(
     id: &str,
     metadata: Option<&ExternalMetadata>,
 ) {
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_verified_record", provider = "musicbrainz", kind, artist,
         album = album.unwrap_or_default(), mbid = id,
         reason = if metadata.is_some() { "genres_found" } else { "verified_record_missing_genres" },
@@ -1430,7 +1537,7 @@ fn diagnosed_unique_match<T>(
     describe: impl Fn(&T) -> String,
 ) -> Option<T> {
     let (selected, diagnostics) = select_unique_match(items, check, describe);
-    info!(
+    info!(target: "metadata_external",
         event = "metadata_search_result", provider = provider_name(provider), kind, artist,
         attempted_title = album.unwrap_or_default(), outcome = diagnostics.outcome(),
         candidates = diagnostics.candidates, exact_matches = diagnostics.exact_matches,
@@ -1669,6 +1776,7 @@ mod tests {
             assert!(response.into_match("Artist", "Album").is_none());
         });
         for expected in [
+            "metadata_external",
             "metadata_search_result",
             "theaudiodb",
             "no_verified_match",

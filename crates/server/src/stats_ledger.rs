@@ -138,8 +138,9 @@ impl StatsStore {
         if expected_generation == 0 {
             return Err(StatsError::Invalid("invalid history generation".into()));
         }
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         let result;
+        let mut changed = false;
         {
             let mut meta = txn.open_table(META)?;
             let key = scoped_key(user_id, "account");
@@ -154,6 +155,7 @@ impl StatsStore {
                 return Err(StatsError::GenerationMismatch);
             }
             if expected_generation == account.generation {
+                changed = true;
                 account.generation = account
                     .generation
                     .checked_add(1)
@@ -197,12 +199,18 @@ impl StatsStore {
                 history_generation: account.generation,
             };
         }
+        if changed {
+            self.advance_notification(&txn, user_id)?;
+        }
         txn.commit()?;
+        if changed {
+            self.notify_committed(user_id);
+        }
         Ok(result)
     }
 
     pub(super) fn init_ledger(&self) -> Result<(), StatsError> {
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         {
             let mut meta = txn.open_table(META)?;
             if meta.get("server_id")?.is_none() {
@@ -244,9 +252,10 @@ impl StatsStore {
         preference: DevicePreference,
     ) -> Result<DevicePreference, StatsError> {
         validate_id(&preference.device_id)?;
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         let key = scoped_key(user_id, &preference.device_id);
         let result;
+        let mut changed = false;
         {
             let mut table = txn.open_table(PREFERENCES)?;
             let existing = table
@@ -256,13 +265,20 @@ impl StatsStore {
             result = match existing {
                 Some(existing) if existing.revision >= preference.revision => existing,
                 _ => {
+                    changed = true;
                     let bytes = serde_json::to_vec(&preference)?;
                     table.insert(key.as_str(), bytes.as_slice())?;
                     preference
                 }
             };
         }
+        if changed {
+            self.advance_notification(&txn, user_id)?;
+        }
         txn.commit()?;
+        if changed {
+            self.notify_committed(user_id);
+        }
         Ok(result)
     }
 
@@ -279,7 +295,7 @@ impl StatsStore {
                 "at most 200 listening events per batch".into(),
             ));
         }
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         counters::check_legacy(&txn, user_id, device_id)?;
         let mut result = EventBatchResult::default();
         {
@@ -456,7 +472,13 @@ impl StatsStore {
             meta.insert(account_key.as_str(), bytes.as_slice())?;
         }
         // Acknowledgments are only returned after a successful durable commit.
+        if !result.accepted.is_empty() {
+            self.advance_notification(&txn, user_id)?;
+        }
         txn.commit()?;
+        if !result.accepted.is_empty() {
+            self.notify_committed(user_id);
+        }
         Ok(result)
     }
 
@@ -634,7 +656,7 @@ impl StatsStore {
         if metadata.is_empty() {
             return Ok(());
         }
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         let mut changed = false;
         {
             let tracks = txn.open_table(TRACK_METADATA)?;
@@ -660,8 +682,12 @@ impl StatsStore {
         if changed {
             rebuild_genre_durations(&txn, Some(user_id))?;
             counters::genres_changed(&txn, user_id)?;
+            self.advance_notification(&txn, user_id)?;
         }
         txn.commit()?;
+        if changed {
+            self.notify_committed(user_id);
+        }
         Ok(())
     }
 
@@ -1205,7 +1231,7 @@ mod tests {
                     &HashMap::from([("track".into(), vec!["Jazz".into()])]),
                 )
                 .unwrap();
-            let txn = fixture.store.db.begin_write().unwrap();
+            let txn = ::library::begin_write(&fixture.store.db).unwrap();
             {
                 let mut legacy = txn.open_table(super::super::STATS_TABLE).unwrap();
                 let bytes = bincode::serialize(&UserPeriodStats {
@@ -1485,7 +1511,7 @@ mod tests {
                 .into_iter()
                 .map(|(key, bytes)| (key, serde_json::from_slice(&bytes).unwrap()))
                 .collect();
-        let txn = fixture.store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&fixture.store.db).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();
             meta.remove(PRIMARY_ARTIST_POLICY).unwrap();
@@ -1718,7 +1744,7 @@ mod tests {
         assert_eq!(current.genre_ms["Funk"], 10_333);
         assert_eq!(current.genre_ms.values().sum::<u64>(), current.total_ms);
 
-        let txn = fixture.store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&fixture.store.db).unwrap();
         txn.open_table(META)
             .unwrap()
             .remove(GENRE_DURATION_POLICY)
@@ -1916,7 +1942,7 @@ mod tests {
             .get_ledger_period(user, 2025, None)
             .unwrap()
             .unwrap();
-        let txn = fixture.store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&fixture.store.db).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();
             meta.remove(GENRE_DURATION_POLICY).unwrap();
@@ -2044,7 +2070,7 @@ mod tests {
             .collect();
         assert!(expected.len() > GENRE_MIGRATION_CACHE_LIMIT * 2);
         let immutable_events = table_contents(&fixture.store, EVENTS);
-        let txn = fixture.store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&fixture.store.db).unwrap();
         {
             let mut meta = txn.open_table(META).unwrap();
             meta.remove(GENRE_DURATION_POLICY).unwrap();
@@ -2354,7 +2380,7 @@ mod tests {
     #[test]
     fn legacy_baseline_is_preserved_but_never_replicated() {
         let fixture = Fixture::new();
-        let txn = fixture.store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&fixture.store.db).unwrap();
         {
             let mut table = txn.open_table(super::super::STATS_TABLE).unwrap();
             let mut legacy = UserPeriodStats {

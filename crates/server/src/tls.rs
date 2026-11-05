@@ -230,6 +230,8 @@ pub async fn serve(
     cert: &Path,
     key: &Path,
     endpoint: Endpoint,
+    shutdown: crate::shutdown::Shutdown,
+    network: crate::network_metrics::NetworkMetrics,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let policy = RedirectPolicy {
@@ -251,18 +253,31 @@ pub async fn serve(
     config.max_early_data_size = 0;
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let slots = Arc::new(tokio::sync::Semaphore::new(512));
-    let shutdown = crate::process_control::shutdown_signal();
-    tokio::pin!(shutdown);
     loop {
-        let (socket, peer) = tokio::select! { _ = &mut shutdown => break, accepted = listener.accept() => accepted? };
+        let (socket, peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted?,
+        };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
-        tokio::spawn(async move {
+        let connection_shutdown = shutdown.clone();
+        let connection_network = network.clone();
+        shutdown.spawn_graceful(async move {
             let _permit = permit;
-            serve_connection(socket, acceptor, app, peer.ip(), policy).await;
+            serve_connection(
+                socket,
+                acceptor,
+                app,
+                peer.ip(),
+                policy,
+                connection_shutdown,
+                connection_network,
+            )
+            .await;
         });
     }
     Ok(())
@@ -274,14 +289,21 @@ async fn serve_connection<T>(
     app: Router,
     peer: IpAddr,
     policy: RedirectPolicy,
+    shutdown: crate::shutdown::Shutdown,
+    network: crate::network_metrics::NetworkMetrics,
 ) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Buffer without consuming the prefix so the TLS ClientHello stays intact.
     // A plain HTTP request gets a standalone redirect service, never the app.
-    let mut socket = BufReader::new(socket);
+    let mut socket = BufReader::new(network.track_io(socket));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let plain_http = match tokio::time::timeout_at(deadline, socket.fill_buf()).await {
+    let detected = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return,
+        result = tokio::time::timeout_at(deadline, socket.fill_buf()) => result,
+    };
+    let plain_http = match detected {
         Ok(Ok(bytes)) if !bytes.is_empty() => bytes[0].is_ascii_alphabetic(),
         _ => return,
     };
@@ -289,7 +311,7 @@ async fn serve_connection<T>(
         let service = hyper::service::service_fn(move |request| async move {
             Ok::<_, std::convert::Infallible>(http_redirect(request, policy))
         });
-        let _ = tokio::time::timeout(
+        let response = tokio::time::timeout(
             Duration::from_secs(10),
             hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -298,11 +320,20 @@ async fn serve_connection<T>(
                 .max_buf_size(8192)
                 .keep_alive(false)
                 .serve_connection(TokioIo::new(socket), service),
-        )
-        .await;
+        );
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {},
+            _ = response => {},
+        }
         return;
     }
-    let stream = match tokio::time::timeout_at(deadline, acceptor.accept(socket)).await {
+    let accepted = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return,
+        result = tokio::time::timeout_at(deadline, acceptor.accept(socket)) => result,
+    };
+    let stream = match accepted {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             tracing::warn!(
@@ -327,14 +358,27 @@ async fn serve_connection<T>(
     {
         return;
     }
-    let service = app.layer(Extension(TlsConnection { binding, peer }));
-    let _ = hyper::server::conn::http1::Builder::new()
+    let presence = crate::presence::HttpConnection::default();
+    let service = app
+        .layer(Extension(presence.clone()))
+        .layer(Extension(TlsConnection { binding, peer }));
+    let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(10))
         .max_buf_size(32768)
         .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
-        .with_upgrades()
-        .await;
+        .with_upgrades();
+    tokio::pin!(connection);
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            // Response bodies, event streams and pending handlers are
+            // disposable. Committed mutations have their own tracked workers.
+            // Dropping this connection also drops bodies and their permits.
+        },
+        _ = &mut connection => {},
+    }
+    presence.close();
 }
 
 #[cfg(test)]
@@ -573,6 +617,7 @@ mod tests {
 
     async fn memory_http(raw: &[u8]) -> (String, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let network = crate::network_metrics::NetworkMetrics::default();
         let (socket, mut client) = tokio::io::duplex(8192);
         let handled = Arc::new(AtomicUsize::new(0));
         let count = handled.clone();
@@ -586,6 +631,8 @@ mod tests {
             app,
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             policy(Endpoint::Admin, 3002),
+            crate::shutdown::Shutdown::new(),
+            network.clone(),
         ));
         client.write_all(raw).await.unwrap();
         let mut response = Vec::new();
@@ -597,6 +644,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(network.totals().received_bytes, raw.len() as u64);
+        assert_eq!(network.totals().sent_bytes, response.len() as u64);
         (
             String::from_utf8(response).unwrap(),
             handled.load(Ordering::SeqCst),
@@ -628,7 +677,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_releases_idle_detection_partial_tls_and_plaintext_headers() {
+        for prefix in [
+            &[][..],
+            &[0x16, 0x03, 0x03, 0x00, 0x64][..],
+            &b"GET / HTTP/1.1\r\nHost: localhost:3002\r\n"[..],
+        ] {
+            let (socket, mut client) = tokio::io::duplex(8192);
+            let shutdown = crate::shutdown::Shutdown::new();
+            let connection_shutdown = shutdown.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = shutdown.spawn_graceful(async move {
+                let _ = started.send(());
+                serve_connection(
+                    socket,
+                    memory_tls().0,
+                    Router::new(),
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    policy(Endpoint::Admin, 3002),
+                    connection_shutdown,
+                    Default::default(),
+                )
+                .await;
+            });
+            ready.await.unwrap();
+            client.write_all(prefix).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(shutdown.drain(Duration::from_secs(1)).await);
+            task.await.unwrap();
+            // Keep the peer alive until after drain: EOF is not cancellation.
+            drop(client);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_discards_a_pending_tls_response_without_awaiting_its_result() {
+        let (socket, client) = tokio::io::duplex(8192);
+        let (acceptor, connector) = memory_tls();
+        let shutdown = crate::shutdown::Shutdown::new();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, finish) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(tokio::sync::Mutex::new(Some(entered)));
+        let finish = Arc::new(tokio::sync::Mutex::new(Some(finish)));
+        let app = Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let entered = entered.clone();
+                let finish = finish.clone();
+                async move {
+                    let _ = entered.lock().await.take().unwrap().send(());
+                    let _ = finish.lock().await.take().unwrap().await;
+                    "finished during graceful shutdown"
+                }
+            }),
+        );
+        let task = shutdown.spawn_graceful(serve_connection(
+            socket,
+            acceptor,
+            app,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            policy(Endpoint::Api, 3000),
+            shutdown.clone(),
+            Default::default(),
+        ));
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut client = connector.connect(name, client).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        shutdown.cancel();
+        assert!(shutdown.drain(Duration::from_secs(1)).await);
+        task.await.unwrap();
+        assert!(
+            release.send(()).is_err(),
+            "the handler was waiting for its result"
+        );
+    }
+
+    #[tokio::test]
     async fn tls_client_hello_and_exporter_binding_survive_protocol_detection() {
+        let network = crate::network_metrics::NetworkMetrics::default();
         let (socket, client) = tokio::io::duplex(8192);
         let (acceptor, connector) = memory_tls();
         let app = Router::new().route(
@@ -646,6 +776,8 @@ mod tests {
             app,
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             policy(Endpoint::Api, 3000),
+            crate::shutdown::Shutdown::new(),
+            network.clone(),
         ));
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let mut stream =
@@ -695,6 +827,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // Raw-socket accounting includes handshake and TLS framing overhead,
+        // rather than measuring only the plaintext application payload.
+        assert!(network.totals().received_bytes > 100);
+        assert!(network.totals().sent_bytes > 100);
     }
 
     struct TemporaryDirectory(PathBuf);

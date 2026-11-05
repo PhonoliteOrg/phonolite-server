@@ -7,7 +7,7 @@ use redb::{ReadTransaction, ReadableTable, TableDefinition, TableError, WriteTra
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::credits::{display_credit_key, resolve_display_credit, DISPLAY_CREDIT_RESOLUTIONS};
-use crate::indexing::{LOCAL_ALBUMS, SCAN_LOCK};
+use crate::indexing::LOCAL_ALBUMS;
 use crate::storage::*;
 use crate::{AlbumSourceIdentity, Library, LibraryError};
 
@@ -100,10 +100,11 @@ pub(super) fn discard_retained(write: &WriteTransaction) -> Result<(), LibraryEr
 impl Library {
     /// Explicit operator reset; ordinary root/schema rebuilds retain imports.
     pub fn discard_metadata_imports(&self) -> Result<(), LibraryError> {
-        let _scan = SCAN_LOCK.lock();
-        let write = self.db.begin_write()?;
+        let _scan = crate::indexing::scan_lock(&self.cancellation)?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         discard_retained(&write)?;
-        write.commit()?;
+        self.check_cancelled()?;
+        write.commit_cancellable(&self.cancellation)?;
         Ok(())
     }
 
@@ -111,8 +112,8 @@ impl Library {
         &self,
         catalogs: &[CatalogBackup],
     ) -> Result<RestoreReport, LibraryError> {
-        let _scan = SCAN_LOCK.lock();
-        let write = self.db.begin_write()?;
+        let _scan = crate::indexing::scan_lock(&self.cancellation)?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         // Dropping the transaction rolls back every proposed field change.
         let count = import_resolutions(&write, catalogs)?;
         let mut report = apply(&write, catalogs)?;
@@ -180,8 +181,16 @@ impl Library {
         &self,
         catalogs: &[CatalogBackup],
     ) -> Result<RestoreReport, LibraryError> {
-        let _scan = SCAN_LOCK.lock();
-        let write = self.db.begin_write()?;
+        self.restore_metadata_observing_commits(catalogs, || {})
+    }
+
+    fn restore_metadata_observing_commits(
+        &self,
+        catalogs: &[CatalogBackup],
+        mut after_commit: impl FnMut(),
+    ) -> Result<RestoreReport, LibraryError> {
+        let _scan = crate::indexing::scan_lock(&self.cancellation)?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         {
             let mut table = write.open_table(RETAINED)?;
             for catalog in catalogs {
@@ -192,21 +201,36 @@ impl Library {
         }
         let count = import_resolutions(&write, catalogs)?;
         let mut report = apply(&write, catalogs)?;
-        write.commit()?;
+        self.check_cancelled()?;
+        write.commit_cancellable(&self.cancellation)?;
+        self.metadata_restored();
+        after_commit();
         report.restored_credit_resolutions = count;
         if count > 0 {
             // Use the normal source-driven rebuild for restored collaboration
             // repairs. Explicit local credit tags retain their normal precedence.
-            match crate::indexing::scan_locked(&self.roots, &self.db, false, None, std::time::Instant::now(), None) {
+            match crate::indexing::scan_locked(&self.roots, &self.db, false, None, std::time::Instant::now(), None, &self.cancellation, self.tag_reader.as_ref()) {
                 Ok(_) => {
-                    let preview = self.db.begin_write()?;
-                    let current = apply(&preview, catalogs)?;
-                    report.matched_albums = current.matched_albums;
-                    report.matched_artists = current.matched_artists;
-                    report.unmatched_albums = current.unmatched_albums;
-                    report.unmatched_artists = current.unmatched_artists;
-                    report.ambiguous_albums = current.ambiguous_albums;
-                    report.library_albums_without_backup = current.library_albums_without_backup;
+                    self.catalog_changed();
+                    after_commit();
+                    // Both the restore and credit rebuild are already durable.
+                    // Refreshing report counts is optional and cannot turn the
+                    // committed operation into an apparent failed restore.
+                    let refreshed = (|| {
+                        let preview = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
+                        apply(&preview, catalogs)
+                    })();
+                    match refreshed {
+                        Ok(current) => {
+                            report.matched_albums = current.matched_albums;
+                            report.matched_artists = current.matched_artists;
+                            report.unmatched_albums = current.unmatched_albums;
+                            report.unmatched_artists = current.unmatched_artists;
+                            report.ambiguous_albums = current.ambiguous_albums;
+                            report.library_albums_without_backup = current.library_albums_without_backup;
+                        }
+                        Err(err) => report.warnings.push(format!("Metadata was restored, but refreshing report counts stopped: {err}.")),
+                    }
                 },
                 Err(err) => report.warnings.push(format!("Metadata was restored, but rebuilding artist credits failed: {err}. Retry a library scan.")),
             }
@@ -455,4 +479,66 @@ pub(super) fn apply(
         .open_table(META_TABLE)?
         .insert(META_ALBUM_METADATA_KEY, encode_value(&stats)?.as_slice())?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn cancellation_after_restore_or_credit_commit_keeps_a_successful_report() {
+        for cancel_after_commit in [0, 1] {
+            let db = Arc::new(
+                redb::Database::builder()
+                    .create_with_backend(redb::backends::InMemoryBackend::new())
+                    .unwrap(),
+            );
+            let flag = Arc::new(AtomicBool::new(false));
+            let library = Library::load_or_scan_with_db_and_progress_cancellable(
+                Vec::new(),
+                db,
+                &|_| {},
+                flag.clone(),
+            )
+            .unwrap()
+            .0;
+            let mut catalog = CatalogBackup::default();
+            let credits = ArtistCredits {
+                display_name: "Earth, Wind, Fire".into(),
+                credits: vec![common::ArtistCredit {
+                    artist_id: "verified-group".into(),
+                    name: "Earth, Wind & Fire".into(),
+                    credited_name: "Earth, Wind, Fire".into(),
+                    role: "album_artist".into(),
+                    join_phrase: String::new(),
+                    source: "musicbrainz".into(),
+                }],
+            };
+            let key = display_credit_key(&credits.display_name);
+            catalog.credit_resolutions.insert(key.clone(), credits);
+            let mut committed = 0;
+            let report = library
+                .restore_metadata_observing_commits(&[catalog], || {
+                    if committed == cancel_after_commit {
+                        flag.store(true, Ordering::Release);
+                    }
+                    committed += 1;
+                })
+                .unwrap();
+            assert_eq!(report.restored_credit_resolutions, 1);
+            assert!(!report.warnings.is_empty());
+            let read = library.db.begin_read().unwrap();
+            assert!(read
+                .open_table(DISPLAY_CREDIT_RESOLUTIONS)
+                .unwrap()
+                .get(key.as_str())
+                .unwrap()
+                .is_some());
+            assert_eq!(committed, cancel_after_commit + 1);
+        }
+    }
 }

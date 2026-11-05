@@ -60,19 +60,21 @@ pub async fn get_stats(
     Extension(ctx): Extension<AuthContext>,
     Query(query): Query<StatsQuery>,
 ) -> JsonResult<StatsResponse> {
+    let jobs = state.shutdown.clone();
     let library = state.library_state.read().library.clone();
     let (year, month) = resolve_stats_period(query.year, query.month)?;
     let store = state.stats.clone();
     let user_id = ctx.user.id.clone();
     let catalog = library.clone();
-    let stats = tokio::task::spawn_blocking(move || {
-        let track_ids = store.listening_track_ids(&user_id)?;
-        refresh_genre_metadata(&store, &user_id, catalog.as_ref(), track_ids)?;
-        store.get_period(&user_id, year, month)
-    })
-    .await
-    .map_err(stats_task_error)?
-    .map_err(stats_error)?;
+    let stats = jobs
+        .spawn_blocking_named("api_stats", move || {
+            let track_ids = store.listening_track_ids(&user_id)?;
+            refresh_genre_metadata(&store, &user_id, catalog.as_ref(), track_ids)?;
+            store.get_period(&user_id, year, month)
+        })
+        .await
+        .map_err(stats_task_error)?
+        .map_err(stats_error)?;
 
     let Some(stats) = stats else {
         return Ok(Json(StatsResponse {
@@ -232,30 +234,33 @@ pub async fn sync_stats(
     Extension(ctx): Extension<AuthContext>,
     Query(query): Query<StatsSyncQuery>,
 ) -> JsonResult<StatsSyncPage> {
+    let jobs = state.shutdown.clone();
     // Reading history and identity remains available when recording is disabled.
     let collection_enabled = state.config.read().stats_collection_enabled;
     let library = state.library_state.read().library.clone();
     let store = state.stats.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut page = store.sync_events(
-            &ctx.user.id,
-            query.after,
-            query.limit.unwrap_or(MAX_EVENT_BATCH),
-            collection_enabled,
-            query.device_id.as_deref(),
-        )?;
-        // Keep repair payloads bounded by this history page. Already-synced
-        // client history can refresh its remaining tracks when opening stats.
-        let track_ids = page
-            .events
-            .iter()
-            .map(|change| change.event.track_id.clone());
-        let resolved = refresh_genre_metadata(&store, &ctx.user.id, library.as_ref(), track_ids)?;
-        page.genre_metadata.extend(resolved);
-        Ok::<_, StatsError>(page)
-    })
-    .await
-    .map_err(stats_task_error)?;
+    let result = jobs
+        .spawn_blocking_named("api_stats", move || {
+            let mut page = store.sync_events(
+                &ctx.user.id,
+                query.after,
+                query.limit.unwrap_or(MAX_EVENT_BATCH),
+                collection_enabled,
+                query.device_id.as_deref(),
+            )?;
+            // Keep repair payloads bounded by this history page. Already-synced
+            // client history can refresh its remaining tracks when opening stats.
+            let track_ids = page
+                .events
+                .iter()
+                .map(|change| change.event.track_id.clone());
+            let resolved =
+                refresh_genre_metadata(&store, &ctx.user.id, library.as_ref(), track_ids)?;
+            page.genre_metadata.extend(resolved);
+            Ok::<_, StatsError>(page)
+        })
+        .await
+        .map_err(stats_task_error)?;
     result.map(Json).map_err(stats_error)
 }
 
@@ -303,6 +308,7 @@ pub async fn ingest_stats(
     Extension(ctx): Extension<AuthContext>,
     Json(request): Json<ListeningBatchRequest>,
 ) -> JsonResult<EventBatchResult> {
+    let jobs = state.shutdown.clone();
     if !state.config.read().stats_collection_enabled {
         return Err(json_error(
             StatusCode::FORBIDDEN,
@@ -316,16 +322,17 @@ pub async fn ingest_stats(
         ));
     }
     let store = state.stats.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store.ingest_events(
-            &ctx.user.id,
-            &request.device_id,
-            request.history_generation,
-            &request.events,
-        )
-    })
-    .await
-    .map_err(stats_task_error)?;
+    let result = jobs
+        .spawn_blocking_named("api_stats", move || {
+            store.ingest_events(
+                &ctx.user.id,
+                &request.device_id,
+                request.history_generation,
+                &request.events,
+            )
+        })
+        .await
+        .map_err(stats_task_error)?;
     result.map(Json).map_err(stats_error)
 }
 
@@ -334,13 +341,16 @@ pub async fn update_stats_preference(
     Extension(ctx): Extension<AuthContext>,
     Json(request): Json<DevicePreference>,
 ) -> JsonResult<DevicePreference> {
+    let jobs = state.shutdown.clone();
     // Disabling a device is always allowed, including when the administrator has
     // disabled ingestion. It never changes another installation's preference.
     let store = state.stats.clone();
-    let result =
-        tokio::task::spawn_blocking(move || store.set_device_preference(&ctx.user.id, request))
-            .await
-            .map_err(stats_task_error)?;
+    let result = jobs
+        .spawn_blocking_named("api_stats", move || {
+            store.set_device_preference(&ctx.user.id, request)
+        })
+        .await
+        .map_err(stats_task_error)?;
     result.map(Json).map_err(stats_error)
 }
 
@@ -372,10 +382,11 @@ pub async fn counter_state(
     Extension(ctx): Extension<AuthContext>,
     Query(query): Query<CounterQuery>,
 ) -> JsonResult<CounterState> {
+    let jobs = state.shutdown.clone();
     let enabled = state.config.read().stats_collection_enabled;
     let store = state.stats.clone();
     let library = state.library_state.read().library.clone();
-    tokio::task::spawn_blocking(move || {
+    jobs.spawn_blocking_named("api_stats", move || {
         let tracks = store.listening_track_ids(&ctx.user.id)?;
         refresh_genre_metadata(&store, &ctx.user.id, library.as_ref(), tracks)?;
         store.counter_state(&ctx.user.id, &query.device_id, enabled)
@@ -390,9 +401,10 @@ pub async fn counter_snapshot(
     Extension(ctx): Extension<AuthContext>,
     Query(query): Query<CounterQuery>,
 ) -> JsonResult<CounterSnapshot> {
+    let jobs = state.shutdown.clone();
     let store = state.stats.clone();
     let library = state.library_state.read().library.clone();
-    tokio::task::spawn_blocking(move || {
+    jobs.spawn_blocking_named("api_stats", move || {
         let year = query
             .year
             .ok_or_else(|| StatsError::Invalid("year is required".into()))?;
@@ -424,6 +436,7 @@ pub async fn ingest_counters(
     Extension(ctx): Extension<AuthContext>,
     Json(batch): Json<CounterBatch>,
 ) -> JsonResult<CounterCheckpoint> {
+    let jobs = state.shutdown.clone();
     if !state.config.read().stats_collection_enabled {
         return Err(json_error(
             StatusCode::FORBIDDEN,
@@ -431,19 +444,22 @@ pub async fn ingest_counters(
         ));
     }
     let store = state.stats.clone();
-    tokio::task::spawn_blocking(move || store.ingest_counters(&ctx.user.id, &batch))
-        .await
-        .map_err(stats_task_error)?
-        .map(Json)
-        .map_err(stats_error)
+    jobs.spawn_blocking_named("api_stats", move || {
+        store.ingest_counters(&ctx.user.id, &batch)
+    })
+    .await
+    .map_err(stats_task_error)?
+    .map(Json)
+    .map_err(stats_error)
 }
 pub async fn activate_counters(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
     Json(request): Json<ActivateRequest>,
 ) -> JsonResult<CounterCheckpoint> {
+    let jobs = state.shutdown.clone();
     let store = state.stats.clone();
-    tokio::task::spawn_blocking(move || {
+    jobs.spawn_blocking_named("api_stats", move || {
         store.activate_counters(&ctx.user.id, &request.device_id, request.history_generation)
     })
     .await
@@ -457,13 +473,15 @@ pub async fn reset_stats(
     Extension(ctx): Extension<AuthContext>,
     Json(request): Json<StatsResetRequest>,
 ) -> JsonResult<StatsResetResult> {
+    let jobs = state.shutdown.clone();
     // Deletion remains available when device or server collection is disabled.
     let store = state.stats.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store.reset_history(&ctx.user.id, request.history_generation)
-    })
-    .await
-    .map_err(stats_task_error)?;
+    let result = jobs
+        .spawn_blocking_named("api_stats", move || {
+            store.reset_history(&ctx.user.id, request.history_generation)
+        })
+        .await
+        .map_err(stats_task_error)?;
     result.map(Json).map_err(stats_error)
 }
 

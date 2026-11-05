@@ -21,7 +21,7 @@ use crate::config::resolve_path;
 use crate::http::{json_error_response, json_ok_response, redirect_to, wants_json};
 use crate::logging::{
     LOG_ACTIVITY_FILE, LOG_ALL_FILE, LOG_DEBUG_FILE, LOG_ERROR_FILE, LOG_INFO_FILE, LOG_ISSUE_FILE,
-    LOG_MAX_LINES, LOG_WARN_FILE,
+    LOG_MAX_LINES, LOG_METADATA_EXTERNAL_FILE, LOG_METADATA_REQUESTS_FILE, LOG_WARN_FILE,
 };
 use crate::state::AppState;
 
@@ -130,6 +130,8 @@ pub async fn admin_logs(State(state): State<AppState>, headers: HeaderMap) -> Re
             ("log_issues_path", log_path("issues")),
             ("log_activities_path", log_path("activities")),
             ("log_debug_path", log_path("debug")),
+            ("log_metadata_requests_path", log_path("metadata_requests")),
+            ("log_metadata_external_path", log_path("metadata_external")),
             ("log_limit", LOG_UI_DEFAULT_LINES.to_string()),
             ("log_debug_checked", log_debug_checked),
             ("tag_errors", tag_errors),
@@ -148,7 +150,12 @@ pub async fn admin_logs(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 async fn load_indexing_issues(state: &AppState) -> Result<issues::IndexingIssuesResponse, String> {
     let state = state.clone();
-    tokio::task::spawn_blocking(move || issues::load_indexing_issues(&state))
+    state
+        .shutdown
+        .clone()
+        .spawn_blocking_named("indexing_issues", move || {
+            issues::load_indexing_issues(&state)
+        })
         .await
         .map_err(|err| err.to_string())?
 }
@@ -184,6 +191,7 @@ pub async fn admin_logs_tail(
     headers: HeaderMap,
     Query(query): Query<LogTailQuery>,
 ) -> Response {
+    let jobs = state.shutdown.clone();
     if !state.auth.has_admin().unwrap_or(false) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -244,10 +252,11 @@ pub async fn admin_logs_tail(
     let view = query.view.as_deref().unwrap_or("all");
     let log_path = log_file_for_view(&log_dir, view);
     let include_issues = view == "issues";
-    let result = tokio::task::spawn_blocking(move || {
-        read_log_tail_snapshot(&log_path, limit, include_issues, query.revision.as_deref())
-    })
-    .await;
+    let result = jobs
+        .spawn_blocking_named("admin_logs.rs", move || {
+            read_log_tail_snapshot(&log_path, limit, include_issues, query.revision.as_deref())
+        })
+        .await;
     match result {
         Ok(Ok(snapshot)) => Json(snapshot).into_response(),
         Ok(Err(err)) => (
@@ -390,6 +399,8 @@ fn log_file_for_view(log_dir: &PathBuf, view: &str) -> PathBuf {
         "issues" => LOG_ISSUE_FILE,
         "activities" => LOG_ACTIVITY_FILE,
         "debug" => LOG_DEBUG_FILE,
+        "metadata_requests" => LOG_METADATA_REQUESTS_FILE,
+        "metadata_external" => LOG_METADATA_EXTERNAL_FILE,
         _ => LOG_ALL_FILE,
     };
     log_dir.join(name)
@@ -428,7 +439,26 @@ pub async fn admin_logs_clear(State(state): State<AppState>, headers: HeaderMap)
 
 #[cfg(test)]
 mod tests {
-    use super::{read_log_records, read_log_tail, read_log_tail_snapshot, LogTailSnapshot};
+    use super::{
+        log_file_for_view, read_log_records, read_log_tail, read_log_tail_snapshot, LogTailSnapshot,
+    };
+
+    #[test]
+    fn metadata_views_select_their_own_files() {
+        let directory = std::path::PathBuf::from("configured-logs");
+        assert_eq!(
+            log_file_for_view(&directory, "metadata_requests"),
+            directory.join(crate::logging::LOG_METADATA_REQUESTS_FILE)
+        );
+        assert_eq!(
+            log_file_for_view(&directory, "metadata_external"),
+            directory.join(crate::logging::LOG_METADATA_EXTERNAL_FILE)
+        );
+        assert_eq!(
+            log_file_for_view(&directory, "unknown"),
+            directory.join(crate::logging::LOG_ALL_FILE)
+        );
+    }
 
     #[test]
     fn log_revisions_skip_unchanged_reads_and_invalidate_for_append_clear_and_selection() {

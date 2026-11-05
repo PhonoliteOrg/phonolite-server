@@ -50,6 +50,7 @@ fn hash(file: &mut File) -> Result<[u8; 32], String> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0; 64 * 1024];
     loop {
+        super::ensure_archive_running()?;
         let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
@@ -86,6 +87,7 @@ pub(super) fn split(mut export: Export, max_file: u64) -> Result<Prepared, Strin
     let mut remaining = length;
     let mut buffer = [0; 64 * 1024];
     for index in 0..count as u32 {
+        super::ensure_archive_running()?;
         let name = format!(
             "phonolite-{}-part-{:04}-of-{:04}.phonolite",
             &set.to_string()[..8],
@@ -105,6 +107,7 @@ pub(super) fn split(mut export: Export, max_file: u64) -> Result<Prepared, Strin
         let mut left = payload_bytes;
         let mut hasher = blake3::Hasher::new();
         while left > 0 {
+            super::ensure_archive_running()?;
             let n = left.min(buffer.len() as u64) as usize;
             export
                 .file
@@ -192,6 +195,7 @@ pub(super) fn assemble(
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0; 64 * 1024];
     for index in 0..first.count {
+        super::ensure_archive_running()?;
         let part = parts.get(&index).ok_or("Missing backup part.")?;
         if !first.same_set(part) {
             return Err("These files belong to different backup sets.".into());
@@ -206,6 +210,7 @@ pub(super) fn assemble(
         let mut part_hash = blake3::Hasher::new();
         let mut left = part.payload_bytes;
         while left > 0 {
+            super::ensure_archive_running()?;
             let n = left.min(buffer.len() as u64) as usize;
             file.read_exact(&mut buffer[..n])
                 .map_err(|e| e.to_string())?;

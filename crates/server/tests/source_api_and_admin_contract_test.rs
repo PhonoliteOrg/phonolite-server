@@ -110,7 +110,7 @@ fn download_batch_manifest_and_resume_rules_are_encoded() {
             "pub sha256: String",
             "pub struct DownloadBatchUnavailable",
             "pub async fn create_download_batch",
-            "checksum_for_file(&path, &metadata).await",
+            "checksum_for_file(&path, &metadata, &state.shutdown).await",
             "DOWNLOAD_CHECKSUM_CACHE",
             "header::IF_RANGE",
             "value.trim() == etag.as_str()",

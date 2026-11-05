@@ -5,10 +5,10 @@ use std::convert::Infallible;
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::Response,
-    Json,
+    Extension, Json,
 };
 use common::Track;
 use serde::{Deserialize, Serialize};
@@ -17,13 +17,13 @@ use tokio::sync::broadcast;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::assets::{
-    cover_response, fetch_cover_cached, metadata_root_path, resolve_artist_banner_source,
-    resolve_artist_cover_source, resolve_artist_logo_source, resolve_cover_source, CoverCacheKey,
+    metadata_root_path, resolve_artist_banner_source, resolve_artist_cover_source,
+    resolve_artist_logo_source, resolve_cover_source, CoverCacheKey,
 };
 use crate::http::{json_error, json_error_response};
 use crate::shuffle::{build_shuffle_queue, ShuffleError, ShuffleMode};
 use crate::state::{
-    AppState, ArtistCoverQuery, JsonResult, SearchQuery, SearchResult, ShuffleQuery,
+    AppState, ArtistCoverQuery, AuthContext, JsonResult, SearchQuery, SearchResult, ShuffleQuery,
 };
 
 use super::{
@@ -38,16 +38,48 @@ pub async fn get_artist_cover(
     State(state): State<AppState>,
     Query(query): Query<ArtistCoverQuery>,
     AxumPath(artist_id): AxumPath<String>,
+    headers: HeaderMap,
+    work: Option<Extension<std::sync::Arc<crate::resources::WorkPermit>>>,
 ) -> Response {
+    if query
+        .size
+        .is_some_and(|size| !crate::artwork_cache::ArtworkCache::valid_size(size))
+    {
+        return json_error_response(StatusCode::BAD_REQUEST, "size must be 128, 256 or 512");
+    }
+    if query
+        .kind
+        .as_deref()
+        .is_some_and(|kind| !matches!(kind, "logo" | "banner" | "cover"))
+    {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid artwork kind");
+    }
     let library = match library_or_response(&state) {
         Ok(library) => library,
         Err(response) => return response,
     };
     let metadata_root = metadata_root_path(&state);
-    let source = match query.kind.as_deref() {
-        Some("logo") => resolve_artist_logo_source(&library, &metadata_root, &artist_id),
-        Some("banner") => resolve_artist_banner_source(&library, &metadata_root, &artist_id),
-        _ => resolve_artist_cover_source(&library, &metadata_root, &artist_id),
+    let kind = query.kind.clone();
+    let source_artist_id = artist_id.clone();
+    let source = state
+        .shutdown
+        .clone()
+        .spawn_blocking_named("api_library.rs", move || {
+            let _work = work;
+            match kind.as_deref() {
+                Some("logo") => {
+                    resolve_artist_logo_source(&library, &metadata_root, &source_artist_id)
+                }
+                Some("banner") => {
+                    resolve_artist_banner_source(&library, &metadata_root, &source_artist_id)
+                }
+                _ => resolve_artist_cover_source(&library, &metadata_root, &source_artist_id),
+            }
+        })
+        .await;
+    let source = match source {
+        Ok(result) => result,
+        Err(err) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     let source = match source {
         Ok(Some(source)) => source,
@@ -60,19 +92,13 @@ pub async fn get_artist_cover(
         }
     };
 
-    let key = CoverCacheKey::Artist {
-        id: artist_id.clone(),
-        variant: query.kind.as_deref().unwrap_or("cover").to_string(),
-    };
-    match fetch_cover_cached(&state, key, source).await {
-        Ok((bytes, mime)) => cover_response(bytes, &mime),
-        Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
-    }
+    crate::artwork_cache::artist_response(&state, &artist_id, &query, source, &headers).await
 }
 
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
+    permit: Option<Extension<std::sync::Arc<crate::resources::WorkPermit>>>,
 ) -> JsonResult<Vec<SearchResult>> {
     let library = library_or_json_error(&state)?;
     let query = params.query.trim();
@@ -82,17 +108,33 @@ pub async fn search(
             "query is required".to_string(),
         ));
     }
+    if query.len() > 512 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "query exceeds 512 bytes",
+        ));
+    }
+    let query = query.to_owned();
     let limit = params
         .limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
 
-    let results = crate::library_search::search_library(&library, query, limit).map_err(|err| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("library error: {err}"),
-        )
-    })?;
+    let results = state
+        .shutdown
+        .clone()
+        .spawn_blocking_named("api_library.rs", move || {
+            let _permit = permit.map(|Extension(permit)| permit);
+            crate::library_search::search_library(&library, &query, limit)
+        })
+        .await
+        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .map_err(|err| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("library error: {err}"),
+            )
+        })?;
     Ok(Json(results))
 }
 
@@ -131,6 +173,7 @@ pub struct TrackMatchResult {
 
 pub async fn match_tracks(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Json(request): Json<TrackMatchRequest>,
 ) -> JsonResult<TrackMatchResponse> {
     if request.tracks.is_empty() {
@@ -151,7 +194,7 @@ pub async fn match_tracks(
         .collect::<HashMap<_, _>>();
     let like_states = state
         .user_data
-        .list_like_states()
+        .list_like_states(&ctx.user.id)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -169,11 +212,9 @@ pub async fn match_tracks(
             .map(str::trim)
             .filter(|track_id| !track_id.is_empty())
             .and_then(|track_id| {
-                by_id.get(track_id).map(|candidate| CandidateMatch {
-                    track_id: candidate.track.id.clone(),
-                    score: 1.0,
-                    kind: "exact_server_track_id",
-                })
+                by_id
+                    .get(track_id)
+                    .and_then(|candidate| exact_source_match(&descriptor, candidate))
             })
             .or_else(|| best_metadata_match(&descriptor, &candidates));
 
@@ -202,92 +243,156 @@ pub async fn match_tracks(
 
 pub async fn shuffle_tracks(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Query(params): Query<ShuffleQuery>,
 ) -> JsonResult<Vec<TrackView>> {
     let library = library_or_json_error(&state)?;
-    let mode = match ShuffleMode::parse(&params.mode) {
-        Some(mode) => mode,
-        None => {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid shuffle mode".to_string(),
-            ))
-        }
-    };
+    // Older clients still request a complete response. Keep their contract but
+    // isolate the catalog work from async streaming workers and bound its load.
+    let permit = state
+        .shuffle_sessions
+        .acquire_work_permit()
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shuffle capacity reached; retry shortly",
+            )
+        })?;
+    state
+        .shutdown
+        .clone()
+        .spawn_blocking(move || {
+            let _permit = permit;
+            if state.shutdown.is_cancelled() {
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server is shutting down",
+                ));
+            }
+            let mode = match ShuffleMode::parse(&params.mode) {
+                Some(mode) => mode,
+                None => {
+                    return Err(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid shuffle mode".to_string(),
+                    ))
+                }
+            };
 
-    let custom_artist_ids = split_list_param(params.artist_ids.as_deref());
-    let custom_genres = split_list_param(params.genres.as_deref());
+            let custom_artist_ids = split_list_param(params.artist_ids.as_deref());
+            let custom_genres = split_list_param(params.genres.as_deref());
 
-    let liked_set = liked_set(&state)?;
-    let tracks = match build_shuffle_queue(
-        &library,
-        mode,
-        params.artist_id.as_deref(),
-        params.album_id.as_deref(),
-        &custom_artist_ids,
-        &custom_genres,
-        &liked_set,
-    ) {
-        Ok(tracks) => tracks,
-        Err(ShuffleError::MissingArtistId) => {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "artist_id required for shuffle=artist".to_string(),
-            ))
-        }
-        Err(ShuffleError::MissingAlbumId) => {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "album_id required for shuffle=album".to_string(),
-            ))
-        }
-        Err(ShuffleError::Library(err)) => {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            ))
-        }
-    };
-    if tracks.is_empty() {
-        return Err(json_error(StatusCode::NOT_FOUND, "no tracks found"));
-    }
+            let liked_set = liked_set(&state, &ctx.user.id)?;
+            let tracks = match build_shuffle_queue(
+                &library,
+                mode,
+                params.artist_id.as_deref(),
+                params.album_id.as_deref(),
+                &custom_artist_ids,
+                &custom_genres,
+                &liked_set,
+            ) {
+                Ok(tracks) => tracks,
+                Err(ShuffleError::MissingArtistId) => {
+                    return Err(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "artist_id required for shuffle=artist".to_string(),
+                    ))
+                }
+                Err(ShuffleError::MissingAlbumId) => {
+                    return Err(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "album_id required for shuffle=album".to_string(),
+                    ))
+                }
+                Err(ShuffleError::Library(err)) => {
+                    return Err(json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("library error: {}", err),
+                    ))
+                }
+            };
+            if tracks.is_empty() {
+                return Err(json_error(StatusCode::NOT_FOUND, "no tracks found"));
+            }
 
-    let playlist_set = playlist_set(&state)?;
-    let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
-        .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    Ok(Json(items))
+            let playlist_set = playlist_set(&state, &ctx.user.id)?;
+            let items = build_track_views(&library, &tracks, &liked_set, &playlist_set)
+                .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+            Ok(Json(items))
+        })
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "legacy shuffle worker failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "shuffle worker failed")
+        })?
 }
 
 pub async fn metadata_events(
     State(state): State<AppState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    Extension(ctx): Extension<AuthContext>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, Response> {
+    let token = crate::http::extract_token(&headers)
+        .ok_or_else(|| json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"))?;
     let receiver = state.metadata_events.subscribe();
-    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    let data = match serde_json::to_string(&event) {
-                        Ok(data) => data,
-                        Err(err) => {
-                            tracing::warn!("Failed to serialize metadata event: {}", err);
+    let access = state.auth.subscribe_access_changes(&ctx.user.id);
+    let initial = Some(state.metadata_events.resync_event());
+    let timer = tokio::time::interval(std::time::Duration::from_secs(15));
+    let stream = futures_util::stream::unfold(
+        (receiver, initial, state, access, timer, token, ctx.user.id),
+        |(mut receiver, mut initial, state, mut access, mut timer, token, user_id)| async move {
+            loop {
+                let event = if let Some(event) = initial.take() {
+                    event
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = state.shutdown.cancelled() => return None,
+                        _ = access.changed() => {
+                            if !matches!(state.auth.user_from_token(&token), Ok(Some(user)) if user.id == user_id) { return None; }
                             continue;
+                        },
+                        notification = receiver.recv() => match notification {
+                            Ok(event) => event,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                receiver = state.metadata_events.subscribe();
+                                state.metadata_events.resync_event()
+                            },
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                        },
+                        _ = timer.tick() => {
+                            let revision = {
+                                let catalogue = state.library_state.read();
+                                if !matches!(catalogue.status, crate::state::LibraryStatus::Ready(_)) { continue; }
+                                catalogue.library.as_ref().map(|library| library.browse_revision())
+                            };
+                            match revision {
+                                Some(revision) => state.metadata_events.catalogue_event(revision),
+                                None => continue,
+                            }
                         }
-                    };
-                    let sse = Event::default()
-                        .event("metadata")
-                        .id(event.revision.to_string())
-                        .data(data);
-                    return Some((Ok(sse), receiver));
+                    }
+                };
+                if state.shutdown.is_cancelled()
+                    || !matches!(state.auth.user_from_token(&token), Ok(Some(user)) if user.id == user_id)
+                {
+                    return None;
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!("Metadata event stream lagged by {} event(s)", skipped);
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                let sse = Event::default()
+                    .event("metadata")
+                    .id(event.revision.to_string())
+                    .json_data(event)
+                    .ok()?;
+                return Some((
+                    Ok(sse),
+                    (receiver, None, state, access, timer, token, user_id),
+                ));
             }
-        }
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[derive(Clone)]
@@ -358,7 +463,12 @@ fn best_metadata_match(
     let title_norm = normalize_match_text(&descriptor.title);
     let artist_norm = normalize_match_text(&descriptor.artist);
     let album_norm = normalize_match_text(&descriptor.album);
-    if title_norm.is_empty() || artist_norm.is_empty() {
+    if descriptor.duration_ms == 0
+        || title_norm.is_empty()
+        || artist_norm.is_empty()
+        || matches!(title_norm.as_str(), "unknown" | "unknown title")
+        || matches!(artist_norm.as_str(), "unknown" | "unknown artist")
+    {
         return None;
     }
 
@@ -366,7 +476,17 @@ fn best_metadata_match(
     let mut second_score: f64 = 0.0;
     for candidate in candidates {
         let duration_delta = duration_delta_ms(descriptor.duration_ms, candidate.track.duration_ms);
-        if duration_delta > 3000 {
+        if candidate.track.duration_ms == 0
+            || duration_delta > 3000
+            || !recording_editions_compatible(
+                &title_norm,
+                &album_norm,
+                &candidate.title_norm,
+                &candidate.album_norm,
+            )
+            || !known_numbers_compatible(descriptor.track_no, candidate.track.track_no)
+            || !known_numbers_compatible(descriptor.disc_no, candidate.track.disc_no)
+        {
             continue;
         }
         let title_score = normalized_ratio(&title_norm, &candidate.title_norm);
@@ -402,6 +522,57 @@ fn best_metadata_match(
     } else {
         None
     }
+}
+
+fn exact_source_match(
+    descriptor: &TrackMatchDescriptor,
+    candidate: &TrackMatchCandidate,
+) -> Option<CandidateMatch> {
+    // IDs are relative-path hashes. A foreign library can contain the same ID,
+    // so even an exact-ID hint must identify compatible recording metadata.
+    let mut matched = best_metadata_match(descriptor, std::slice::from_ref(candidate))?;
+    matched.kind = "exact_server_track_id";
+
+    Some(matched)
+}
+
+fn known_numbers_compatible(left: Option<u16>, right: Option<u16>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn recording_editions_compatible(
+    left_title: &str,
+    left_album: &str,
+    right_title: &str,
+    right_album: &str,
+) -> bool {
+    fn editions<'a>(title: &'a str, album: &'a str) -> HashSet<&'a str> {
+        title
+            .split_whitespace()
+            .chain(album.split_whitespace())
+            .filter(|word| {
+                matches!(
+                    *word,
+                    "acoustic"
+                        | "demo"
+                        | "edit"
+                        | "instrumental"
+                        | "karaoke"
+                        | "live"
+                        | "mono"
+                        | "remaster"
+                        | "remastered"
+                        | "remix"
+                        | "stereo"
+                )
+            })
+            .collect()
+    }
+
+    editions(left_title, left_album) == editions(right_title, right_album)
 }
 
 fn duration_delta_ms(left: u32, right: u32) -> u32 {
@@ -488,6 +659,7 @@ pub async fn get_album(
 pub async fn get_album_cover(
     State(state): State<AppState>,
     AxumPath(album_id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Response {
     let library = match library_or_response(&state) {
         Ok(library) => library,
@@ -519,10 +691,7 @@ pub async fn get_album_cover(
     };
 
     let key = CoverCacheKey::Album(album_id.clone());
-    match fetch_cover_cached(&state, key, source).await {
-        Ok((bytes, mime)) => cover_response(bytes, &mime),
-        Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
-    }
+    crate::assets::stream_cover_response(&state, &key, source, &headers).await
 }
 
 #[cfg(test)]
@@ -638,5 +807,67 @@ mod tests {
         );
 
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn exact_source_hint_does_not_accept_an_unrelated_recording() {
+        let descriptor = descriptor();
+        let unrelated = candidate(
+            "same-path-hash",
+            "An Unrelated Recording",
+            "Another Artist",
+            "Another Album",
+            descriptor.duration_ms,
+        );
+
+        assert!(exact_source_match(&descriptor, &unrelated).is_none());
+    }
+
+    #[test]
+    fn exact_source_hint_accepts_compatible_metadata() {
+        let descriptor = descriptor();
+        let equivalent = candidate(
+            "same-path-hash",
+            "Break My Soul",
+            "Beyoncé",
+            "Renaissance",
+            descriptor.duration_ms,
+        );
+        let matched = exact_source_match(&descriptor, &equivalent).unwrap();
+
+        assert_eq!(matched.track_id, "same-path-hash");
+        assert_eq!(matched.kind, "exact_server_track_id");
+    }
+
+    #[test]
+    fn metadata_match_preserves_recording_editions() {
+        let mut descriptor = descriptor();
+        descriptor.title = "Break My Soul (Live)".to_string();
+        let studio = candidate(
+            "studio",
+            "Break My Soul",
+            "Beyoncé",
+            "Renaissance",
+            descriptor.duration_ms,
+        );
+
+        assert!(best_metadata_match(&descriptor, &[studio]).is_none());
+    }
+
+    #[test]
+    fn matching_does_not_choose_between_equivalent_quality_variants() {
+        let descriptor = descriptor();
+        let mp3 = candidate(
+            "mp3-source",
+            "Break My Soul",
+            "Beyoncé",
+            "Renaissance",
+            descriptor.duration_ms,
+        );
+        let mut flac = mp3.clone();
+        flac.track.id = "flac-source".to_string();
+        flac.track.codec = Codec::Flac;
+
+        assert!(best_metadata_match(&descriptor, &[mp3, flac]).is_none());
     }
 }

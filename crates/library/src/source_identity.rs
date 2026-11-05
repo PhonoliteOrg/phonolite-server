@@ -89,6 +89,7 @@ impl Library {
             Ok(identity) => identity,
             Err(_) => {
                 warn!(
+                    target: "metadata_external",
                     event = "metadata_source_identity_cache_invalid",
                     album_id,
                     reason = "malformed_json_record",
@@ -104,6 +105,7 @@ impl Library {
         }
         if let Err(reason) = identity.validate() {
             warn!(
+                target: "metadata_external",
                 event = "metadata_source_identity_cache_invalid",
                 album_id, reason, "Ignoring invalid optional album source identity cache"
             );
@@ -120,6 +122,7 @@ impl Library {
         album_id: &str,
         identity: &AlbumSourceIdentity,
     ) -> Result<(), LibraryError> {
+        self.check_cancelled()?;
         if album_id.trim().is_empty() {
             return Err(LibraryError::InvalidSourceIdentity(
                 "missing album ID".into(),
@@ -130,12 +133,13 @@ impl Library {
             .map_err(|reason| LibraryError::InvalidSourceIdentity(reason.into()))?;
         let bytes = serde_json::to_vec(identity)
             .map_err(|err| LibraryError::InvalidSourceIdentity(err.to_string()))?;
-        let write = self.db.begin_write()?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         {
             let mut table = write.open_table(ALBUM_SOURCE_IDENTITY_TABLE)?;
             table.insert(album_id, bytes.as_slice())?;
         }
-        write.commit()?;
+        self.check_cancelled()?;
+        write.commit_cancellable(&self.cancellation)?;
         Ok(())
     }
 }

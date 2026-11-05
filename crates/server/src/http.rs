@@ -8,6 +8,59 @@ use std::time::Duration;
 use crate::auth::SessionToken;
 use crate::state::{ErrorResponse, HealthResponse};
 
+/// Keep login metadata readable and bounded without storing arbitrary headers.
+pub(crate) fn login_device(headers: &HeaderMap) -> String {
+    let mut values = headers.get_all(header::USER_AGENT).iter();
+    let Some(value) = values.next().and_then(|value| value.to_str().ok()) else {
+        return "Unknown device".to_string();
+    };
+    if values.next().is_some() || value.len() > 2048 {
+        return "Unknown device".to_string();
+    }
+    let value = value.to_ascii_lowercase();
+    let platform = if value.contains("iphone") {
+        Some("iPhone")
+    } else if value.contains("ipad") {
+        Some("iPad")
+    } else if value.contains("android") {
+        Some("Android")
+    } else if value.contains("windows") {
+        Some("Windows")
+    } else if value.contains("cros") {
+        Some("ChromeOS")
+    } else if value.contains("mac os x") || value.contains("macintosh") || value.contains("(macos)")
+    {
+        Some("macOS")
+    } else if value.contains("(ios)") {
+        Some("iOS")
+    } else if value.contains("linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    let client = if value.starts_with("phonolite/") {
+        Some("Phonolite")
+    } else if value.contains("edg/") || value.contains("edgios/") || value.contains("edga/") {
+        Some("Edge")
+    } else if value.contains("opr/") || value.contains("opera") {
+        Some("Opera")
+    } else if value.contains("firefox/") || value.contains("fxios/") {
+        Some("Firefox")
+    } else if value.contains("chrome/") || value.contains("crios/") {
+        Some("Chrome")
+    } else if value.contains("safari/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    match (client, platform) {
+        (Some(client), Some(platform)) => format!("{client} on {platform}"),
+        (Some(client), None) => client.to_string(),
+        (None, Some(platform)) => platform.to_string(),
+        (None, None) => "Unknown device".to_string(),
+    }
+}
+
 pub(crate) fn request_authority<B>(
     request: &Request<B>,
     default_port: u16,
@@ -118,15 +171,15 @@ pub fn html_response(status: StatusCode, body: String) -> Response {
     response
 }
 
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .map(|token| token.trim().to_string())
+}
+
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(header::AUTHORIZATION) {
-        if let Ok(value) = value.to_str() {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                return Some(token.trim().to_string());
-            }
-        }
-    }
-    extract_session_cookie(headers)
+    extract_bearer_token(headers).or_else(|| extract_session_cookie(headers))
 }
 
 pub fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -171,6 +224,50 @@ mod session_tests {
     use super::*;
 
     #[test]
+    fn login_devices_describe_browsers_and_native_app_platforms() {
+        for (agent, expected) in [
+            ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36", "Chrome on Windows"),
+            ("Mozilla/5.0 (Windows NT 10.0) Chrome/130.0 Safari/537.36 Edg/130.0", "Edge on Windows"),
+            ("Mozilla/5.0 (X11; Linux x86_64) Firefox/132.0", "Firefox on Linux"),
+            ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Version/18.0 Mobile/15E148 Safari/604.1", "Safari on iPhone"),
+            ("Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) CriOS/130.0 Mobile/15E148 Safari/604.1", "Chrome on iPad"),
+            ("Phonolite/0.1.0 (android)", "Phonolite on Android"),
+            ("Phonolite/0.1.0 (macos)", "Phonolite on macOS"),
+            ("Phonolite/0.1.0 (ios)", "Phonolite on iOS"),
+            ("Phonolite/0.1.0 (windows)", "Phonolite on Windows"),
+            ("Phonolite/0.1.0 (linux)", "Phonolite on Linux"),
+            ("<script>arbitrary client</script>", "Unknown device"),
+            ("", "Unknown device"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_str(agent).unwrap());
+            assert_eq!(login_device(&headers), expected);
+        }
+    }
+
+    #[test]
+    fn login_devices_ignore_missing_ambiguous_or_oversized_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(login_device(&headers), "Unknown device");
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert_eq!(login_device(&headers), "Unknown device");
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(&"x".repeat(2049)).unwrap(),
+        );
+        assert_eq!(login_device(&headers), "Unknown device");
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Phonolite/0.1.0 (android)"),
+        );
+        headers.append(header::USER_AGENT, HeaderValue::from_static("Chrome/130.0"));
+        assert_eq!(login_device(&headers), "Unknown device");
+    }
+
+    #[test]
     fn bearer_precedes_cookie_and_cookie_only_auth_stays_separate() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -178,11 +275,20 @@ mod session_tests {
             HeaderValue::from_static("other=x; phonolite_session=cookie=token"),
         );
         assert_eq!(extract_token(&headers).as_deref(), Some("cookie=token"));
+        assert_eq!(
+            extract_bearer_token(&headers),
+            None,
+            "console cookies do not identify a client heartbeat"
+        );
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer   bearer-token  "),
         );
         assert_eq!(extract_token(&headers).as_deref(), Some("bearer-token"));
+        assert_eq!(
+            extract_bearer_token(&headers).as_deref(),
+            Some("bearer-token")
+        );
         assert_eq!(
             extract_session_cookie(&headers).as_deref(),
             Some("cookie=token")
@@ -192,6 +298,7 @@ mod session_tests {
             HeaderValue::from_static("bearer lower-case"),
         );
         assert_eq!(extract_token(&headers).as_deref(), Some("cookie=token"));
+        assert_eq!(extract_bearer_token(&headers), None);
     }
 
     #[test]

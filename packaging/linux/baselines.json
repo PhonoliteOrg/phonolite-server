@@ -1,0 +1,27 @@
+{
+  "ubuntu22.04": {
+    "format": "deb", "image": "docker.io/library/ubuntu:22.04",
+    "recipe": "deb", "os_id": "ubuntu", "os_version": "22.04",
+    "glibc_max": "2.35", "architectures": ["x86_64", "aarch64"]
+  },
+  "debian12": {
+    "format": "deb", "image": "docker.io/library/debian:12-slim",
+    "recipe": "deb", "os_id": "debian", "os_version": "12",
+    "glibc_max": "2.36", "architectures": ["x86_64", "aarch64"]
+  },
+  "el9": {
+    "format": "rpm", "image": "docker.io/library/almalinux:9",
+    "recipe": "rpm", "os_id": "almalinux", "os_version": "9",
+    "glibc_max": "2.34", "architectures": ["x86_64", "aarch64"]
+  },
+  "el10": {
+    "format": "rpm", "image": "docker.io/library/almalinux:10",
+    "recipe": "rpm", "os_id": "almalinux", "os_version": "10",
+    "glibc_max": "2.39", "architectures": ["x86_64", "aarch64"]
+  },
+  "arch": {
+    "format": "pacman", "image": "docker.io/library/archlinux:base",
+    "recipe": "pacman", "os_id": "arch", "os_version": "",
+    "glibc_max": null, "architectures": ["x86_64"]
+  }
+}

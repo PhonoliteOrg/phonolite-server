@@ -27,7 +27,7 @@ impl ActivityStore {
     }
 
     pub fn init_tables(&self) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let write_txn = ::library::begin_write(&self.db).map_err(|e| e.to_string())?;
         let _ = write_txn
             .open_table(ACTIVITY_TABLE)
             .map_err(|e| e.to_string())?;
@@ -45,7 +45,7 @@ impl ActivityStore {
             kind: kind.to_string(),
         };
         let bytes = bincode::serialize(&entry).map_err(|e| e.to_string())?;
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let write_txn = ::library::begin_write(&self.db).map_err(|e| e.to_string())?;
         {
             let mut table = write_txn
                 .open_table(ACTIVITY_TABLE)
@@ -90,7 +90,7 @@ impl ActivityStore {
     }
 
     pub fn clear_events(&self) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let write_txn = ::library::begin_write(&self.db).map_err(|e| e.to_string())?;
         match write_txn.delete_table(ACTIVITY_TABLE) {
             Ok(_) | Err(TableError::TableDoesNotExist(_)) => {}
             Err(err) => return Err(err.to_string()),

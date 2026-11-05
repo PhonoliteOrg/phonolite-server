@@ -82,6 +82,7 @@ pub(super) struct Import {
 impl Import {
     pub fn write_assets(&self, root: &Path) -> Result<(), String> {
         for (reference, path) in &self.images {
+            super::ensure_archive_running()?;
             let bytes = read_image(path)?;
             super::write_assets(root, &BTreeMap::from([(reference.clone(), bytes)]))?;
         }
@@ -125,8 +126,7 @@ impl<W: Write> Write for LimitedWriter<W> {
 
 fn read_image(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|err| err.to_string())?
+    super::ArchiveReader(File::open(path).map_err(|err| err.to_string())?)
         .take(MAX_IMAGE as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|err| err.to_string())?;
@@ -147,6 +147,7 @@ pub(super) fn export(
     let canonical_root = root.canonicalize().ok();
     let mut artwork_bytes = 0u64;
     for reference in asset_refs(&catalogs) {
+        super::ensure_archive_running()?;
         if image_extension(&reference).is_none() {
             return Err("Invalid stored artwork reference.".into());
         }
@@ -221,6 +222,7 @@ pub(super) fn export(
     drop(manifest);
     // References are immutable content versions; verify them again during copy.
     for (hash, path) in sources {
+        super::ensure_archive_running()?;
         let bytes = read_image(&path)?;
         if blake3::hash(&bytes).to_hex().as_str() != hash {
             return Err("Artwork changed while creating the backup; retry the download.".into());
@@ -246,6 +248,7 @@ fn payload_hash(file: &mut File, max_archive: u64) -> Result<blake3::Hash, Strin
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0; 64 * 1024];
     loop {
+        super::ensure_archive_running()?;
         let count = file.read(&mut buffer).map_err(|err| err.to_string())?;
         if count == 0 {
             break;
@@ -276,7 +279,8 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
         file.seek(SeekFrom::Start(0))
             .map_err(|err| err.to_string())?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        super::ArchiveReader(&mut *file)
+            .read_to_end(&mut bytes)
             .map_err(|err| err.to_string())?;
         let mut legacy = super::decode_with_limit(
             &bytes,
@@ -285,6 +289,7 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
         let images = super::prepare_assets(&mut legacy)?;
         let mut staged = BTreeMap::new();
         for (reference, bytes) in images {
+            super::ensure_archive_running()?;
             staged.insert(reference, scratch.stage(&bytes)?);
         }
         return Ok(Import {
@@ -303,7 +308,7 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
     }
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|err| err.to_string())?;
-    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let mut decoder = GzDecoder::new(BufReader::new(super::ArchiveReader(file)));
     let mut length = [0; 8];
     decoder
         .read_exact(&mut length)
@@ -331,6 +336,7 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
     }
     let mut expanded = length + 8;
     for (hash, &size) in &manifest.blobs {
+        super::ensure_archive_running()?;
         if hash.len() != 64
             || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             || size > MAX_IMAGE as u64
@@ -343,12 +349,14 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
         }
     }
     for (reference, hash) in &manifest.assets {
+        super::ensure_archive_running()?;
         if image_extension(reference).is_none() || !manifest.blobs.contains_key(hash) {
             return Err("Invalid artwork reference in backup.".into());
         }
     }
     let mut staged = BTreeMap::new();
     for (hash, &size) in &manifest.blobs {
+        super::ensure_archive_running()?;
         let mut bytes = vec![0; size as usize];
         decoder
             .read_exact(&mut bytes)
@@ -377,14 +385,18 @@ pub(super) fn import(file: &mut File, scratch: &Scratch, limits: Limits) -> Resu
     let mut mapping = BTreeMap::new();
     let mut images = BTreeMap::new();
     for (reference, hash) in manifest.assets {
+        super::ensure_archive_running()?;
         let ext = image_extension(&reference).ok_or("Invalid artwork reference.")?;
         let target = format!("restored/{hash}.{ext}");
         images.insert(target.clone(), staged[&hash].clone());
         mapping.insert(reference, target);
     }
     for catalog in &mut manifest.catalogs {
+        super::ensure_archive_running()?;
         for artist in &mut catalog.artists {
+            super::ensure_archive_running()?;
             for reference in [&mut artist.logo_ref, &mut artist.banner_ref] {
+                super::ensure_archive_running()?;
                 *reference = reference
                     .as_ref()
                     .and_then(|value| mapping.get(value))

@@ -85,6 +85,29 @@ mod tests {
         }
     }
     #[test]
+    fn notifications_advance_only_for_committed_account_mutations() {
+        let fixture = Fixture::new();
+        let store = fixture.store.as_ref().unwrap();
+        let baseline = store.notification_revision("user").unwrap();
+        store.activate_counters("user", "device", 1).unwrap();
+        assert_eq!(store.notification_revision("user").unwrap(), baseline);
+        let mut changes = store.subscribe_changes("user");
+        store.ingest_counters("user", &batch(1)).unwrap();
+        assert_eq!(store.notification_revision("user").unwrap(), baseline + 1);
+        assert_eq!(store.notification_revision("other").unwrap(), 0);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        store.ingest_counters("user", &batch(1)).unwrap();
+        assert!(!changes.has_changed().unwrap());
+        assert!(store.ingest_counters("user", &batch(3)).is_err());
+        assert_eq!(store.notification_revision("user").unwrap(), baseline + 1);
+        store.reset_history("user", 1).unwrap();
+        assert_eq!(store.notification_revision("user").unwrap(), baseline + 2);
+        store.reset_history("user", 1).unwrap();
+        assert_eq!(store.notification_revision("user").unwrap(), baseline + 2);
+    }
+
+    #[test]
     fn retry_stale_gap_and_changed_payload_are_atomic() {
         let fixture = Fixture::new();
         let store = fixture.store.as_ref().unwrap();
@@ -229,7 +252,7 @@ mod tests {
             .unwrap();
         // Recreate a pre-v2 database. Migration retains its original event IDs
         // until the old installation explicitly completes its handoff.
-        let txn = store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&store.db).unwrap();
         for definition in [ROWS, SNAPSHOTS, REVISIONS, DEVICES, STATE] {
             let mut table = txn.open_table(definition).unwrap();
             for item in table.drain_filter::<&str, _>(.., |_, _| true).unwrap() {
@@ -573,7 +596,7 @@ fn checkpoint_read(
 
 impl StatsStore {
     pub(in super::super) fn init_counters(&self) -> Result<(), StatsError> {
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         for definition in [ROWS, SNAPSHOTS, DEVICES, REVISIONS, STATE] {
             txn.open_table(definition)?;
         }
@@ -682,7 +705,7 @@ impl StatsStore {
         generation: u64,
     ) -> Result<CounterCheckpoint, StatsError> {
         validate_id(device)?;
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         let current = txn
             .open_table(META)?
             .get(scoped_key(user, "account").as_str())?
@@ -693,6 +716,7 @@ impl StatsStore {
             return Err(StatsError::GenerationMismatch);
         }
         let checkpoint;
+        let upgraded;
         {
             let mut devices = txn.open_table(DEVICES)?;
             let key = scoped_key(user, device);
@@ -701,6 +725,7 @@ impl StatsStore {
                 .map(|v| serde_json::from_slice(v.value()))
                 .transpose()?
                 .unwrap_or_default();
+            upgraded = !state.upgraded;
             state.upgraded = true;
             let bytes = serde_json::to_vec(&state)?;
             devices.insert(key.as_str(), bytes.as_slice())?;
@@ -753,7 +778,13 @@ impl StatsStore {
             txn.open_table(STATE)?
                 .insert(scoped_key(user, "retired").as_str(), &b"1"[..])?;
         }
+        if upgraded {
+            self.advance_notification(&txn, user)?;
+        }
         txn.commit()?;
+        if upgraded {
+            self.notify_committed(user);
+        }
         Ok(checkpoint)
     }
     pub fn ingest_counters(
@@ -772,7 +803,7 @@ impl StatsStore {
             return Err(StatsError::Invalid("invalid counter batch or size".into()));
         }
         let hash = digest(batch)?;
-        let txn = self.db.begin_write()?;
+        let txn = ::library::begin_write(&self.db)?;
         let generation = txn
             .open_table(META)?
             .get(scoped_key(user, "account").as_str())?
@@ -863,7 +894,9 @@ impl StatsStore {
         let bytes = serde_json::to_vec(&checkpoint)?;
         txn.open_table(DEVICES)?
             .insert(key.as_str(), bytes.as_slice())?;
+        self.advance_notification(&txn, user)?;
         txn.commit()?;
+        self.notify_committed(user);
         Ok(checkpoint)
     }
     pub fn counter_snapshot(

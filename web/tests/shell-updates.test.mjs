@@ -72,7 +72,7 @@ class Element extends Events {
   focus() { document.activeElement = this; }
 }
 
-const originals = { document: globalThis.document, window: globalThis.window, fetch: globalThis.fetch, FormData: globalThis.FormData };
+const originals = { document: globalThis.document, window: globalThis.window, fetch: globalThis.fetch, FormData: globalThis.FormData, WebSocket: globalThis.WebSocket };
 const cleanups = [];
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 afterEach(() => {
@@ -165,6 +165,16 @@ test("synchronizing authenticated views retains the drawer and one library statu
   assert.equal(state.document.listeners.get("library:scan-started").size, 0);
   assert.equal(state.document.listeners.get("visibilitychange").size, 0);
   assert.equal(state.media[0].listeners.get("change").size, 0);
+});
+
+test("console navigation and polling do not open client presence connections", async () => {
+  const state = harness();
+  globalThis.WebSocket = class { constructor() { assert.fail("the admin console must not establish client presence"); } };
+  const shell = setupShell(); cleanups.push(shell);
+  await settle();
+  shell.sync();
+  await state.poll();
+  assert.equal(state.timers.size, 1, "only the existing library status watcher is needed");
 });
 
 test("finishing a scan clears sidebar progress without refreshing settings or replacing the form", async () => {
@@ -456,4 +466,10 @@ test("authentication navigation removes old bindings and aborts pending shell wo
   shell.sync();
   assert.equal(state.media.length, 2);
   assert.equal(state.elements.get("nav-menu-toggle").listeners.get("click").size, 1);
+});
+
+
+test("single-entity metadata work does not claim to be a catalog sweep", () => {
+  const progress = { phase: "artists", checked: 0, total: 1, interactive: true, current: { artist: "Prime per artist" } };
+  assert.equal(libraryIndexStatusText({ status: "ready", metadata: { phase: "artists", progress } }), "Artist metadata: Prime per artist");
 });

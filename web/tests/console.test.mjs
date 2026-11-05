@@ -254,7 +254,7 @@ function logsHarness() {
   window.clearTimeout = (id) => timers.delete(id);
   const nodes = Object.fromEntries([
     "log-view", "log-panel", "log-empty", "logs-refresh", "logs-clear",
-    "log-spinner", "indexing-issues", "indexing-issue-count", "indexing-issues-card", "log-tabs",
+    "log-spinner", "indexing-issues", "indexing-issue-count", "indexing-issues-card", "log-tabs", "log-file-path",
   ].map((id) => [id, new Element()]));
   nodes["log-view"].scrollTop = 0;
   nodes["log-view"].scrollHeight = 100;
@@ -270,9 +270,10 @@ function logsHarness() {
   nodes["indexing-issues"].innerHTML = "Initial issues";
   nodes["indexing-issue-count"].textContent = "1 files";
   nodes["indexing-issues-card"].classList.add("hidden");
-  const chips = new Map(["all", "info", "warnings", "errors", "issues", "activities", "debug"].map((view) => {
+  const chips = new Map(["all", "info", "warnings", "errors", "issues", "activities", "debug", "metadata_requests", "metadata_external"].map((view) => {
     const chip = new Element();
     chip.dataset.log = view;
+    chip.dataset.logPath = `/configured-logs/${view}.log`;
     chip.closest = () => chip;
     if (view === "all") chip.classList.add("active");
     return [view, chip];
@@ -319,9 +320,10 @@ test("Indexing issues has its own Logs tab and only the selected view polls", as
   assert.ok(requests.at(-1).url.endsWith("view=all"));
   requests.at(-1).resolve(response({ lines: [], updated_at: 1 }));
   await settle();
-  for (const view of ["info", "warnings", "errors", "activities", "debug", "all"]) {
+  for (const view of ["info", "warnings", "errors", "activities", "debug", "metadata_requests", "metadata_external", "all"]) {
     select(view);
     assert.ok(requests.at(-1).url.endsWith(`view=${view}`));
+    assert.equal(nodes["log-file-path"].textContent, `/configured-logs/${view}.log`);
     requests.at(-1).resolve(response({ lines: [], updated_at: 1 }));
     await settle();
   }
@@ -344,6 +346,49 @@ test("Indexing issues has its own Logs tab and only the selected view polls", as
   requests.at(-1).resolve(response({ lines: [], updated_at: 1 }));
   await settle();
   assert.equal(nodes["indexing-issues"].innerHTML, "Issue details");
+  window.emit("pagehide");
+});
+
+test("metadata log views retain severity and status, poll independently, and ignore a previous view's response", async () => {
+  const { window, nodes, requests, select, tick, messages } = logsHarness();
+  requests[0].resolve(response({ lines: [], updated_at: 1, revision: "all-revision" }));
+  await settle();
+  select("metadata_requests");
+  const staleRequest = requests.at(-1);
+  assert.equal(nodes["log-file-path"].textContent, "/configured-logs/metadata_requests.log");
+  select("metadata_external");
+  assert.equal(staleRequest.options.signal.aborted, true);
+  assert.equal(nodes["log-file-path"].textContent, "/configured-logs/metadata_external.log");
+  assert.equal(requests.at(-1).url.includes("revision="), false);
+  requests.at(-1).resolve(response({
+    lines: [
+      "now WARN metadata_external: status=429 provider rate limited",
+      "now ERROR metadata_external: status=503 provider unavailable",
+      "now DEBUG metadata_external: provider retry diagnostic",
+    ], updated_at: 2, revision: "external-revision",
+  }));
+  await settle();
+  staleRequest.resolve(response({ lines: ["now INFO stale request"], updated_at: 1 }));
+  await settle();
+  assert.deepEqual(messages(), [
+    "metadata_external: status=429 provider rate limited",
+    "metadata_external: status=503 provider unavailable",
+    "metadata_external: provider retry diagnostic",
+  ]);
+  const rows = nodes["log-view"].querySelectorAll(".log-line");
+  assert.deepEqual(rows.map((row) => row.children[1].textContent), ["WARN", "ERROR", "DEBUG"]);
+  assert.deepEqual(rows.map((row) => row.children[1].className), ["log-level warn", "log-level error", "log-level debug"]);
+  tick(1000);
+  assert.ok(requests.at(-1).url.endsWith("view=metadata_external"));
+  assert.ok(requests.at(-1).url.includes("revision=external-revision"));
+  requests.at(-1).resolve(response({ unchanged: true, revision: "external-revision", updated_at: 2 }));
+  await settle();
+  select("metadata_requests");
+  assert.ok(requests.at(-1).url.endsWith("view=metadata_requests"));
+  assert.equal(requests.at(-1).url.includes("revision="), false);
+  requests.at(-1).resolve(response({ lines: ["now INFO metadata_request: status=200 request completed"], updated_at: 3 }));
+  await settle();
+  assert.deepEqual(messages(), ["metadata_request: status=200 request completed"]);
   window.emit("pagehide");
 });
 

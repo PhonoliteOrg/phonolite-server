@@ -1,0 +1,72 @@
+<div class="page-title">
+  <div><h1>Performance</h1><p class="muted">Live resource usage and music streams for this Phonolite server.</p></div>
+</div>
+<div class="process-performance" id="process-performance">
+  <dl class="process-details">
+    <div><dt>Process ID</dt><dd id="process-pid">{{pid}}</dd></div>
+    <div><dt>Uptime</dt><dd id="process-uptime">{{uptime}}</dd></div>
+    <div><dt>Logical CPUs</dt><dd id="process-cpus">{{logical_cpus}}</dd></div>
+    <div><dt>Active streams</dt><dd id="process-active-streams">{{active_streams}}</dd></div>
+  </dl>
+  <p class="hint">Devices currently playing music from this server, including buffered audio. Paused playback and downloads are excluded. Disconnected devices expire within 15 seconds.</p>
+  <p class="hint" id="performance-status">Updates every two seconds while this page is visible. History is kept in memory for up to five minutes.</p>
+  <p id="performance-error" class="inline-error" role="alert"></p>
+  <div class="process-charts">
+    <section class="process-chart" aria-labelledby="cpu-heading">
+      <div class="process-chart-heading">
+        <h2 id="cpu-heading">Server CPU usage</h2>
+        <p class="process-value" id="process-cpu">{{cpu_value}}</p>
+      </div>
+      <p class="hint">The server and all of its workers, including transcodes, as a share of total CPU capacity. 100% means all logical CPUs are fully occupied.</p>
+      <div class="process-chart-scale"><span id="cpu-scale">100%</span></div>
+      <svg id="cpu-chart" class="process-graph" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Server share of total CPU capacity. Waiting for samples.">
+        <title>Server share of total CPU capacity over the most recent five minutes</title>
+        <path class="process-grid" d="M0 0H600M0 90H600M0 180H600" />
+        <path class="process-line" id="cpu-line" d="" />
+        <circle class="process-point" id="cpu-point" r="2.5" hidden />
+      </svg>
+      <div class="process-chart-axis" aria-hidden="true"><span>5 min ago</span><span>0%</span><span>Latest</span></div>
+      <p class="hint process-chart-summary" id="cpu-summary" title="Min, average and max of available samples in the last five minutes.">Min — · Avg — · Max —</p>
+    </section>
+    <section class="process-chart process-memory" aria-labelledby="memory-heading">
+      <div class="process-chart-heading"><h2 id="memory-heading">Resident memory</h2><p class="process-value" id="process-memory">{{memory_value}}</p></div>
+      <p class="hint">Physical memory currently held by this process, including shared pages.</p>
+      <div class="process-chart-scale"><span id="memory-scale">MiB</span></div>
+      <svg id="memory-chart" class="process-graph" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Resident memory history. Waiting for samples.">
+        <title>Resident memory over the most recent five minutes</title>
+        <path class="process-grid" d="M0 0H600M0 90H600M0 180H600" />
+        <path class="process-line" id="memory-line" d="" />
+        <circle class="process-point" id="memory-point" r="2.5" hidden />
+      </svg>
+      <div class="process-chart-axis" aria-hidden="true"><span>5 min ago</span><span>0 MiB</span><span>Latest</span></div>
+      <p class="hint process-chart-summary" id="memory-summary" title="Min, average and max of available samples in the last five minutes.">Min — · Avg — · Max —</p>
+    </section>
+    <section class="process-chart process-sent" aria-labelledby="sent-heading">
+      <div class="process-chart-heading"><h2 id="sent-heading">Sent to clients</h2><p class="process-value" id="process-sent">{{sent_value}}</p></div>
+      <p class="hint">Bytes sent per second across the server's client connections.</p>
+      <div class="process-chart-scale"><span id="sent-scale">KiB/s</span></div>
+      <svg id="sent-chart" class="process-graph" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Traffic sent to clients. Waiting for samples.">
+        <title>Traffic sent to clients over the most recent five minutes</title>
+        <path class="process-grid" d="M0 0H600M0 90H600M0 180H600" />
+        <path class="process-line" id="sent-line" d="" />
+        <circle class="process-point" id="sent-point" r="2.5" hidden />
+      </svg>
+      <div class="process-chart-axis" aria-hidden="true"><span>5 min ago</span><span>0 KiB/s</span><span>Latest</span></div>
+      <p class="hint process-chart-summary" id="sent-summary" title="Min, average and max of available samples in the last five minutes.">Min — · Avg — · Max —</p>
+    </section>
+    <section class="process-chart process-received" aria-labelledby="received-heading">
+      <div class="process-chart-heading"><h2 id="received-heading">Received from clients</h2><p class="process-value" id="process-received">{{received_value}}</p></div>
+      <p class="hint">Bytes received per second across the server's client connections.</p>
+      <div class="process-chart-scale"><span id="received-scale">KiB/s</span></div>
+      <svg id="received-chart" class="process-graph" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Traffic received from clients. Waiting for samples.">
+        <title>Traffic received from clients over the most recent five minutes</title>
+        <path class="process-grid" d="M0 0H600M0 90H600M0 180H600" />
+        <path class="process-line" id="received-line" d="" />
+        <circle class="process-point" id="received-point" r="2.5" hidden />
+      </svg>
+      <div class="process-chart-axis" aria-hidden="true"><span>5 min ago</span><span>0 KiB/s</span><span>Latest</span></div>
+      <p class="hint process-chart-summary" id="received-summary" title="Min, average and max of available samples in the last five minutes.">Min — · Avg — · Max —</p>
+    </section>
+  </div>
+  <noscript><p class="hint">These values were measured when the page loaded. Enable JavaScript for live updates and graphs.</p></noscript>
+</div>

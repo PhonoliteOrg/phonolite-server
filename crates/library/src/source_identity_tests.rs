@@ -32,6 +32,17 @@ fn identity() -> AlbumSourceIdentity {
 
 fn memory_library() -> Library {
     Library {
+        metadata_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
+        browse_projection: Arc::new(Default::default()),
+        search_state: Arc::new(Default::default()),
+        cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tag_reader: None,
+        cancel_reads: false,
+        cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
         roots: Vec::new(),
         db: Arc::new(
             Database::builder()
@@ -110,6 +121,17 @@ fn source_identity_roundtrips_json_and_survives_database_reopen() {
     let expected = identity();
     {
         let library = Library {
+            metadata_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::next_catalog_generation(),
+            )),
+            browse_projection: Arc::new(Default::default()),
+            search_state: Arc::new(Default::default()),
+            cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tag_reader: None,
+            cancel_reads: false,
+            cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::next_catalog_generation(),
+            )),
             roots: Vec::new(),
             db: Library::open_db(&file.path).unwrap(),
         };
@@ -131,6 +153,17 @@ fn source_identity_roundtrips_json_and_survives_database_reopen() {
         );
     }
     let reopened = Library {
+        metadata_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
+        browse_projection: Arc::new(Default::default()),
+        search_state: Arc::new(Default::default()),
+        cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tag_reader: None,
+        cancel_reads: false,
+        cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
         roots: Vec::new(),
         db: Library::open_db(&file.path).unwrap(),
     };

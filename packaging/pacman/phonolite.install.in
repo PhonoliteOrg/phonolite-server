@@ -1,0 +1,17 @@
+@HOOKS@
+
+post_install() {
+    phonolite_first_install
+}
+
+post_upgrade() {
+    phonolite_upgrade
+}
+
+pre_remove() {
+    phonolite_remove
+}
+
+post_remove() {
+    phonolite_reload
+}

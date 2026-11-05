@@ -22,6 +22,7 @@ use crate::{now_secs, AlbumMetadataStats, Library, LibraryError, LibraryStats};
 
 pub(super) fn album_metadata_stats(
     db: &redb::Database,
+    cancellation: &std::sync::atomic::AtomicBool,
 ) -> Result<AlbumMetadataStats, LibraryError> {
     {
         let read = db.begin_read()?;
@@ -32,7 +33,7 @@ pub(super) fn album_metadata_stats(
     }
     // Upgrade existing indexes once. Recheck under the writer lock so concurrent
     // enrichments and status requests cannot publish stale counts.
-    let write = db.begin_write()?;
+    let write = crate::begin_write_cancellable(db, cancellation)?;
     let stats = {
         let mut meta = write.open_table(META_TABLE)?;
         if let Some(value) = meta.get(META_ALBUM_METADATA_KEY)? {
@@ -41,6 +42,7 @@ pub(super) fn album_metadata_stats(
         let albums = write.open_table(ALBUMS_TABLE)?;
         let mut stats = AlbumMetadataStats::default();
         for entry in albums.iter()? {
+            crate::check_cancelled(cancellation)?;
             let (_, value) = entry?;
             let album: Album = decode_value(value.value())?;
             stats.total += 1;
@@ -50,13 +52,13 @@ pub(super) fn album_metadata_stats(
         meta.insert(META_ALBUM_METADATA_KEY, bytes.as_slice())?;
         stats
     };
-    write.commit()?;
+    write.commit_cancellable(cancellation)?;
     Ok(stats)
 }
 
 impl Library {
     pub fn album_metadata_stats(&self) -> Result<AlbumMetadataStats, LibraryError> {
-        album_metadata_stats(&self.db)
+        album_metadata_stats(&self.db, &self.cancellation)
     }
 
     pub fn update_artist_enrichment(
@@ -68,7 +70,8 @@ impl Library {
         banner_ref: Option<String>,
         replace: bool,
     ) -> Result<bool, LibraryError> {
-        let write_txn = self.db.begin_write()?;
+        self.check_cancelled()?;
+        let write_txn = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         let updated = {
             let mut artist_table = write_txn.open_table(ARTISTS_TABLE)?;
             let mut artist: Artist = match artist_table.get(artist_id)? {
@@ -121,12 +124,15 @@ impl Library {
             if updated {
                 let artist_bytes = encode_value(&artist)?;
                 artist_table.insert(artist_id, artist_bytes.as_slice())?;
+                crate::browse_projection::refresh_artist(&write_txn, &artist)?;
             }
             updated
         };
 
         if updated {
-            write_txn.commit()?;
+            self.check_cancelled()?;
+            write_txn.commit_cancellable(&self.cancellation)?;
+            self.metadata_changed();
         }
         Ok(updated)
     }
@@ -138,7 +144,8 @@ impl Library {
         genres: &[String],
         replace: bool,
     ) -> Result<bool, LibraryError> {
-        let write_txn = self.db.begin_write()?;
+        self.check_cancelled()?;
+        let write_txn = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         let (updated, was_complete, is_complete) = {
             let mut album_table = write_txn.open_table(ALBUMS_TABLE)?;
             let mut album: Album = match album_table.get(album_id)? {
@@ -204,7 +211,9 @@ impl Library {
                     meta.insert(META_ALBUM_METADATA_KEY, bytes.as_slice())?;
                 }
             }
-            write_txn.commit()?;
+            self.check_cancelled()?;
+            write_txn.commit_cancellable(&self.cancellation)?;
+            self.metadata_changed();
         }
         Ok(updated)
     }
@@ -214,12 +223,13 @@ impl Library {
         album_id: &str,
         artists: &[Artist],
     ) -> Result<bool, LibraryError> {
+        self.check_cancelled()?;
         let mut artists = normalize_album_artists(artists);
         if artists.is_empty() {
             return Ok(false);
         }
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         let (updated, new_artist_count) = {
             let mut meta_table = write_txn.open_table(META_TABLE)?;
             let mut artists_table = write_txn.open_table(ARTISTS_TABLE)?;
@@ -303,6 +313,7 @@ impl Library {
             let mut end = prefix.clone();
             end.push('\u{10ffff}');
             for entry in album_tracks_table.range(prefix.as_str()..end.as_str())? {
+                self.check_cancelled()?;
                 let entry = entry?;
                 let (_, track_id) = split_key_last(entry.0.value())?;
                 if let Some(value) = tracks_table.get(track_id)? {
@@ -373,6 +384,7 @@ impl Library {
 
             let mut new_artist_count = 0usize;
             for artist in &artists {
+                self.check_cancelled()?;
                 let existing = match artists_table.get(artist.id.as_str())? {
                     Some(value) => Some(decode_value::<Artist>(value.value())?),
                     None => None,
@@ -481,6 +493,7 @@ impl Library {
                 let mut end = prefix.clone();
                 end.push('\u{10ffff}');
                 for entry in album_tracks_table.range(prefix.as_str()..end.as_str())? {
+                    self.check_cancelled()?;
                     let entry = entry?;
                     let key = entry.0.value();
                     let (_, track_id) = split_key_last(key)?;
@@ -560,9 +573,13 @@ impl Library {
         };
 
         if updated || new_artist_count > 0 {
-            write_txn.commit()?;
+            self.check_cancelled()?;
+            write_txn.commit_cancellable(&self.cancellation)?;
         }
 
+        if updated {
+            self.catalog_changed();
+        }
         Ok(updated)
     }
 
@@ -587,7 +604,8 @@ impl Library {
     }
 
     pub fn record_external_attempt(&self, key: &str, success: bool) -> Result<(), LibraryError> {
-        let write_txn = self.db.begin_write()?;
+        self.check_cancelled()?;
+        let write_txn = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         {
             let mut table = write_txn.open_table(EXTERNAL_ATTEMPTS_TABLE)?;
             let now = now_secs();
@@ -605,7 +623,8 @@ impl Library {
             let bytes = encode_value(&record)?;
             table.insert(key, bytes.as_slice())?;
         }
-        write_txn.commit()?;
+        self.check_cancelled()?;
+        write_txn.commit_cancellable(&self.cancellation)?;
         Ok(())
     }
 }

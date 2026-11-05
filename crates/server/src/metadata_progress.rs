@@ -30,6 +30,12 @@ pub struct MetadataProgress {
     pub checked: usize,
     pub total: Option<usize>,
     pub current: Option<MetadataTarget>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub interactive: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl MetadataProgress {
@@ -39,6 +45,7 @@ impl MetadataProgress {
             checked: 0,
             total: None,
             current: None,
+            interactive: false,
         }
     }
 }
@@ -71,10 +78,19 @@ pub struct MetadataWorkHandle {
 
 impl MetadataWorkHandle {
     pub fn set_phase(&self, phase: MetadataPhase) {
-        self.work
-            .active
-            .write()
-            .insert(self.id, MetadataProgress::new(phase));
+        let mut active = self.work.active.write();
+        let interactive = active
+            .get(&self.id)
+            .is_some_and(|progress| progress.interactive);
+        let mut progress = MetadataProgress::new(phase);
+        progress.interactive = interactive;
+        active.insert(self.id, progress);
+    }
+
+    pub fn set_interactive(&self, interactive: bool) {
+        if let Some(progress) = self.work.active.write().get_mut(&self.id) {
+            progress.interactive = interactive;
+        }
     }
 
     pub fn set_total(&self, total: usize) {
@@ -158,6 +174,7 @@ mod tests {
                 checked: 3,
                 total: Some(3),
                 current: None,
+                interactive: false,
             })
         );
         let other = work.start(MetadataPhase::Albums);

@@ -3,6 +3,7 @@ mod catalog;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use common::{artist_identity_key, Album, Artist, ArtistCredits};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use walkdir::WalkDir;
 
-use self::catalog::{audio_codec, build_catalog};
+use self::catalog::{build_catalog, is_audio_file};
 use crate::normalization::merge_genres;
 use crate::storage::{
     clear_table, decode_value, encode_value, prefix_key, read_stats, ALBUMS_BY_NAME_TABLE,
@@ -21,18 +22,64 @@ use crate::storage::{
     TAG_ERROR_FILES_TABLE, TRACKS_BY_NAME_TABLE, TRACKS_TABLE, TRACK_CREDITS_TABLE,
     TRACK_EMBEDDED_COVER_TABLE,
 };
-use crate::{LibraryError, LibraryRoot, LibraryStats, ScanObserver, ScanProgress};
+use crate::{
+    LibraryError, LibraryRoot, LibraryStats, ScanChanges, ScanObserver, ScanOutcome, ScanProgress,
+};
 
-const FILE_TAGS: TableDefinition<&str, &[u8]> = TableDefinition::new("file_tags_v4");
+const FILE_TAGS: TableDefinition<&str, &[u8]> = TableDefinition::new("file_tags_v5");
+
+/// Disk staging keeps a second complete catalogue out of the process heap.
+/// Declared before its database so the database closes before file cleanup.
+struct StagingDirectory(PathBuf);
+
+impl StagingDirectory {
+    fn create() -> Result<Self, LibraryError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phonolite-catalogue-stage-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.join("catalogue.redb"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
 const LOCAL_ARTISTS: TableDefinition<&str, &[u8]> = TableDefinition::new("local_artists_v1");
 pub(super) const LOCAL_ALBUMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("local_albums_v1");
 pub(super) static SCAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+// A queued scan or source-credit repair must not keep shutdown waiting for a
+// different scan to finish. The in-progress scan also checks this shared flag.
+pub(super) fn scan_lock(
+    cancellation: &AtomicBool,
+) -> Result<parking_lot::MutexGuard<'static, ()>, LibraryError> {
+    loop {
+        crate::check_cancelled(cancellation)?;
+        if let Some(guard) = SCAN_LOCK.try_lock() {
+            return Ok(guard);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 const MANIFEST: &str = "file_manifest_v1";
 const EXTERNAL_IDENTITY_POLICY_KEY: &str = "external_metadata_identity_policy";
 const EXTERNAL_IDENTITY_POLICY_VERSION: &[u8] = &[3];
 const ARTIST_CREDIT_POLICY_KEY: &str = "artist_credit_identity_policy";
 const ARTIST_CREDIT_POLICY_VERSION: &[u8] = &[3];
+const AUDIO_FORMAT_POLICY_KEY: &str = "audio_format_policy";
+const AUDIO_FORMAT_POLICY_VERSION: &[u8] = &[1];
 pub(super) const DISPLAY_CREDIT_RESOLUTIONS_DIRTY: &str = "display_credit_resolutions_dirty";
 
 impl crate::Library {
@@ -83,13 +130,29 @@ pub(super) fn needs_identity_policy_recovery(db: &Database) -> Result<bool, Libr
 }
 
 pub(super) fn needs_catalog_recovery(db: &Database) -> Result<bool, LibraryError> {
-    if needs_identity_policy_recovery(db)? || needs_credit_policy_recovery(db)? {
+    if needs_identity_policy_recovery(db)?
+        || needs_credit_policy_recovery(db)?
+        || needs_audio_format_recovery(db)?
+    {
         return Ok(true);
     }
     let read = db.begin_read()?;
     let table = read.open_table(META_TABLE)?;
     let dirty = table.get(DISPLAY_CREDIT_RESOLUTIONS_DIRTY)?.is_some();
     Ok(dirty)
+}
+
+fn needs_audio_format_recovery(db: &Database) -> Result<bool, LibraryError> {
+    let read = db.begin_read()?;
+    let table = match read.open_table(META_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(true),
+        Err(err) => return Err(err.into()),
+    };
+    let current = table
+        .get(AUDIO_FORMAT_POLICY_KEY)?
+        .is_some_and(|value| value.value() == AUDIO_FORMAT_POLICY_VERSION);
+    Ok(!current)
 }
 
 fn needs_credit_policy_recovery(db: &Database) -> Result<bool, LibraryError> {
@@ -125,13 +188,48 @@ pub(super) fn scan(
     force: bool,
     changed_paths: Option<&[PathBuf]>,
     progress: Option<ScanObserver<'_>>,
+    cancellation: &std::sync::Arc<AtomicBool>,
+    tag_reader: Option<&std::sync::Arc<crate::TagReader>>,
 ) -> Result<LibraryStats, LibraryError> {
+    scan_detailed(
+        roots,
+        db,
+        force,
+        changed_paths,
+        progress,
+        cancellation,
+        None,
+        tag_reader,
+    )
+    .map(|outcome| outcome.stats)
+}
+
+pub(super) fn scan_detailed(
+    roots: &[LibraryRoot],
+    db: &Database,
+    force: bool,
+    changed_paths: Option<&[PathBuf]>,
+    progress: Option<ScanObserver<'_>>,
+    cancellation: &std::sync::Arc<AtomicBool>,
+    before_commit: Option<&(dyn Fn() + Sync)>,
+    tag_reader: Option<&std::sync::Arc<crate::TagReader>>,
+) -> Result<ScanOutcome, LibraryError> {
     let started = Instant::now();
     if let Some(progress) = progress {
         progress(ScanProgress::Discovering);
     }
-    let _scan = SCAN_LOCK.lock();
-    scan_locked(roots, db, force, changed_paths, started, progress)
+    let _scan = scan_lock(cancellation)?;
+    scan_locked_detailed(
+        roots,
+        db,
+        force,
+        changed_paths,
+        started,
+        progress,
+        cancellation,
+        before_commit,
+        tag_reader,
+    )
 }
 
 // The caller holds SCAN_LOCK, including any preceding resolution-table write.
@@ -143,10 +241,39 @@ pub(super) fn scan_locked(
     changed_paths: Option<&[PathBuf]>,
     started: Instant,
     progress: Option<ScanObserver<'_>>,
+    cancellation: &std::sync::Arc<AtomicBool>,
+    tag_reader: Option<&std::sync::Arc<crate::TagReader>>,
 ) -> Result<LibraryStats, LibraryError> {
+    scan_locked_detailed(
+        roots,
+        db,
+        force,
+        changed_paths,
+        started,
+        progress,
+        cancellation,
+        None,
+        tag_reader,
+    )
+    .map(|outcome| outcome.stats)
+}
+
+fn scan_locked_detailed(
+    roots: &[LibraryRoot],
+    db: &Database,
+    force: bool,
+    changed_paths: Option<&[PathBuf]>,
+    started: Instant,
+    progress: Option<ScanObserver<'_>>,
+    cancellation: &std::sync::Arc<AtomicBool>,
+    before_commit: Option<&(dyn Fn() + Sync)>,
+    tag_reader: Option<&std::sync::Arc<crate::TagReader>>,
+) -> Result<ScanOutcome, LibraryError> {
+    crate::check_cancelled(cancellation)?;
     let lock_done = started.elapsed();
     let recover_external_metadata = needs_identity_policy_recovery(db)?;
     let recover_artist_credits = needs_credit_policy_recovery(db)?;
+    let recover_audio_formats = needs_audio_format_recovery(db)?;
     let read = db.begin_read()?;
     let previous = read
         .open_table(META_TABLE)
@@ -203,6 +330,7 @@ pub(super) fn scan_locked(
         roots.iter().map(|root| root.path.clone()).collect()
     };
     for path in paths {
+        crate::check_cancelled(cancellation)?;
         // Removal and directory rename events delete the old subtree from the
         // manifest; additions and modifications repopulate only that subtree.
         manifest.retain(|key, _| key.starts_with("root:") || !Path::new(key).starts_with(&path));
@@ -210,6 +338,7 @@ pub(super) fn scan_locked(
             continue;
         }
         for entry in WalkDir::new(&path).follow_links(false) {
+            crate::check_cancelled(cancellation)?;
             let entry = entry.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
             if !entry.file_type().is_file() {
                 continue;
@@ -227,6 +356,7 @@ pub(super) fn scan_locked(
         }
     }
     for key in root_keys {
+        crate::check_cancelled(cancellation)?;
         manifest.insert(
             key,
             Fingerprint {
@@ -236,9 +366,11 @@ pub(super) fn scan_locked(
         );
     }
     let inventory_done = started.elapsed();
+    crate::check_cancelled(cancellation)?;
     if !force
         && !recover_external_metadata
         && !recover_artist_credits
+        && !recover_audio_formats
         && !resolutions_dirty
         && previous.as_ref() == Some(&manifest)
     {
@@ -246,18 +378,26 @@ pub(super) fn scan_locked(
         if profile_enabled() {
             info!(target: "performance", event = "metadata_local_scan", source = "local_tags", outcome = "ok", force, targeted, unchanged = true, duration_us = started.elapsed().as_micros() as u64, lock_wait_us = lock_done.as_micros() as u64, inventory_us = (inventory_done - lock_done).as_micros() as u64, parsed_files = 0u64, "Local metadata scan reused its unchanged catalog");
         }
-        return Ok(stats);
+        return Ok(ScanOutcome {
+            stats,
+            changes: ScanChanges::default(),
+        });
     }
     let audio: Vec<_> = manifest
         .iter()
-        .filter(|(path, _)| !path.starts_with("root:") && audio_codec(Path::new(path)).is_some())
+        .filter(|(path, _)| !path.starts_with("root:") && is_audio_file(Path::new(path)))
         .map(|(path, fingerprint)| (PathBuf::from(path), fingerprint.clone()))
         .collect();
     let mut tags = HashMap::new();
     let mut pending = Vec::new();
     let cached = read.open_table(FILE_TAGS).ok();
     for (path, fingerprint) in &audio {
-        let previous = if force || recover_external_metadata || recover_artist_credits {
+        crate::check_cancelled(cancellation)?;
+        let previous = if force
+            || recover_external_metadata
+            || recover_artist_credits
+            || recover_audio_formats
+        {
             None
         } else {
             cached
@@ -289,11 +429,20 @@ pub(super) fn scan_locked(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
+                if cancellation.load(Ordering::Acquire) {
+                    break;
+                }
                 let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(path) = pending.get(index) else {
                     break;
                 };
-                let result = read_tags(path).map_err(|err| format!("{:?}", err));
+                let result = match tag_reader {
+                    Some(reader) => reader(path, cancellation),
+                    None => read_tags(path).map_err(|err| format!("{:?}", err)),
+                };
+                if cancellation.load(Ordering::Acquire) {
+                    break;
+                }
                 let mut results = results.lock().unwrap();
                 results.push((path.clone(), result));
                 if let Some(progress) = progress {
@@ -305,6 +454,7 @@ pub(super) fn scan_locked(
             });
         }
     });
+    crate::check_cancelled(cancellation)?;
     info!(
         "Indexing {} audio files: {} changed, {} reused",
         audio.len(),
@@ -313,22 +463,38 @@ pub(super) fn scan_locked(
     );
     tags.extend(results.into_inner().unwrap());
     let tags_done = started.elapsed();
+    let staging_directory = StagingDirectory::create()?;
     let staged = std::sync::Arc::new(
-        Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?,
+        Database::builder()
+            .set_cache_size(8 * 1024 * 1024)
+            .create(staging_directory.0.join("catalogue.redb"))?,
     );
     let file_sizes = audio
         .iter()
         .map(|(path, fingerprint)| (path.clone(), fingerprint.size))
         .collect();
     let resolutions = crate::credits::display_credit_resolutions(db)?;
-    build_catalog(roots, &staged, &tags, &file_sizes, &resolutions, progress)?;
+    build_catalog(
+        roots,
+        &staged,
+        &tags,
+        &file_sizes,
+        &resolutions,
+        progress,
+        cancellation,
+    )?;
+    crate::check_cancelled(cancellation)?;
     if let Some(progress) = progress {
         progress(ScanProgress::Committing);
     }
-    let local_artists = source_records::<Artist>(&staged, ARTISTS_TABLE)?;
-    let local_albums = source_records::<Album>(&staged, ALBUMS_TABLE)?;
+    let local_artists = source_records::<Artist>(&staged, ARTISTS_TABLE, cancellation)?;
+    let local_albums = source_records::<Album>(&staged, ALBUMS_TABLE, cancellation)?;
     let catalog_done = started.elapsed();
-    let write = db.begin_write()?;
+    if let Some(before_commit) = before_commit {
+        before_commit();
+    }
+    let write = crate::begin_write_cancellable(db, cancellation)?;
+    crate::check_cancelled(cancellation)?;
     let writer_done = started.elapsed();
     // Previous provider lookups lacked reliable artist/release identity
     // checks. Rebuild from local sources once rather than carrying any of
@@ -342,6 +508,7 @@ pub(super) fn scan_locked(
             &local_albums,
             !recover_artist_credits,
             &resolutions,
+            cancellation,
         )?
     } else {
         InvalidatedSources::default()
@@ -351,52 +518,85 @@ pub(super) fn scan_locked(
     {
         let catalogs = crate::backup::retained(&db.begin_read()?)?;
         if !catalogs.is_empty() {
-            let restore = staged.begin_write()?;
-            replace_source_records(&restore, LOCAL_ALBUMS, &local_albums)?;
+            let restore = crate::begin_write_cancellable(&staged, cancellation)?;
+            replace_source_records(&restore, LOCAL_ALBUMS, &local_albums, cancellation)?;
             crate::backup::apply(&restore, &catalogs)?;
-            restore.commit()?;
+            restore.commit_cancellable(cancellation)?;
         }
     }
     let stats = read_stats(&staged)?;
-    crate::enrichment::album_metadata_stats(&staged)?;
+    crate::enrichment::album_metadata_stats(&staged, cancellation)?;
     let staging_read = staged.begin_read()?;
     let enrichment_done = started.elapsed();
-    for definition in [
-        META_TABLE,
-        ARTISTS_TABLE,
-        ARTISTS_BY_NAME_TABLE,
-        ALBUMS_TABLE,
-        ALBUMS_BY_NAME_TABLE,
-        ARTIST_ALBUMS_TABLE,
-        TRACKS_TABLE,
-        TRACKS_BY_NAME_TABLE,
-        ALBUM_TRACKS_TABLE,
-        TRACK_EMBEDDED_COVER_TABLE,
-        SEEK_TABLE,
-        TAG_ERRORS_TABLE,
-        TAG_ERROR_FILES_TABLE,
-        ALBUM_CREDITS_TABLE,
-        TRACK_CREDITS_TABLE,
+    let mut changes = ScanChanges {
+        changed: true,
+        ..ScanChanges::default()
+    };
+    for (definition, kind) in [
+        (META_TABLE, ChangeKind::Other),
+        (ARTISTS_TABLE, ChangeKind::Artist),
+        (ARTISTS_BY_NAME_TABLE, ChangeKind::Other),
+        (ALBUMS_TABLE, ChangeKind::Album),
+        (ALBUMS_BY_NAME_TABLE, ChangeKind::Other),
+        (ARTIST_ALBUMS_TABLE, ChangeKind::Other),
+        (TRACKS_TABLE, ChangeKind::Track),
+        (TRACKS_BY_NAME_TABLE, ChangeKind::Other),
+        (ALBUM_TRACKS_TABLE, ChangeKind::Other),
+        (TRACK_EMBEDDED_COVER_TABLE, ChangeKind::Other),
+        (SEEK_TABLE, ChangeKind::Other),
+        (TAG_ERRORS_TABLE, ChangeKind::Other),
+        (TAG_ERROR_FILES_TABLE, ChangeKind::Other),
+        (ALBUM_CREDITS_TABLE, ChangeKind::Album),
+        (TRACK_CREDITS_TABLE, ChangeKind::TrackCredit),
     ] {
+        crate::check_cancelled(cancellation)?;
         let source = staging_read.open_table(definition)?;
         let mut target = write.open_table(definition)?;
         let mut obsolete = Vec::new();
         for entry in target.iter()? {
-            let (key, _) = entry?;
+            crate::check_cancelled(cancellation)?;
+            let (key, value) = entry?;
             if key.value() != MANIFEST && source.get(key.value())?.is_none() {
+                record_scan_change(
+                    &mut changes,
+                    kind,
+                    key.value(),
+                    if matches!(kind, ChangeKind::Track) {
+                        Some(value.value().to_vec())
+                    } else {
+                        None
+                    },
+                    None,
+                    &staging_read,
+                )?;
                 obsolete.push(key.value().to_owned());
             }
         }
         for key in obsolete {
+            crate::check_cancelled(cancellation)?;
             target.remove(key.as_str())?;
         }
         for entry in source.iter()? {
+            crate::check_cancelled(cancellation)?;
             let (key, value) = entry?;
             let changed = target
                 .get(key.value())?
                 .map(|old| old.value() != value.value())
                 .unwrap_or(true);
             if changed {
+                let previous = if matches!(kind, ChangeKind::Track) {
+                    target.get(key.value())?.map(|old| old.value().to_vec())
+                } else {
+                    None
+                };
+                record_scan_change(
+                    &mut changes,
+                    kind,
+                    key.value(),
+                    previous,
+                    Some(value.value()),
+                    &staging_read,
+                )?;
                 target.insert(key.value(), value.value())?;
             }
         }
@@ -406,6 +606,7 @@ pub(super) fn scan_locked(
     if let Ok(source) = staging_read.open_table(crate::storage::ALBUM_SOURCE_IDENTITY_TABLE) {
         let mut target = write.open_table(crate::storage::ALBUM_SOURCE_IDENTITY_TABLE)?;
         for entry in source.iter()? {
+            crate::check_cancelled(cancellation)?;
             let (key, value) = entry?;
             if target.get(key.value())?.is_none() {
                 target.insert(key.value(), value.value())?;
@@ -414,31 +615,39 @@ pub(super) fn scan_locked(
     }
     if force || recover_external_metadata {
         clear_table(&write, EXTERNAL_ATTEMPTS_TABLE)?;
+        clear_table(&write, crate::metadata_retry::METADATA_RETRIES)?;
     } else {
-        prune_external_attempts(&write, &staging_read, &invalidated)?;
+        prune_external_attempts(&write, &staging_read, &invalidated, cancellation)?;
+        crate::metadata_retry::prune_retries(&write, &staging_read)?;
     }
     if recover_external_metadata || recover_artist_credits {
         write.delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v1"))?;
         write.delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v2"))?;
         write.delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v3"))?;
     }
-    replace_source_records(&write, LOCAL_ARTISTS, &local_artists)?;
-    replace_source_records(&write, LOCAL_ALBUMS, &local_albums)?;
+    if recover_audio_formats {
+        write.delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v4"))?;
+    }
+    replace_source_records(&write, LOCAL_ARTISTS, &local_artists, cancellation)?;
+    replace_source_records(&write, LOCAL_ALBUMS, &local_albums, cancellation)?;
     {
         let mut cache = write.open_table(FILE_TAGS)?;
         let mut obsolete = Vec::new();
         for entry in cache.iter()? {
+            crate::check_cancelled(cancellation)?;
             let (key, _) = entry?;
             if !manifest.contains_key(key.value()) {
                 obsolete.push(key.value().to_owned());
             }
         }
         for key in obsolete {
+            crate::check_cancelled(cancellation)?;
             cache.remove(key.as_str())?;
         }
         // Unchanged tags already have the same cached fingerprint and value.
         // Avoid cloning and serializing every track when just one file changed.
         for path in &pending {
+            crate::check_cancelled(cancellation)?;
             let fingerprint = manifest.get(path.to_string_lossy().as_ref()).unwrap();
             if let Some(Ok(tag)) = tags.get(path) {
                 let value = encode_value(&CachedTags {
@@ -463,12 +672,94 @@ pub(super) fn scan_locked(
             EXTERNAL_IDENTITY_POLICY_VERSION,
         )?;
         meta.insert(ARTIST_CREDIT_POLICY_KEY, ARTIST_CREDIT_POLICY_VERSION)?;
+        meta.insert(AUDIO_FORMAT_POLICY_KEY, AUDIO_FORMAT_POLICY_VERSION)?;
     }
-    write.commit()?;
+    crate::check_cancelled(cancellation)?;
+    write.commit_cancellable(cancellation)?;
     if profile_enabled() {
         info!(target: "performance", event = "metadata_local_scan", source = "local_tags", outcome = "ok", force, targeted, unchanged = false, duration_us = started.elapsed().as_micros() as u64, lock_wait_us = lock_done.as_micros() as u64, inventory_us = (inventory_done - lock_done).as_micros() as u64, tags_us = (tags_done - inventory_done).as_micros() as u64, catalog_us = (catalog_done - tags_done).as_micros() as u64, writer_wait_us = (writer_done - catalog_done).as_micros() as u64, enrichment_reuse_us = (enrichment_done - writer_done).as_micros() as u64, commit_us = (started.elapsed() - enrichment_done).as_micros() as u64, audio_files = audio.len(), parsed_files = pending.len(), reused_files, "Local metadata scan completed");
     }
-    Ok(stats)
+    {
+        let read = db.begin_read()?;
+        let albums = read.open_table(ALBUMS_TABLE)?;
+        for id in &changes.albums {
+            if let Some(value) = albums.get(id.as_str())? {
+                let album: Album = decode_value(value.value())?;
+                changes
+                    .artists
+                    .extend(album.all_artist_ids().iter().cloned());
+            }
+        }
+    }
+    changes
+        .artists
+        .retain(|id| !changes.removed_artists.contains(id));
+    changes
+        .albums
+        .retain(|id| !changes.removed_albums.contains(id));
+    Ok(ScanOutcome { stats, changes })
+}
+
+#[derive(Clone, Copy)]
+enum ChangeKind {
+    Artist,
+    Album,
+    Track,
+    TrackCredit,
+    Other,
+}
+
+fn record_scan_change(
+    changes: &mut ScanChanges,
+    kind: ChangeKind,
+    id: &str,
+    previous: Option<Vec<u8>>,
+    current: Option<&[u8]>,
+    staged: &redb::ReadTransaction,
+) -> Result<(), LibraryError> {
+    match kind {
+        ChangeKind::Artist => {
+            if current.is_some() {
+                changes.artists.insert(id.into());
+            } else {
+                changes.removed_artists.insert(id.into());
+            }
+        }
+        ChangeKind::Album => {
+            // Credit/tag-error rows can disappear while the album survives.
+            if staged.open_table(ALBUMS_TABLE)?.get(id)?.is_some() {
+                changes.albums.insert(id.into());
+            } else {
+                changes.removed_albums.insert(id.into());
+            }
+        }
+        ChangeKind::Track => {
+            for bytes in previous.as_deref().into_iter().chain(current) {
+                let track: common::Track = decode_value(bytes)?;
+                changes.albums.insert(track.album_id);
+                changes.artists.insert(track.artist_id);
+            }
+        }
+        ChangeKind::TrackCredit => {
+            if let Some(bytes) = current {
+                let credits: ArtistCredits = decode_value(bytes)?;
+                changes.artists.extend(
+                    credits
+                        .credits
+                        .into_iter()
+                        .filter(|credit| credit.is_billed_artist())
+                        .map(|credit| credit.artist_id),
+                );
+            }
+            if let Some(value) = staged.open_table(TRACKS_TABLE)?.get(id)? {
+                let track: common::Track = decode_value(value.value())?;
+                changes.albums.insert(track.album_id);
+                changes.artists.insert(track.artist_id);
+            }
+        }
+        ChangeKind::Other => {}
+    }
+    Ok(())
 }
 
 fn profile_enabled() -> bool {
@@ -494,12 +785,14 @@ struct InvalidatedSources {
 fn source_records<T: for<'de> Deserialize<'de>>(
     db: &Database,
     definition: TableDefinition<&str, &[u8]>,
+    cancellation: &AtomicBool,
 ) -> Result<Vec<SourceRecord<T>>, LibraryError> {
     let read = db.begin_read()?;
     let table = read.open_table(definition)?;
     let records = table
         .iter()?
         .map(|entry| {
+            crate::check_cancelled(cancellation)?;
             let (key, value) = entry?;
             let bytes = value.value().to_vec();
             Ok((key.value().to_string(), decode_value(&bytes)?, bytes))
@@ -519,16 +812,29 @@ fn preserve_enrichment(
     local_albums: &[SourceRecord<Album>],
     preserve_album_artists: bool,
     resolutions: &HashMap<String, ArtistCredits>,
+    cancellation: &std::sync::Arc<AtomicBool>,
 ) -> Result<InvalidatedSources, LibraryError> {
     let mut invalidated = InvalidatedSources::default();
     let library = crate::Library {
+        cancellation: std::sync::Arc::clone(cancellation),
+        tag_reader: None,
+        cancel_reads: false,
         roots: roots.to_vec(),
         db: std::sync::Arc::clone(staged),
+        cache_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
+        metadata_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::next_catalog_generation(),
+        )),
+        browse_projection: std::sync::Arc::new(Default::default()),
+        search_state: std::sync::Arc::new(Default::default()),
     };
     let artists = live.open_table(ARTISTS_TABLE)?;
     let artist_sources = live.open_table(LOCAL_ARTISTS)?;
     let mut artist_names = HashMap::new();
     for (id, incoming, _) in local_artists {
+        crate::check_cancelled(cancellation)?;
         let Some(value) = artists.get(id.as_str())? else {
             continue;
         };
@@ -590,6 +896,7 @@ fn preserve_enrichment(
     let previous_credits = live.open_table(ALBUM_CREDITS_TABLE)?;
     let current_credits = stage_read.open_table(ALBUM_CREDITS_TABLE)?;
     for (id, incoming, _) in local_albums {
+        crate::check_cancelled(cancellation)?;
         let Some(value) = albums.get(id.as_str())? else {
             continue;
         };
@@ -765,6 +1072,7 @@ fn replace_source_records<T>(
     live: &redb::WriteTransaction,
     definition: TableDefinition<&str, &[u8]>,
     records: &[SourceRecord<T>],
+    cancellation: &AtomicBool,
 ) -> Result<(), LibraryError> {
     let mut table = live.open_table(definition)?;
     let current = records
@@ -780,9 +1088,11 @@ fn replace_source_records<T>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     for id in obsolete {
+        crate::check_cancelled(cancellation)?;
         table.remove(id.as_str())?;
     }
     for (id, _, bytes) in records {
+        crate::check_cancelled(cancellation)?;
         let changed = table
             .get(id.as_str())?
             .map_or(true, |old| old.value() != bytes.as_slice());
@@ -797,12 +1107,14 @@ fn prune_external_attempts(
     live: &redb::WriteTransaction,
     staged: &redb::ReadTransaction,
     invalidated: &InvalidatedSources,
+    cancellation: &AtomicBool,
 ) -> Result<(), LibraryError> {
     let artists = staged.open_table(ARTISTS_TABLE)?;
     let albums = staged.open_table(ALBUMS_TABLE)?;
     let mut attempts = live.open_table(EXTERNAL_ATTEMPTS_TABLE)?;
     let mut obsolete = Vec::new();
     for entry in attempts.iter()? {
+        crate::check_cancelled(cancellation)?;
         let (key, _) = entry?;
         let retain = match key.value().split_once(':') {
             Some(("artist", id)) => artists.get(id)?.is_some() && !invalidated.artists.contains(id),
@@ -818,6 +1130,7 @@ fn prune_external_attempts(
         }
     }
     for key in obsolete {
+        crate::check_cancelled(cancellation)?;
         attempts.remove(key.as_str())?;
     }
     Ok(())

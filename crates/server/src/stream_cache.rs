@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,11 +10,16 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::transcode::{TranscodeMode, TranscodeQuality};
 
+#[path = "transcode/presentation_policy.rs"]
+mod presentation_policy;
+pub(crate) use presentation_policy::PRESENTATION_POLICY_VERSION;
+
 const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_CACHE_ENTRIES: usize = 64;
+const MAX_CACHE_ENTRIES: usize = 8;
 pub const MEMORY_CACHE_MAX_BYTES: usize = MAX_CACHE_BYTES * MAX_CACHE_ENTRIES;
 pub const CACHE_RANGE_MS: u32 = 5_000;
 const SEEK_PREROLL_MS: u32 = 80;
+const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -23,6 +29,7 @@ pub struct CacheKey {
     pub quality: TranscodeQuality,
     pub range_start_ms: u32,
     source: String,
+    policy: &'static str,
 }
 
 impl CacheKey {
@@ -34,6 +41,7 @@ impl CacheKey {
     ) -> Self {
         Self {
             source: String::new(),
+            policy: PRESENTATION_POLICY_VERSION,
             track_id: track_id.into(),
             frame_ms,
             mode,
@@ -56,7 +64,11 @@ impl CacheKey {
         self
     }
     pub fn source_version(&self) -> String {
-        blake3::hash(self.source.as_bytes()).to_hex().to_string()
+        let mut hash = blake3::Hasher::new();
+        hash.update(self.policy.as_bytes());
+        hash.update(b"\0");
+        hash.update(self.source.as_bytes());
+        hash.finalize().to_hex().to_string()
     }
 }
 
@@ -65,6 +77,7 @@ pub struct StreamCache {
     enabled: bool,
     entries: Arc<Mutex<CacheEntries>>,
     budget: Arc<tokio::sync::Semaphore>,
+    shutdown: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct CacheEntries {
@@ -76,13 +89,46 @@ impl StreamCache {
         Self {
             enabled,
             entries: Arc::new(Mutex::new(CacheEntries::default())),
-            budget: Arc::new(tokio::sync::Semaphore::new(MAX_CACHE_ENTRIES)),
+            budget: Arc::new(tokio::sync::Semaphore::new(
+                MEMORY_CACHE_MAX_BYTES / MAX_CACHE_BYTES,
+            )),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+    /// Configure before sharing the cache or creating any pinned ranges.
+    /// Reserving full range capacity bounds retained and transient payloads.
+    pub fn with_memory_budget(mut self, bytes: usize) -> Self {
+        assert_eq!(
+            Arc::strong_count(&self.entries),
+            1,
+            "configure stream cache before sharing"
+        );
+        assert!(
+            self.entries.lock().items.is_empty(),
+            "configure stream cache before use"
+        );
+        assert_eq!(
+            Arc::strong_count(&self.budget),
+            1,
+            "stream ranges already reserve memory"
+        );
+        let ranges = (bytes / MAX_CACHE_BYTES).clamp(1, 1024);
+        self.budget = Arc::new(tokio::sync::Semaphore::new(ranges));
+        self
+    }
+    /// Configure the process-wide stop flag before creating playback ranges.
+    pub fn with_shutdown_flag(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+    fn check_cancelled(&self) -> io::Result<()> {
+        check_cancelled(&self.shutdown)
     }
     pub fn enabled(&self) -> bool {
         self.enabled
     }
     pub fn transient(&self, key: &CacheKey) -> io::Result<(CacheWriter, CacheReader)> {
+        self.check_cancelled()?;
         let permit = self
             .reserve(&mut self.entries.lock())
             .ok_or_else(|| io::Error::other("stream cache capacity exhausted; retry playback"))?;
@@ -91,6 +137,7 @@ impl StreamCache {
             key.range_start_ms,
             MAX_CACHE_BYTES,
             Some(permit),
+            Arc::clone(&self.shutdown),
         ));
         Ok((
             CacheWriter {
@@ -103,6 +150,7 @@ impl StreamCache {
         ))
     }
     pub fn reader(&self, key: &CacheKey) -> io::Result<Option<CacheReader>> {
+        self.check_cancelled()?;
         if !self.enabled {
             return Ok(None);
         }
@@ -117,6 +165,7 @@ impl StreamCache {
     /// One independent producer per source/rendition/range. Partial frames survive
     /// cancellation and can be retried; readers never turn producer failure into EOS.
     pub fn writer(&self, key: CacheKey) -> io::Result<Option<CacheWriter>> {
+        self.check_cancelled()?;
         if !self.enabled {
             return Ok(None);
         }
@@ -144,6 +193,7 @@ impl StreamCache {
             key.range_start_ms,
             MAX_CACHE_BYTES,
             Some(permit),
+            Arc::clone(&self.shutdown),
         ));
         entries.items.insert(key.clone(), Arc::clone(&cache));
         entries.order.push_back(key);
@@ -182,6 +232,7 @@ struct MemoryCache {
     max_bytes: usize,
     state: Mutex<CacheState>,
     ready: Condvar,
+    shutdown: Arc<AtomicBool>,
 }
 struct CacheState {
     header: Option<Bytes>,
@@ -197,6 +248,7 @@ impl MemoryCache {
         range_start_ms: u32,
         max_bytes: usize,
         reservation: Option<tokio::sync::OwnedSemaphorePermit>,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             _reservation: reservation,
@@ -212,6 +264,7 @@ impl MemoryCache {
                 failure: None,
             }),
             ready: Condvar::new(),
+            shutdown,
         }
     }
 }
@@ -224,12 +277,49 @@ pub struct CacheReader {
     cache: Arc<MemoryCache>,
 }
 impl CacheReader {
+    fn check_cancelled(&self) -> Result<(), String> {
+        check_cancelled(&self.cache.shutdown).map_err(|error| error.to_string())
+    }
+
+    // blocking_send cannot observe shutdown while a paused receiver keeps a
+    // full channel alive. Poll capacity with the same bound as cache gaps.
+    fn send_item(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+        mut item: Result<Bytes, io::Error>,
+    ) -> Result<(), String> {
+        loop {
+            self.check_cancelled()?;
+            match tx.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("stream closed".into());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    item = returned;
+                    std::thread::sleep(CANCELLATION_POLL);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn send_error(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+        error: String,
+    ) -> Result<(), String> {
+        self.send_item(tx, Err(io::Error::other(error)))
+    }
+
     pub fn guard(&self) -> CacheGuard {
         CacheGuard {
             _cache: Arc::clone(&self.cache),
         }
     }
     pub fn can_start(&self, start_ms: u32) -> bool {
+        if self.check_cancelled().is_err() {
+            return false;
+        }
         let state = self.cache.state.lock();
         state.header.is_some()
             && (start_ms.saturating_sub(self.cache.range_start_ms) / self.cache.frame_ms)
@@ -243,6 +333,7 @@ impl CacheReader {
         let header = {
             let mut state = self.cache.state.lock();
             loop {
+                self.check_cancelled()?;
                 if tx.is_closed() {
                     return Err("stream closed".into());
                 }
@@ -255,9 +346,7 @@ impl CacheReader {
                 if !state.producing {
                     return Err("cache range has no header".into());
                 }
-                self.cache
-                    .ready
-                    .wait_for(&mut state, Duration::from_millis(25));
+                self.cache.ready.wait_for(&mut state, CANCELLATION_POLL);
             }
         };
         let (header, mut index) = replay_header(
@@ -265,11 +354,12 @@ impl CacheReader {
             start_ms.saturating_sub(self.cache.range_start_ms),
             self.cache.frame_ms,
         )?;
-        tx.blocking_send(Ok(header)).map_err(|_| "stream closed")?;
+        self.send_item(tx, Ok(header))?;
         loop {
             let frame = {
                 let mut state = self.cache.state.lock();
                 loop {
+                    self.check_cancelled()?;
                     if tx.is_closed() {
                         return Err("stream closed".into());
                     }
@@ -286,16 +376,13 @@ impl CacheReader {
                     if !state.producing {
                         return Err("cache range ended without completion".into());
                     }
-                    self.cache
-                        .ready
-                        .wait_for(&mut state, Duration::from_millis(25));
+                    self.cache.ready.wait_for(&mut state, CANCELLATION_POLL);
                 }
             };
             match frame {
-                Some(frame) => tx.blocking_send(Ok(frame)).map_err(|_| "stream closed")?,
+                Some(frame) => self.send_item(tx, Ok(frame))?,
                 None => {
-                    tx.blocking_send(Ok(Bytes::from_static(&[0, 0])))
-                        .map_err(|_| "stream closed")?;
+                    self.send_item(tx, Ok(Bytes::from_static(&[0, 0])))?;
                     return Ok(());
                 }
             }
@@ -321,6 +408,31 @@ fn replay_header(header: &Bytes, offset_ms: u32, frame_ms: u32) -> Result<(Bytes
     let skip = u16::try_from(skip).map_err(|_| "cached seek preroll too large")?;
     let mut replay = header.to_vec();
     replay[26..28].copy_from_slice(&skip.to_le_bytes());
+    if header[9] & 1 != 0 {
+        if header.len() < 48 {
+            return Err("invalid exact-frame range header".into());
+        }
+        let extension = 40
+            + (0..6)
+                .map(|i| {
+                    u16::from_le_bytes(header[28 + i * 2..30 + i * 2].try_into().unwrap()) as usize
+                })
+                .sum::<usize>();
+        if extension.checked_add(8) != Some(header.len()) {
+            return Err("invalid exact-frame range extension".into());
+        }
+        let frames = u64::from_le_bytes(header[extension..extension + 8].try_into().unwrap());
+        let offset_frames = rate * u64::from(offset_ms) / 1000;
+        let remaining = frames.saturating_sub(offset_frames);
+        replay[extension..extension + 8].copy_from_slice(&remaining.to_le_bytes());
+        if remaining == 0 {
+            // Legacy indexed MP3 duration may include known encoder padding.
+            // An interior request in that discarded tail returns an empty
+            // source: no packets and no remaining decoder pre-skip.
+            replay[26..28].copy_from_slice(&0u16.to_le_bytes());
+            return Ok((Bytes::from(replay), usize::MAX));
+        }
+    }
     Ok((Bytes::from(replay), index as usize))
 }
 
@@ -331,10 +443,16 @@ pub struct CacheWriter {
     finalized: bool,
 }
 impl CacheWriter {
+    pub fn check_cancelled(&self) -> io::Result<()> {
+        check_cancelled(&self.cache.shutdown)
+    }
+
     pub fn has_readers(&self) -> bool {
-        Arc::strong_count(&self.cache) > if self.retained { 2 } else { 1 }
+        self.check_cancelled().is_ok()
+            && Arc::strong_count(&self.cache) > if self.retained { 2 } else { 1 }
     }
     pub fn write_header(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.check_cancelled()?;
         let mut state = self.cache.state.lock();
         if state.header.is_some() {
             return Ok(());
@@ -348,6 +466,7 @@ impl CacheWriter {
         Ok(())
     }
     pub fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.check_cancelled()?;
         let mut state = self.cache.state.lock();
         if !state.producing {
             return Err(io::Error::other("cache producer closed"));
@@ -377,11 +496,23 @@ impl CacheWriter {
         self.cache.ready.notify_all();
     }
     pub fn finalize(mut self) -> io::Result<()> {
+        self.check_cancelled()?;
         let mut state = self.cache.state.lock();
         state.complete = true;
         state.producing = false;
         self.finalized = true;
         self.cache.ready.notify_all();
+        Ok(())
+    }
+}
+
+fn check_cancelled(shutdown: &AtomicBool) -> io::Result<()> {
+    if shutdown.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "server shutting down",
+        ))
+    } else {
         Ok(())
     }
 }
@@ -396,8 +527,35 @@ impl Drop for CacheWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_budget_counts_retained_and_unshared_pinned_ranges() {
+        let cache = StreamCache::new(PathBuf::new(), true).with_memory_budget(MAX_CACHE_BYTES);
+        let key = CacheKey::new("pinned", 20, TranscodeMode::Fixed, TranscodeQuality::High);
+        let (writer, reader) = cache.transient(&key).unwrap();
+        assert!(cache.transient(&key).is_err());
+        drop(writer);
+        assert!(
+            cache.transient(&key).is_err(),
+            "an active reader still owns its range capacity"
+        );
+        drop(reader);
+        assert!(cache.transient(&key).is_ok());
+    }
     fn key(id: &str) -> CacheKey {
         CacheKey::new(id, 20, TranscodeMode::Fixed, TranscodeQuality::High)
+    }
+    #[test]
+    fn presentation_policy_versions_do_not_reuse_ranges_or_client_source_fingerprints() {
+        let current = key("same-source");
+        let mut legacy = current.clone();
+        legacy.policy = "presentation-v1";
+        assert_ne!(current, legacy);
+        assert_ne!(current.source_version(), legacy.source_version());
+        assert_eq!(
+            current.source_version(),
+            current.with_range(5000).source_version()
+        );
     }
     #[test]
     fn disabled_cache_never_creates_entries() {
@@ -475,13 +633,38 @@ mod tests {
         assert_eq!(index as u64 * 960 + skip, 48000 * 1005 / 1000 + 312);
     }
     #[test]
+    fn cached_exact_frames_trim_interior_seeks_and_clamp_discarded_tails() {
+        let mut header = vec![0; 48];
+        header[..8].copy_from_slice(b"OPUSR01\0");
+        header[9] = 1;
+        header[10..12].copy_from_slice(&48u16.to_le_bytes());
+        header[12..16].copy_from_slice(&48000u32.to_le_bytes());
+        header[26..28].copy_from_slice(&4152u16.to_le_bytes());
+        header[40..48].copy_from_slice(&19207u64.to_le_bytes());
+        let (replay, index) = replay_header(&Bytes::from(header.clone()), 105, 20).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(replay[40..48].try_into().unwrap()),
+            14167
+        );
+        assert_eq!(
+            index as u64 * 960 + u64::from(u16::from_le_bytes(replay[26..28].try_into().unwrap())),
+            5040 + 4152
+        );
+        let (empty, index) = replay_header(&Bytes::from(header.clone()), 401, 20).unwrap();
+        assert_eq!(index, usize::MAX);
+        assert_eq!(u64::from_le_bytes(empty[40..48].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(empty[26..28].try_into().unwrap()), 0);
+        header.pop();
+        assert!(replay_header(&Bytes::from(header), 0, 20).is_err());
+    }
+    #[test]
     fn cache_budget_is_bounded_and_live_ranges_are_not_evicted() {
         let cache = StreamCache::new(PathBuf::new(), true);
         let writers: Vec<_> = (0..MAX_CACHE_ENTRIES)
             .map(|n| cache.writer(key(&n.to_string())).unwrap().unwrap())
             .collect();
         assert!(cache.writer(key("overflow")).unwrap().is_none());
-        assert_eq!(MEMORY_CACHE_MAX_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MEMORY_CACHE_MAX_BYTES, 32 * 1024 * 1024);
         drop(writers);
         assert!(cache.writer(key("overflow")).unwrap().is_some());
     }
@@ -542,7 +725,13 @@ mod tests {
     }
     #[test]
     fn cache_writer_enforces_range_memory_limit() {
-        let cache = Arc::new(MemoryCache::new(20, 0, 4, None));
+        let cache = Arc::new(MemoryCache::new(
+            20,
+            0,
+            4,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
         let mut writer = CacheWriter {
             cache,
             retained: true,
@@ -569,5 +758,127 @@ mod tests {
         assert!(writer.has_readers());
         drop(reader);
         assert!(!writer.has_readers());
+    }
+
+    #[test]
+    fn shutdown_wakes_a_reader_waiting_for_a_header_without_dropping_the_consumer() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cache =
+            StreamCache::new(PathBuf::new(), true).with_shutdown_flag(Arc::clone(&shutdown));
+        let _writer = cache.writer(key("header-gap")).unwrap().unwrap();
+        let reader = cache.reader(&key("header-gap")).unwrap().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || done_tx.send(reader.stream_to(0, &tx)).unwrap());
+        let pending = done_rx.recv_timeout(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Release);
+        assert!(matches!(
+            pending,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "server shutting down"
+        );
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_wakes_a_reader_waiting_for_the_next_frame() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cache =
+            StreamCache::new(PathBuf::new(), true).with_shutdown_flag(Arc::clone(&shutdown));
+        let mut writer = cache.writer(key("frame-gap")).unwrap().unwrap();
+        writer.write_header(&[1]).unwrap();
+        let reader = cache.reader(&key("frame-gap")).unwrap().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || done_tx.send(reader.stream_to(0, &tx)).unwrap());
+        assert_eq!(
+            rx.blocking_recv().unwrap().unwrap(),
+            Bytes::from_static(&[1])
+        );
+        shutdown.store(true, Ordering::Release);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "server shutting down"
+        );
+        task.join().unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_releases_full_output_channel_and_terminal_error_delivery() {
+        for send_error in [false, true] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let cache =
+                StreamCache::new(PathBuf::new(), true).with_shutdown_flag(Arc::clone(&shutdown));
+            let mut writer = cache.writer(key("paused")).unwrap().unwrap();
+            writer.write_header(&[1]).unwrap();
+            writer.finalize().unwrap();
+            let reader = cache.reader(&key("paused")).unwrap().unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(Bytes::from_static(&[9]))).unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let task = std::thread::spawn(move || {
+                let result = if send_error {
+                    reader.send_error(&tx, "source failed".into())
+                } else {
+                    reader.stream_to(0, &tx)
+                };
+                done_tx.send(result).unwrap();
+            });
+            let pending = done_rx.recv_timeout(Duration::from_millis(50));
+            shutdown.store(true, Ordering::Release);
+            assert!(matches!(
+                pending,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err(),
+                "server shutting down"
+            );
+            task.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_stops_existing_writers_and_rejects_new_ranges() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cache =
+            StreamCache::new(PathBuf::new(), true).with_shutdown_flag(Arc::clone(&shutdown));
+        let mut writer = cache.writer(key("active")).unwrap().unwrap();
+        let _reader = cache.reader(&key("active")).unwrap().unwrap();
+        writer.write_header(&[1]).unwrap();
+        shutdown.store(true, Ordering::Release);
+        assert!(!writer.has_readers());
+        assert_eq!(
+            writer.write_header(&[2]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            writer.write_frame(&[3]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            writer.finalize().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(cache.writer(key("new")).is_err());
+        assert!(cache.reader(&key("active")).is_err());
+        assert!(cache.transient(&key("temporary")).is_err());
+        let entries = cache.entries.lock();
+        let state = entries.items[&key("active")].state.lock();
+        assert!(!state.complete);
+        assert!(!state.producing);
     }
 }

@@ -215,7 +215,7 @@ pub fn artist_tracks(library: &Library, artist_id: &str) -> Result<Vec<Track>, L
     Ok(tracks)
 }
 
-fn normalize_genres(genres: &[String]) -> Vec<String> {
+pub(crate) fn normalize_genres(genres: &[String]) -> Vec<String> {
     genres
         .iter()
         .map(|genre| genre.trim().to_ascii_lowercase())
@@ -234,7 +234,7 @@ fn matches_genres_normalized(genres: &[String], filter: &HashSet<String>) -> boo
     genres.iter().any(|genre| filter.contains(genre))
 }
 
-fn credited_artist_ids(
+pub(crate) fn credited_artist_ids(
     library: &Library,
     track: &Track,
     album_cache: &mut HashMap<String, Vec<String>>,
@@ -272,7 +272,7 @@ fn credited_artist_ids(
     Ok(ids)
 }
 
-fn cached_album_genres(
+pub(crate) fn cached_album_genres(
     library: &Library,
     album_id: &str,
     cache: &mut HashMap<String, Vec<String>>,
@@ -288,7 +288,7 @@ fn cached_album_genres(
     Ok(genres)
 }
 
-fn cached_artist_genres(
+pub(crate) fn cached_artist_genres(
     library: &Library,
     artist_id: &str,
     cache: &mut HashMap<String, Vec<String>>,

@@ -51,13 +51,22 @@ pub(super) const META_STATS_KEY: &str = "stats";
 pub(super) const META_ALBUM_METADATA_KEY: &str = "album_metadata_stats_v1";
 
 pub(super) fn open_or_create_db(path: &Path) -> Result<Database, LibraryError> {
+    open_or_create_db_with_cache(path, 48 * 1024 * 1024)
+}
+
+pub(super) fn open_or_create_db_with_cache(
+    path: &Path,
+    cache_bytes: usize,
+) -> Result<Database, LibraryError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     if path.exists() {
-        Ok(Database::open(path)?)
+        Ok(Database::builder().set_cache_size(cache_bytes).open(path)?)
     } else {
-        Ok(Database::create(path)?)
+        Ok(Database::builder()
+            .set_cache_size(cache_bytes)
+            .create(path)?)
     }
 }
 

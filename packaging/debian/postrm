@@ -1,0 +1,36 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge|disappear)
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge phonolite-server.service >/dev/null || true
+            deb-systemd-helper unmask phonolite-server.service >/dev/null || true
+        fi
+        ;;
+esac
+
+if [ "$1" = purge ] && { [ -e /var/lib/phonolite ] || [ -L /var/lib/phonolite ]; }; then
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && \
+        systemctl --system is-active --quiet phonolite-server.service; then
+        printf '%s\n' 'Stop Phonolite before purging its data: sudo systemctl stop phonolite-server' >&2
+        exit 1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        # Embedded when packaging: postrm must still work after program files
+        # have been removed. Isolated Python ignores user-controlled imports.
+        python3 -I - /var/lib/phonolite <<'PHONOLITE_PURGE_PY'
+@PHONOLITE_PURGE_DATA@
+PHONOLITE_PURGE_PY
+    else
+        printf '%s\n' 'Phonolite data retained: Python 3 is unavailable for safe music-folder checks.' >&2
+    fi
+fi
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+# Retain the service account: music or custom data outside the package state
+# directory can still be owned by this UID. Never make that ownership reusable.
+exit 0

@@ -36,6 +36,7 @@ pub async fn admin_browse_folders(
     headers: HeaderMap,
     Query(query): Query<FolderQuery>,
 ) -> Response {
+    let jobs = state.shutdown.clone();
     let user = match admin_user_from_headers(&state, &headers) {
         Ok(Some(user)) => user,
         Ok(None) => return json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -52,7 +53,10 @@ pub async fn admin_browse_folders(
 
     // Only inspect one directory at a time, away from the async runtime threads.
     let config_path = state.config_path.clone();
-    match tokio::task::spawn_blocking(move || browse_folders(&config_path, query.path.as_deref()))
+    match jobs
+        .spawn_blocking_named("admin_settings_folders.rs", move || {
+            browse_folders(&config_path, query.path.as_deref())
+        })
         .await
     {
         Ok(Ok(listing)) => Json(listing).into_response(),

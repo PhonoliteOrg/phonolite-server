@@ -6,9 +6,8 @@ use super::console::wants_console_view;
 use super::{admin_user_from_headers, is_admin, library_for_admin, library_or_response};
 use crate::admin::presentation::{html_error, url_escape};
 use crate::assets::{
-    clear_metadata_assets, cover_response, fetch_cover, fetch_cover_cached, metadata_root_path,
-    resolve_artist_banner_source, resolve_artist_cover_source, resolve_artist_logo_source,
-    resolve_cover_source, CoverCacheKey,
+    clear_metadata_assets, metadata_root_path, resolve_artist_banner_source,
+    resolve_artist_cover_source, resolve_artist_logo_source, resolve_cover_source, CoverCacheKey,
 };
 use crate::http::{json_error_response, redirect_to, wants_json};
 use crate::scan::start_rescan;
@@ -43,13 +42,14 @@ pub async fn admin_library_status(State(state): State<AppState>, headers: Header
         return json_error_response(StatusCode::FORBIDDEN, "forbidden");
     }
 
-    let mut response = library_status_snapshot(&state.library_state).await;
+    let mut response = library_status_snapshot(&state.library_state, &state.shutdown).await;
     response.backup = state.backup_jobs.latest();
     Json(response).into_response()
 }
 
 async fn library_status_snapshot(
     library_state: &parking_lot::RwLock<crate::state::LibraryState>,
+    shutdown: &crate::shutdown::Shutdown,
 ) -> LibraryStatusResponse {
     let (mut response, library, metadata_work) = {
         let guard = library_state.read();
@@ -61,7 +61,10 @@ async fn library_status_snapshot(
     };
     if response.status == "ready" {
         if let Some(library) = library {
-            match tokio::task::spawn_blocking(move || library.album_metadata_stats()).await {
+            match shutdown
+                .spawn_blocking_named("admin_library.rs", move || library.album_metadata_stats())
+                .await
+            {
                 Ok(Ok(stats)) => {
                     let progress = metadata_work.snapshot();
                     response.metadata = Some(AlbumMetadataStatus {
@@ -71,8 +74,12 @@ async fn library_status_snapshot(
                         progress,
                     })
                 }
-                Ok(Err(err)) => warn!("Failed to read album metadata status: {}", err),
-                Err(err) => warn!("Album metadata status task failed: {}", err),
+                Ok(Err(err)) => {
+                    warn!(target: "metadata_request", "Failed to read album metadata status: {}", err)
+                }
+                Err(err) => {
+                    warn!(target: "metadata_request", "Album metadata status task failed: {}", err)
+                }
             }
         }
     }
@@ -158,7 +165,7 @@ mod progress_tests {
             library: Some(library),
             metadata_work: work,
         });
-        let response = library_status_snapshot(&state).await;
+        let response = library_status_snapshot(&state, &crate::shutdown::Shutdown::new()).await;
         assert_eq!(
             response.status, "ready",
             "metadata work does not make the indexed catalog unavailable"
@@ -172,10 +179,16 @@ mod progress_tests {
         );
         assert!(json["progress"].is_null());
         drop(item);
-        let json = serde_json::to_value(library_status_snapshot(&state).await).unwrap();
+        let json = serde_json::to_value(
+            library_status_snapshot(&state, &crate::shutdown::Shutdown::new()).await,
+        )
+        .unwrap();
         assert!(json["metadata"]["progress"]["current"].is_null());
         drop(job);
-        let json = serde_json::to_value(library_status_snapshot(&state).await).unwrap();
+        let json = serde_json::to_value(
+            library_status_snapshot(&state, &crate::shutdown::Shutdown::new()).await,
+        )
+        .unwrap();
         assert_eq!(
             json["metadata"],
             serde_json::json!({"phase": null, "completed": 0, "total": 0, "progress": null})
@@ -184,7 +197,12 @@ mod progress_tests {
             started: std::time::SystemTime::now(),
             progress: Arc::new(parking_lot::RwLock::new(ScanProgress::Discovering)),
         };
-        assert!(library_status_snapshot(&state).await.metadata.is_none());
+        assert!(
+            library_status_snapshot(&state, &crate::shutdown::Shutdown::new())
+                .await
+                .metadata
+                .is_none()
+        );
     }
 
     #[test]
@@ -247,11 +265,12 @@ pub async fn admin_reindex(State(state): State<AppState>, headers: HeaderMap) ->
 
     let error = match library_for_admin(&state) {
         Ok(library) => {
+            let _metadata_reset = crate::scan::MetadataScanPause::new(&state, true);
             if let Err(err) = library.discard_metadata_imports() {
                 return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
             }
             if let Err(err) = clear_metadata_assets(&state).await {
-                warn!("Failed to clear metadata on reindex: {}", err);
+                warn!(target: "metadata_external", "Failed to clear metadata on reindex: {}", err);
             }
             start_rescan(state.clone(), library, true);
             None
@@ -280,7 +299,9 @@ pub async fn admin_library(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AdminLibraryQuery>,
+    permit: Option<axum::Extension<std::sync::Arc<crate::resources::WorkPermit>>>,
 ) -> Response {
+    let jobs = state.shutdown.clone();
     if !state.auth.has_admin().unwrap_or(false) {
         if wants_console_view(&headers) {
             return redirect_to("/setup");
@@ -313,7 +334,14 @@ pub async fn admin_library(
         }
         return admin_login_page(&state, Some("admin access required".to_string()));
     }
-    admin_library_page(&state, query, None, &headers)
+    jobs.spawn_blocking_named("admin_library.rs", move || {
+        let _permit = permit.map(|axum::Extension(permit)| permit);
+        admin_library_page(&state, query, None, &headers)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        json_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    })
 }
 
 pub async fn admin_album_cover(
@@ -368,10 +396,7 @@ pub async fn admin_album_cover(
     };
 
     let key = CoverCacheKey::Album(album_id.clone());
-    match fetch_cover_cached(&state, key, source).await {
-        Ok((bytes, mime)) => cover_response(bytes, &mime),
-        Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
-    }
+    crate::assets::stream_cover_response(&state, &key, source, &headers).await
 }
 
 pub async fn admin_artist_cover(
@@ -418,10 +443,7 @@ pub async fn admin_artist_cover(
         }
     };
 
-    match fetch_cover(source).await {
-        Ok((bytes, mime)) => cover_response(bytes, &mime),
-        Err(err) => json_error_response(StatusCode::NOT_FOUND, err),
-    }
+    crate::artwork_cache::artist_response(&state, &artist_id, &query, source, &headers).await
 }
 
 pub async fn admin_scan(State(state): State<AppState>, headers: HeaderMap) -> Response {

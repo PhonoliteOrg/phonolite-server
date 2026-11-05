@@ -19,13 +19,14 @@ pub struct UpdatePlaybackSettingsRequest {
 
 pub async fn get_playback_settings(
     State(state): State<AppState>,
-    Extension(_ctx): Extension<AuthContext>,
+    Extension(ctx): Extension<AuthContext>,
 ) -> JsonResult<PlaybackSettingsResponse> {
-    let settings = state.user_data.get_playback_settings().map_err(
-        |err: crate::user_data::UserDataError| {
+    let settings = state
+        .user_data
+        .get_playback_settings(&ctx.user.id)
+        .map_err(|err: crate::user_data::UserDataError| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-        },
-    )?;
+        })?;
     let repeat_mode = settings
         .map(|s| s.repeat_mode)
         .unwrap_or_else(|| DEFAULT_REPEAT_MODE.to_string());
@@ -34,7 +35,7 @@ pub async fn get_playback_settings(
 
 pub async fn update_playback_settings(
     State(state): State<AppState>,
-    Extension(_ctx): Extension<AuthContext>,
+    Extension(ctx): Extension<AuthContext>,
     Json(payload): Json<UpdatePlaybackSettingsRequest>,
 ) -> JsonResult<PlaybackSettingsResponse> {
     let repeat_mode = payload
@@ -52,7 +53,7 @@ pub async fn update_playback_settings(
     let settings = PlaybackSettings { repeat_mode };
     state
         .user_data
-        .set_playback_settings(settings.clone())
+        .set_playback_settings(&ctx.user.id, settings.clone())
         .map_err(|err: crate::user_data::UserDataError| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
         })?;

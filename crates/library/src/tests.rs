@@ -8,6 +8,149 @@ use common::{artist_identity_id, Artist, ArtistCredit};
 use crate::normalization::merge_genres;
 use crate::{Library, LibraryRoot, ScanProgress};
 
+#[test]
+fn scans_and_persists_all_music_formats_with_the_actual_codec() {
+    use common::Codec;
+
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server/tests/fixtures/formats");
+    for (name, expected) in [
+        ("aac.m4a", Codec::Aac),
+        ("aac.mp4", Codec::Aac),
+        ("tone.aac", Codec::Aac),
+        ("alac.m4a", Codec::Alac),
+        ("alac.mp4", Codec::Alac),
+        ("opus.opus", Codec::Opus),
+        ("opus.ogg", Codec::Opus),
+        ("opus.oga", Codec::Opus),
+        ("vorbis.ogg", Codec::Vorbis),
+        ("vorbis.oga", Codec::Vorbis),
+        ("tone.wav", Codec::Pcm),
+        ("tone.aif", Codec::Pcm),
+        ("tone.aiff", Codec::Pcm),
+    ] {
+        let workspace = TestWorkspace::new(name);
+        let relpath = format!("root/Artist/Album/{}", name.to_ascii_uppercase());
+        workspace.write_audio(&relpath);
+        fs::copy(fixtures.join(name), workspace.path(&relpath)).unwrap();
+        // Mixed-case extensions are discovered, and Ogg's actual content selects
+        // Opus versus Vorbis regardless of whether the extension is OGG or OGA.
+        let library = workspace.load_library(&[("", "root")]);
+        let mut albums = library.list_albums(None, 10, 0).unwrap().0;
+        assert_eq!(albums.len(), 1, "{name}");
+        let album = albums.remove(0);
+        let tracks = library.get_album_tracks(&album.id).unwrap();
+        assert_eq!(tracks.len(), 1, "{name}");
+        assert_eq!(tracks[0].codec, expected, "{name}");
+        assert_eq!(tracks[0].sample_rate, Some(48_000), "{name}");
+        assert_eq!(tracks[0].channels, Some(2), "{name}");
+        assert!(tracks[0].duration_ms > 0, "{name}");
+        drop(library);
+        let reopened = workspace.load_library(&[("", "root")]);
+        assert_eq!(
+            reopened.get_album_tracks(&album.id).unwrap()[0].codec,
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn original_codec_discriminants_and_api_names_remain_stable() {
+    use common::Codec;
+
+    assert_eq!(
+        bincode::deserialize::<Codec>(&0u32.to_le_bytes()).unwrap(),
+        Codec::Mp3
+    );
+    assert_eq!(
+        bincode::deserialize::<Codec>(&1u32.to_le_bytes()).unwrap(),
+        Codec::Flac
+    );
+    for (codec, name) in [
+        (Codec::Mp3, "mp3"),
+        (Codec::Flac, "flac"),
+        (Codec::Aac, "aac"),
+        (Codec::Alac, "alac"),
+        (Codec::Opus, "opus"),
+        (Codec::Vorbis, "vorbis"),
+        (Codec::Pcm, "pcm"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&codec).unwrap(),
+            format!("\"{name}\"")
+        );
+    }
+}
+
+#[test]
+fn audio_format_upgrade_reparses_unchanged_files_once() {
+    use crate::storage::{encode_value, META_TABLE, TRACKS_TABLE};
+    use common::Codec;
+    use redb::{TableDefinition, TableError};
+
+    let workspace = TestWorkspace::new("audio-format-upgrade");
+    let path = workspace.path("root/Artist/Album/Song.m4a");
+    workspace.write_audio("root/Artist/Album/Song.m4a");
+    let bytes = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server/tests/fixtures/formats/alac.m4a"),
+    )
+    .unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let library = workspace.load_library(&[("", "root")]);
+    let mut track = library.list_tracks(None, 10, 0).unwrap().0.remove(0);
+    track.codec = Codec::Mp3;
+    let mut stale_tags = metadata::read_tags(&path).unwrap();
+    stale_tags.codec = Some(Codec::Mp3);
+    let properties = fs::metadata(&path).unwrap();
+    let stale_cache =
+        bincode::serialize(&(properties.len(), properties.modified().ok(), stale_tags)).unwrap();
+    let db = library.db();
+    let write = db.begin_write().unwrap();
+    {
+        write
+            .open_table(TRACKS_TABLE)
+            .unwrap()
+            .insert(track.id.as_str(), encode_value(&track).unwrap().as_slice())
+            .unwrap();
+        write
+            .open_table(META_TABLE)
+            .unwrap()
+            .remove("audio_format_policy")
+            .unwrap();
+        write
+            .open_table(TableDefinition::<&str, &[u8]>::new("file_tags_v5"))
+            .unwrap()
+            .insert(path.to_string_lossy().as_ref(), stale_cache.as_slice())
+            .unwrap();
+        write
+            .open_table(TableDefinition::<&str, &[u8]>::new("file_tags_v4"))
+            .unwrap()
+            .insert("legacy-cache", b"old schema".as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+
+    let (recovered, scanned) =
+        Library::load_or_scan_with_db(library.roots().to_vec(), db.clone()).unwrap();
+    assert!(
+        scanned,
+        "the unchanged manifest must not hide new codec support"
+    );
+    assert_eq!(
+        recovered.get_track(&track.id).unwrap().unwrap().codec,
+        Codec::Alac
+    );
+    let read = db.begin_read().unwrap();
+    assert!(matches!(
+        read.open_table(TableDefinition::<&str, &[u8]>::new("file_tags_v4")),
+        Err(TableError::TableDoesNotExist(_))
+    ));
+    drop(read);
+    let (_, scanned_again) = Library::load_or_scan_with_db(library.roots().to_vec(), db).unwrap();
+    assert!(!scanned_again, "format recovery only runs once");
+}
+
 fn write_backup_track(workspace: &TestWorkspace, path: &str) {
     workspace.write_audio(path);
     fs::write(
@@ -80,6 +223,10 @@ fn metadata_backup_matches_renamed_paths_and_root_ids_without_replacing_local_fi
     let original_id = old.list_albums(None, 10, 0).unwrap().0.remove(0).id;
     assert_ne!(album.id, original_id);
     let preview = library.preview_metadata(&backup).unwrap();
+    let before_metadata = library.metadata_revision();
+    let before_ordering = library.browse_revision();
+    let before_summaries = library.artist_browse_page(10, 0).unwrap().0;
+    assert!(!before_summaries[0].genres.contains(&"Jazz".to_owned()));
     assert_eq!(preview.matched_albums, 1);
     assert!(library
         .get_album(&album.id)
@@ -95,6 +242,11 @@ fn metadata_backup_matches_renamed_paths_and_root_ids_without_replacing_local_fi
     let report = library.restore_metadata(&backup).unwrap();
     assert_eq!(report.updated_albums, 1);
     assert_eq!(report.updated_artists, 1);
+    assert_ne!(library.metadata_revision(), before_metadata);
+    assert_eq!(library.browse_revision(), before_ordering);
+    assert!(library.artist_browse_page(10, 0).unwrap().0[0]
+        .genres
+        .contains(&"Jazz".to_owned()));
     let restored = library.get_album(&album.id).unwrap().unwrap();
     assert_eq!(
         restored.summary.as_deref(),
@@ -1430,7 +1582,7 @@ fn seed_cached_tags(
     let write = db.begin_write().unwrap();
     {
         let mut table = write
-            .open_table(redb::TableDefinition::<&str, &[u8]>::new("file_tags_v4"))
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("file_tags_v5"))
             .unwrap();
         table
             .insert(path.to_string_lossy().as_ref(), bytes.as_slice())
@@ -2157,7 +2309,7 @@ fn policy_upgrade_and_force_scan_recover_structured_credits_from_real_flac_tags(
         // A policy upgrade reparses even an unchanged file and discards any
         // cache produced before independent credits were available.
         write
-            .delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v4"))
+            .delete_table(TableDefinition::<&str, &[u8]>::new("file_tags_v5"))
             .unwrap();
     }
     write.commit().unwrap();
@@ -3434,4 +3586,104 @@ impl Drop for TestWorkspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn detailed_scans_report_only_affected_albums_and_preserve_noop_generation() {
+    let workspace = TestWorkspace::new("scan-changes");
+    workspace.write_audio("root/Artist/Changed/First.mp3");
+    workspace.write_audio("root/Artist/Untouched/First.mp3");
+    let library = workspace.load_library(&[("", "root")]);
+    let generation = library.catalog_generation();
+    let publications = std::sync::atomic::AtomicUsize::new(0);
+    let before_commit = || {
+        publications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    };
+    let noop = library
+        .scan_with_changes_and_prepare(false, None, &|_| {}, &before_commit)
+        .unwrap();
+    assert_eq!(publications.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(noop.changes, crate::ScanChanges::default());
+    assert_eq!(library.catalog_generation(), generation);
+    let albums = library.list_albums(None, 10, 0).unwrap().0;
+    let changed = albums
+        .iter()
+        .find(|album| album.title == "Changed")
+        .unwrap();
+    let untouched = albums
+        .iter()
+        .find(|album| album.title == "Untouched")
+        .unwrap();
+    workspace.write_audio("root/Artist/Changed/Second.mp3");
+    let outcome = library
+        .scan_with_changes_and_prepare(
+            false,
+            Some(&[workspace.path("root/Artist/Changed/Second.mp3")]),
+            &|_| {},
+            &before_commit,
+        )
+        .unwrap();
+    assert!(outcome.changes.changed);
+    assert_eq!(publications.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(outcome.changes.albums.contains(&changed.id));
+    assert!(!outcome.changes.albums.contains(&untouched.id));
+    assert_ne!(library.catalog_generation(), generation);
+}
+
+#[test]
+fn detailed_scans_remove_deleted_identities_from_metadata_targets() {
+    let workspace = TestWorkspace::new("scan-removals");
+    workspace.write_audio("root/Artist/Album/First.mp3");
+    let library = workspace.load_library(&[("", "root")]);
+    let album = library.list_albums(None, 10, 0).unwrap().0.remove(0);
+    let retry_key = serde_json::to_string(&("album", &album.id, "test-source")).unwrap();
+    library
+        .claim_metadata_request(&retry_key, "source", Duration::from_secs(3600), false)
+        .unwrap()
+        .unwrap()
+        .finish("no_usable_metadata")
+        .unwrap();
+    let file = workspace.path("root/Artist/Album/First.mp3");
+    fs::remove_file(&file).unwrap();
+    let outcome = library
+        .scan_with_changes(false, Some(&[file]), &|_| {})
+        .unwrap();
+    assert!(library
+        .metadata_request_outcome(&retry_key, "source")
+        .unwrap()
+        .is_none());
+    assert!(outcome.changes.removed_albums.contains(&album.id));
+    assert!(!outcome.changes.albums.contains(&album.id));
+    assert!(outcome.changes.removed_artists.contains(&album.artist_id));
+    assert!(!outcome.changes.artists.contains(&album.artist_id));
+}
+
+#[test]
+fn metadata_credit_application_guard_follows_the_source_scan_lock() {
+    let workspace = TestWorkspace::new("credit-guard-order");
+    workspace.write_audio("root/Artist/Album/First.mp3");
+    let library = workspace.load_library(&[("", "root")]);
+    let source_lock = crate::indexing::scan_lock(&library.cancellation).unwrap();
+    let applied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let checked = applied.clone();
+    let repair_library = library.clone();
+    let (started, ready) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        repair_library
+            .resolve_album_display_credit_with_guard("missing", &[], || {
+                checked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap()
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
+    drop(source_lock);
+    assert!(!thread.join().unwrap());
+    assert!(applied.load(std::sync::atomic::Ordering::SeqCst));
+    let rejected = library.resolve_album_display_credit_with_guard("missing", &[], || {
+        Err::<(), _>(crate::LibraryError::Cancelled)
+    });
+    assert!(matches!(rejected, Err(crate::LibraryError::Cancelled)));
 }

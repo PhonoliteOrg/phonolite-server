@@ -4,7 +4,6 @@ use std::time::SystemTime;
 
 use axum::http::StatusCode;
 use axum::Json;
-use notify::RecommendedWatcher;
 use parking_lot::RwLock;
 use redb::Database;
 use reqwest::Client;
@@ -24,6 +23,8 @@ use library::{Library, LibraryStats, ScanProgress};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub shutdown: crate::shutdown::Shutdown,
+    pub process_metrics: crate::process_metrics::ProcessMetrics,
     pub library_state: Arc<RwLock<LibraryState>>,
     pub auth: AuthStore,
     pub security: Arc<crate::security::SecurityState>,
@@ -34,12 +35,17 @@ pub struct AppState {
     pub stats: StatsStore,
     pub activity: ActivityStore,
     pub log_control: LogControl,
-    pub watcher: Arc<RwLock<Option<RecommendedWatcher>>>,
+    pub watcher: Arc<RwLock<Option<crate::watch::WatchHandle>>>,
     pub external_client: Client,
     pub stream_cache: StreamCache,
     pub metadata_events: MetadataEventBus,
+    pub metadata_coordinator: Arc<crate::metadata_coordinator::MetadataCoordinator>,
+    pub shuffle_sessions: crate::shuffle_sessions::ShuffleSessionStore,
     pub download_jobs: DownloadJobStore,
     pub backup_jobs: crate::admin::backup::jobs::Store,
+    pub resources: Arc<crate::resources::Resources>,
+    pub catalogue_cache: Arc<crate::catalogue_cache::CatalogueCache>,
+    pub artwork_cache: Arc<crate::artwork_cache::ArtworkCache>,
 }
 
 #[derive(Clone)]
@@ -248,6 +254,9 @@ pub struct AdminLibraryQuery {
 #[derive(Deserialize)]
 pub struct ArtistCoverQuery {
     pub kind: Option<String>,
+    pub v: Option<String>,
+    pub size: Option<u32>,
+    pub rendition: Option<u8>,
 }
 
 #[derive(Deserialize)]

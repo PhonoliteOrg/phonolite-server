@@ -14,10 +14,10 @@
     </div>
     <div class="table-scroll" role="region" aria-label="User accounts" tabindex="0">
       <table>
-        <caption class="sr-only">User accounts and access permissions</caption>
+        <caption class="sr-only">User accounts, access permissions, and client login activity</caption>
         <thead><tr>
           <th class="select-cell" scope="col"><span class="sr-only">Select</span></th>
-          <th scope="col">Username</th><th scope="col">Role</th><th scope="col">Actions</th>
+          <th scope="col">Username</th><th scope="col">Role</th><th scope="col" title="Connected Phonolite clients. Lost connections time out after 30 seconds.">Active client sessions</th><th scope="col">Last client login / device</th><th scope="col">Actions</th>
         </tr></thead>
         <tbody id="user-rows">{{user_rows}}</tbody>
       </table>

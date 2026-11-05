@@ -136,6 +136,7 @@ fn build_page_view(
                 ("nav_library_current", current("library")),
                 ("nav_users_current", current("users")),
                 ("nav_logs_current", current("logs")),
+                ("nav_performance_current", current("performance")),
                 ("nav_settings_current", current("settings")),
                 ("server_version", escape_html(env!("CARGO_PKG_VERSION"))),
             ],
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn console_shell_marks_only_the_current_page() {
-        for title in ["Library", "Users", "Logs", "Settings"] {
+        for title in ["Library", "Users", "Logs", "Performance", "Settings"] {
             let html = render_page(title, PageLayout::standard());
             let page = title.to_ascii_lowercase();
             assert!(html.contains(&format!("data-page=\"{page}\"")));

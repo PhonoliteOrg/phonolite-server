@@ -5,6 +5,33 @@ use std::collections::{HashMap, HashSet};
 use common::{genre_display_label, Album, Artist, ArtistCredit, ArtistCredits};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+#[path = "library_views/batch_tests.rs"]
+mod batch_tests;
+
+/// Lightweight cards deliberately omit biographies and release graphs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtistSummaryView {
+    pub id: String,
+    pub name: String,
+    pub genres: Vec<String>,
+    pub logo_ref: Option<String>,
+    pub metadata_revision: String,
+    pub album_count: usize,
+    pub release_count: usize,
+    pub collab_album_count: usize,
+    pub appearance_count: usize,
+    pub other_credit_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtistSummaryPage {
+    pub items: Vec<ArtistSummaryView>,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub browse_revision: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArtistView {
     pub id: String,
@@ -124,30 +151,23 @@ pub fn build_album_views(
     library: &::library::Library,
     albums: Vec<Album>,
 ) -> Result<Vec<AlbumView>, String> {
-    let album_ids = albums
-        .iter()
-        .map(|album| album.id.clone())
-        .collect::<Vec<_>>();
-    let track_counts = library
-        .album_track_counts(&album_ids)
+    let metadata = library
+        .album_view_metadata(&albums)
         .map_err(|err| err.to_string())?;
-    let artist_ids = albums
-        .iter()
-        .flat_map(|album| album.all_artist_ids().iter().cloned())
-        .collect::<HashSet<_>>();
-    let artist_names = library
-        .artist_name_map(&artist_ids)
-        .map_err(|err| err.to_string())?;
+    debug_assert_eq!(albums.len(), metadata.credits.len());
 
     Ok(albums
         .into_iter()
-        .map(|album| {
-            let credits = library
-                .album_credits(&album.id)
-                .map_err(|err| err.to_string())?;
-            Ok(album_view(album, &track_counts, &artist_names, credits))
+        .zip(metadata.credits)
+        .map(|(album, credits)| {
+            album_view(
+                album,
+                &metadata.track_counts,
+                &metadata.artist_names,
+                credits,
+            )
         })
-        .collect::<Result<Vec<_>, String>>()?)
+        .collect())
 }
 
 pub fn build_track_views(
@@ -156,60 +176,35 @@ pub fn build_track_views(
     liked_set: &HashSet<String>,
     playlist_set: &HashSet<String>,
 ) -> Result<Vec<TrackView>, String> {
-    let artist_ids = tracks
-        .iter()
-        .map(|track| track.artist_id.clone())
-        .collect::<HashSet<_>>();
-    let album_ids = tracks
-        .iter()
-        .map(|track| track.album_id.clone())
-        .collect::<HashSet<_>>();
-    let artist_names = library
-        .artist_name_map(&artist_ids)
+    let metadata = library
+        .track_view_metadata(tracks)
         .map_err(|err| err.to_string())?;
-    let album_titles = library
-        .album_title_map(&album_ids)
-        .map_err(|err| err.to_string())?;
-    let mut album_genres = HashMap::new();
-    let mut artist_genres = HashMap::new();
+    debug_assert_eq!(tracks.len(), metadata.tracks.len());
 
     Ok(tracks
         .iter()
-        .map(|track| {
-            let credits = library
-                .track_credits(&track.id)
-                .map_err(|err| err.to_string())?;
+        .zip(metadata.tracks)
+        .map(|(track, display)| {
+            let credits = display.credits;
             let headlines = credits
                 .credits
                 .iter()
                 .filter(|credit| is_track_artist(&credit.role))
                 .collect::<Vec<_>>();
-            let genres = track_genres(
-                library,
-                track,
-                &headlines,
-                &mut album_genres,
-                &mut artist_genres,
-            )?;
-            let listening_genres = listening_track_genres(
-                library,
-                track,
-                &headlines,
-                &mut album_genres,
-                &mut artist_genres,
-            )?;
-            Ok(TrackView {
+            TrackView {
                 id: track.id.clone(),
                 title: track.title.clone(),
                 artist: if credits.display_name.trim().is_empty() {
-                    artist_names
+                    metadata
+                        .artist_names
                         .get(&track.artist_id)
                         .cloned()
                         .unwrap_or_else(|| "Unknown Artist".to_string())
                 } else {
                     credits.display_name.clone()
                 },
-                album: album_titles
+                album: metadata
+                    .album_titles
                     .get(&track.album_id)
                     .cloned()
                     .unwrap_or_else(|| "Unknown Album".to_string()),
@@ -227,87 +222,13 @@ pub fn build_track_views(
                 duration_ms: track.duration_ms,
                 track_no: track.track_no,
                 disc_no: track.disc_no,
-                genres,
-                listening_genres,
+                genres: display.genres,
+                listening_genres: display.listening_genres,
                 liked: liked_set.contains(&track.id),
                 in_playlists: playlist_set.contains(&track.id),
-            })
+            }
         })
-        .collect::<Result<Vec<_>, String>>()?)
-}
-
-fn track_genres(
-    library: &::library::Library,
-    track: &common::Track,
-    performers: &[&ArtistCredit],
-    album_cache: &mut HashMap<String, Vec<String>>,
-    artist_cache: &mut HashMap<String, Vec<String>>,
-) -> Result<Vec<String>, String> {
-    let own = genre_labels(&track.genres);
-    if !own.is_empty() {
-        return Ok(own);
-    }
-    // Provider enrichment can arrive after indexing. Project the current album
-    // metadata for untagged songs without copying every album genre onto tags.
-    let genres = cached_album_genres(library, &track.album_id, album_cache)?;
-    if !genres.is_empty() {
-        return Ok(genres.clone());
-    }
-    let performer_ids = if performers.is_empty() {
-        vec![track.artist_id.as_str()]
-    } else {
-        performers
-            .iter()
-            .map(|credit| credit.artist_id.as_str())
-            .collect()
-    };
-    let mut genres = Vec::new();
-    for id in performer_ids {
-        if !artist_cache.contains_key(id) {
-            let values = library
-                .get_artist(id)
-                .map_err(|err| err.to_string())?
-                .map(|artist| genre_labels(&artist.genres))
-                .unwrap_or_default();
-            artist_cache.insert(id.to_string(), values);
-        }
-        genres.extend(artist_cache.get(id).into_iter().flatten().cloned());
-    }
-    Ok(genre_labels(&genres))
-}
-
-fn listening_track_genres(
-    library: &::library::Library,
-    track: &common::Track,
-    performers: &[&ArtistCredit],
-    album_cache: &mut HashMap<String, Vec<String>>,
-    artist_cache: &mut HashMap<String, Vec<String>>,
-) -> Result<Vec<String>, String> {
-    // Catalog release enrichment describes this recording more specifically
-    // than broad file labels or the performer's whole discography. Reuse the
-    // request's cache so sibling songs and offline projections need no extra
-    // per-song album reads.
-    let genres = cached_album_genres(library, &track.album_id, album_cache)?;
-    if !genres.is_empty() {
-        return Ok(genres.clone());
-    }
-    track_genres(library, track, performers, album_cache, artist_cache)
-}
-
-fn cached_album_genres<'a>(
-    library: &::library::Library,
-    album_id: &str,
-    album_cache: &'a mut HashMap<String, Vec<String>>,
-) -> Result<&'a Vec<String>, String> {
-    if !album_cache.contains_key(album_id) {
-        let genres = library
-            .get_album(album_id)
-            .map_err(|err| err.to_string())?
-            .map(|album| genre_labels(&album.genres))
-            .unwrap_or_default();
-        album_cache.insert(album_id.to_string(), genres);
-    }
-    Ok(&album_cache[album_id])
+        .collect())
 }
 
 fn genre_labels(values: &[String]) -> Vec<String> {

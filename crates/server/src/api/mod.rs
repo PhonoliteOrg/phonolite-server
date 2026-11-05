@@ -1,27 +1,37 @@
+pub mod account;
+pub mod account_events;
+pub mod account_sync;
 pub mod auth;
 pub mod browse;
 pub mod download_v2;
 mod downloads;
 pub mod library;
+pub mod playback;
+mod playback_presence;
 pub mod player;
 pub mod server;
+pub mod shuffle_sessions;
 pub mod stats;
+mod track_files;
 pub mod user_data;
 pub mod views;
+
+#[cfg(test)]
+mod catalogue_tests;
 
 use crate::state::LibraryStatus;
 use ::library::Library;
 use axum::{
     body::Body,
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 
-use crate::http::extract_token;
+use crate::http::{extract_bearer_token, extract_token};
 use crate::http::{json_error, json_error_response};
 use crate::state::{AppState, AuthContext, HealthResponse};
 
@@ -34,6 +44,44 @@ pub fn api_router(state: AppState) -> Router {
         .route("/auth/logout", post(auth::auth_logout));
 
     let protected = Router::new()
+        .route("/account/state", get(account_events::snapshot))
+        .route("/account/events", get(account_events::events))
+        .route(
+            "/account/shuffle-presets",
+            get(account::presets).post(account::create_preset),
+        )
+        .route(
+            "/account/shuffle-presets/:id",
+            post(account::update_preset).delete(account::delete_preset),
+        )
+        .route(
+            "/account/last-track",
+            get(account::last_track).post(account::track_started),
+        )
+        .route(
+            "/account/playback",
+            get(playback::get)
+                .post(playback::save)
+                .delete(playback::clear),
+        )
+        .route("/account/playback/decks/:id", get(playback::deck_page))
+        .route(
+            "/account/playback/presence",
+            post(playback_presence::report).layer(axum::extract::DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/account/sessions/revoke-others",
+            post(account::revoke_others),
+        )
+        .route("/account/sessions/revoke-all", post(account::revoke_all))
+        .route(
+            "/account/collections/events",
+            get(account_sync::collection_events),
+        )
+        .route(
+            "/account/collections/snapshot",
+            get(account_sync::collection_snapshot),
+        )
         .route("/library/search", get(library::search))
         .route("/library/events", get(download_v2::metadata_events))
         .route(
@@ -41,6 +89,14 @@ pub fn api_router(state: AppState) -> Router {
             get(download_v2::metadata_snapshot),
         )
         .route("/library/shuffle", get(library::shuffle_tracks))
+        .route(
+            "/library/shuffle/sessions",
+            post(shuffle_sessions::create_session),
+        )
+        .route(
+            "/library/shuffle/sessions/:session_id",
+            get(shuffle_sessions::get_page).delete(shuffle_sessions::delete_session),
+        )
         .route("/library/metadata-events", get(library::metadata_events))
         .route("/library/albums/:album_id", get(library::get_album))
         .route(
@@ -50,6 +106,10 @@ pub fn api_router(state: AppState) -> Router {
         .route("/library/match-tracks", post(library::match_tracks))
         .route("/library/playlists", get(user_data::list_playlists))
         .route("/library/playlists", post(user_data::create_playlist))
+        .route(
+            "/library/playlists/:playlist_id/tracks",
+            post(user_data::add_playlist_tracks).delete(user_data::remove_playlist_tracks),
+        )
         .route(
             "/library/playlists/:playlist_id",
             post(user_data::update_playlist),
@@ -80,9 +140,10 @@ pub fn api_router(state: AppState) -> Router {
         .route("/download/tracks/:track_id", get(library::download_track))
         .route("/download/jobs", post(download_v2::create_download_job))
         .route("/download/jobs", get(download_v2::list_download_jobs))
+        .route("/download/jobs/:job_id", get(download_v2::get_download_job))
         .route(
-            "/download/jobs/:job_id",
-            get(download_v2::get_download_job),
+            "/download/jobs/:job_id/tracks/:track_id/file",
+            get(download_v2::download_prepared_file),
         )
         .route(
             "/download/jobs/:job_id/actions",
@@ -96,7 +157,15 @@ pub fn api_router(state: AppState) -> Router {
             "/download/tracks/:track_id/file",
             get(download_v2::download_track_file),
         )
+        .route(
+            "/stream/:track_id/original",
+            get(track_files::stream_original_track),
+        )
         .route("/browse/artists", get(browse::list_artists))
+        .route(
+            "/browse/artist-summaries",
+            get(browse::list_artist_summaries),
+        )
         .route("/browse/artists/:artist_id", get(browse::get_artist))
         .route(
             "/browse/artists/:artist_id/releases",
@@ -152,6 +221,9 @@ async fn require_auth(
     mut req: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
+    if state.shutdown.is_cancelled() {
+        return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "server is shutting down");
+    }
     let has_users = match state.auth.has_any_user() {
         Ok(b) => b,
         Err(err) => {
@@ -172,8 +244,63 @@ async fn require_auth(
 
     match state.auth.user_from_token(&token) {
         Ok(Some(user)) => {
+            // Cookie-authenticated console requests are not client presence.
+            if let (Some(client_token), Some(connection)) = (
+                extract_bearer_token(req.headers()),
+                req.extensions().get::<crate::presence::HttpConnection>(),
+            ) {
+                state.auth.observe_connection(&client_token, connection);
+            }
+            let path = req
+                .uri()
+                .path()
+                .strip_prefix("/api")
+                .unwrap_or(req.uri().path());
+            let artwork = path.starts_with("/library/artists/") && path.ends_with("/cover")
+                || path.starts_with("/library/albums/") && path.ends_with("/cover");
+            let catalogue = path.starts_with("/browse/artists")
+                || path == "/browse/artist-summaries"
+                || path == "/library/search";
+            let audio_transfer = crate::streaming::is_http_audio_transfer(req.method(), path);
+            let permit = if artwork || catalogue {
+                let gate = if artwork {
+                    &state.resources.artwork
+                } else {
+                    &state.resources.catalogue
+                };
+                match gate.acquire(&user.id, &state.shutdown).await {
+                    Ok(permit) => Some(std::sync::Arc::new(permit)),
+                    Err(error) => return error.response(),
+                }
+            } else {
+                None
+            };
+            if let Some(permit) = &permit {
+                req.extensions_mut().insert(std::sync::Arc::clone(permit));
+            }
             req.extensions_mut().insert(AuthContext { user });
-            next.run(req).await
+            let mut response = next.run(req).await;
+            if audio_transfer {
+                response = crate::streaming::track_http_audio_response(
+                    response,
+                    &state.process_metrics.network(),
+                );
+            }
+            // The same endpoint URL can return a different account's personal data.
+            if response
+                .extensions()
+                .get::<crate::artwork_cache::AuthenticatedArtwork>()
+                .is_none()
+            {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, no-store"),
+                );
+            }
+            match permit {
+                Some(permit) => permit.retain_response(response),
+                None => response,
+            }
         }
         Ok(None) => json_error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(err) => json_error_response(
@@ -183,7 +310,24 @@ async fn require_auth(
     }
 }
 
-async fn health() -> impl IntoResponse {
+async fn health(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    connection: Option<axum::Extension<crate::presence::HttpConnection>>,
+) -> impl IntoResponse {
+    // Keep anonymous reachability checks public. An authenticated health probe
+    // also proves that an otherwise idle app is still connected.
+    if let (Some(token), Some(axum::Extension(connection))) =
+        (extract_bearer_token(&headers), connection)
+    {
+        if state
+            .auth
+            .user_from_token(&token)
+            .is_ok_and(|user| user.is_some())
+        {
+            state.auth.observe_connection(&token, &connection);
+        }
+    }
     Json(HealthResponse { status: "ok" })
 }
 

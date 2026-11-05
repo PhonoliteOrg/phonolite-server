@@ -13,7 +13,64 @@ use crate::storage::{
 use crate::{Library, LibraryError, LibraryStats, TagErrorFile, TagErrorInfo};
 
 impl Library {
+    /// Catalog IDs in key order, without decoding track metadata. Useful for
+    /// queues that hydrate only a small playback window.
+    pub fn track_ids(&self) -> Result<Vec<String>, LibraryError> {
+        self.check_read_cancelled()?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TRACKS_TABLE)?;
+        let mut ids = Vec::with_capacity(table.len()? as usize);
+        for entry in table.iter()? {
+            self.check_read_cancelled()?;
+            let (id, _) = entry?;
+            ids.push(id.value().to_owned());
+        }
+        Ok(ids)
+    }
+
+    /// Loads an ordered queue window in one read transaction. Removed tracks
+    /// are omitted, while surviving tracks retain the supplied order.
+    pub fn tracks_by_ids(&self, ids: &[String]) -> Result<Vec<Track>, LibraryError> {
+        self.check_read_cancelled()?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TRACKS_TABLE)?;
+        let mut tracks = Vec::with_capacity(ids.len());
+        for id in ids {
+            self.check_read_cancelled()?;
+            if let Some(value) = table.get(id.as_str())? {
+                tracks.push(decode_value(value.value())?);
+            }
+        }
+        Ok(tracks)
+    }
+
+    /// Collection browsing historically skips failed individual `get_track`
+    /// lookups. Keep that tolerant behavior, order, and duplicate entries while
+    /// sharing one catalog snapshot and table handle across the whole list.
+    /// Like `get_track`, this path does not apply operational read cancellation.
+    pub fn tracks_by_ids_best_effort(&self, ids: &[String]) -> Vec<Track> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(read) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = read.open_table(TRACKS_TABLE) else {
+            return Vec::new();
+        };
+        let mut tracks = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(Some(value)) = table.get(id.as_str()) {
+                if let Ok(track) = decode_value(value.value()) {
+                    tracks.push(track);
+                }
+            }
+        }
+        tracks
+    }
+
     pub fn stats(&self) -> Result<LibraryStats, LibraryError> {
+        self.check_read_cancelled()?;
         read_stats(&self.db)
     }
 
@@ -22,6 +79,7 @@ impl Library {
         cursor: &mut Option<String>,
         limit: usize,
     ) -> Result<(Vec<Album>, usize), LibraryError> {
+        self.check_read_cancelled()?;
         let read = self.db.begin_read()?;
         let names = read.open_table(ALBUMS_BY_NAME_TABLE)?;
         let values = read.open_table(ALBUMS_TABLE)?;
@@ -29,6 +87,7 @@ impl Library {
         let mut items = Vec::new();
         let start = cursor.clone().unwrap_or_default();
         for entry in names.range(start.as_str()..)? {
+            self.check_read_cancelled()?;
             let (key, _) = entry?;
             if cursor.is_some() && key.value() == start {
                 continue;
@@ -50,6 +109,7 @@ impl Library {
         cursor: &mut Option<String>,
         limit: usize,
     ) -> Result<(Vec<Artist>, usize), LibraryError> {
+        self.check_read_cancelled()?;
         let read = self.db.begin_read()?;
         let names = read.open_table(ARTISTS_BY_NAME_TABLE)?;
         let values = read.open_table(ARTISTS_TABLE)?;
@@ -57,6 +117,7 @@ impl Library {
         let mut items = Vec::new();
         let start = cursor.clone().unwrap_or_default();
         for entry in names.range(start.as_str()..)? {
+            self.check_read_cancelled()?;
             let (key, _) = entry?;
             if cursor.is_some() && key.value() == start {
                 continue;
@@ -78,6 +139,7 @@ impl Library {
         cursor: &mut Option<String>,
         limit: usize,
     ) -> Result<(Vec<Track>, usize), LibraryError> {
+        self.check_read_cancelled()?;
         let read = self.db.begin_read()?;
         let names = read.open_table(TRACKS_BY_NAME_TABLE)?;
         let values = read.open_table(TRACKS_TABLE)?;
@@ -85,6 +147,7 @@ impl Library {
         let mut items = Vec::new();
         let start = cursor.clone().unwrap_or_default();
         for entry in names.range(start.as_str()..)? {
+            self.check_read_cancelled()?;
             let (key, _) = entry?;
             if cursor.is_some() && key.value() == start {
                 continue;
@@ -131,6 +194,7 @@ impl Library {
         let mut items = Vec::new();
 
         for entry in name_table.iter()? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             let key = entry.0.value();
             let (name_lower, artist_id) = split_key_last(key)?;
@@ -189,6 +253,7 @@ impl Library {
         let artist_table = read_txn.open_table(ARTISTS_TABLE)?;
         let mut names = HashMap::with_capacity(artist_ids.len());
         for artist_id in artist_ids {
+            self.check_read_cancelled()?;
             if let Some(value) = artist_table.get(artist_id.as_str())? {
                 let artist: Artist = decode_value(value.value())?;
                 names.insert(artist_id.clone(), artist.name);
@@ -206,11 +271,13 @@ impl Library {
         let mut counts = HashMap::with_capacity(artist_ids.len());
 
         for artist_id in artist_ids {
+            self.check_read_cancelled()?;
             let prefix = prefix_key(artist_id);
             let mut end = prefix.clone();
             end.push('\u{10ffff}');
             let mut count = 0usize;
             for entry in artist_album_table.range(prefix.as_str()..end.as_str())? {
+                self.check_read_cancelled()?;
                 entry?;
                 count += 1;
             }
@@ -231,6 +298,7 @@ impl Library {
         let mut albums = Vec::new();
 
         for entry in artist_album_table.range(prefix.as_str()..end.as_str())? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             let key = entry.0.value();
             let (_, album_id) = split_key_last(key)?;
@@ -252,11 +320,13 @@ impl Library {
         let mut counts = HashMap::with_capacity(album_ids.len());
 
         for album_id in album_ids {
+            self.check_read_cancelled()?;
             let prefix = prefix_key(album_id);
             let mut end = prefix.clone();
             end.push('\u{10ffff}');
             let mut count = 0usize;
             for entry in album_track_table.range(prefix.as_str()..end.as_str())? {
+                self.check_read_cancelled()?;
                 entry?;
                 count += 1;
             }
@@ -285,6 +355,7 @@ impl Library {
             let total = name_table.len()? as usize;
             let mut items = Vec::new();
             for entry in name_table.iter()?.skip(offset).take(limit) {
+                self.check_read_cancelled()?;
                 let (key, _) = entry?;
                 let (_, id) = split_key_last(key.value())?;
                 if let Some(value) = album_table.get(id)? {
@@ -298,6 +369,7 @@ impl Library {
         let mut items = Vec::new();
 
         for entry in name_table.iter()? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             let key = entry.0.value();
             let (_, album_id) = split_key_last(key)?;
@@ -343,6 +415,7 @@ impl Library {
             let total = name_table.len()? as usize;
             let mut items = Vec::new();
             for entry in name_table.iter()?.skip(offset).take(limit) {
+                self.check_read_cancelled()?;
                 let (key, _) = entry?;
                 let (_, id) = split_key_last(key.value())?;
                 if let Some(value) = track_table.get(id)? {
@@ -356,6 +429,7 @@ impl Library {
         let mut items = Vec::new();
 
         for entry in name_table.iter()? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             let key = entry.0.value();
             let (_, track_id) = split_key_last(key)?;
@@ -397,6 +471,7 @@ impl Library {
         let mut total = 0usize;
         let mut items = Vec::new();
         for entry in table.iter()? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             total += 1;
             if total <= offset {
@@ -410,6 +485,21 @@ impl Library {
         }
 
         Ok((items, total))
+    }
+
+    pub fn album_tag_error(&self, id: &str) -> Result<Option<TagErrorInfo>, LibraryError> {
+        self.check_read_cancelled()?;
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(TAG_ERRORS_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let item = table
+            .get(id)?
+            .map(|value| decode_value(value.value()))
+            .transpose();
+        item
     }
 
     pub fn list_tag_error_files(
@@ -427,6 +517,7 @@ impl Library {
         let mut total = 0usize;
         let mut items = Vec::new();
         for entry in table.iter()? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             total += 1;
             if total <= offset {
@@ -460,6 +551,7 @@ impl Library {
         let album_table = read_txn.open_table(ALBUMS_TABLE)?;
         let mut titles = HashMap::with_capacity(album_ids.len());
         for album_id in album_ids {
+            self.check_read_cancelled()?;
             if let Some(value) = album_table.get(album_id.as_str())? {
                 let album: Album = decode_value(value.value())?;
                 titles.insert(album_id.clone(), album.title);
@@ -479,6 +571,7 @@ impl Library {
         let mut tracks = Vec::new();
 
         for entry in album_track_table.range(prefix.as_str()..end.as_str())? {
+            self.check_read_cancelled()?;
             let entry = entry?;
             let key = entry.0.value();
             let (_, track_id) = split_key_last(key)?;
@@ -521,3 +614,6 @@ impl Library {
         Ok(has_cover)
     }
 }
+
+#[cfg(test)]
+mod batch_tests;

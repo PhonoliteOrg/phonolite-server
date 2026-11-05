@@ -6,22 +6,29 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::net::UdpSocket;
 
 use crate::config::{bind_target, ServerConfig};
 use crate::performance::{self, OperationTiming, StreamProfile};
 use crate::state::AppState;
-use crate::stream_cache::{CacheGuard, CacheKey, CACHE_RANGE_MS, MEMORY_CACHE_MAX_BYTES};
+use crate::stream_cache::{CacheGuard, CacheKey, CACHE_RANGE_MS};
 use crate::streaming::{
     build_raw_opus_meta, parse_frame_ms, parse_transcode_mode, parse_transcode_quality,
     transcode_mode_label, transcode_quality_label,
 };
-use crate::transcode::{BitrateSelector, TranscodeMode, TranscodeQuality};
+use crate::transcode::{TranscodeMode, TranscodeQuality};
+
+#[cfg(test)]
+mod migration_tests;
+mod source;
+mod udp;
+
+use udp::DatagramSocket;
 
 const ALPN_QUIC: &[&[u8]] = &[b"phonolite-quic"];
 const SERVER_CONN_ID_LEN: usize = 16;
-const MAX_UDP_SIZE: usize = 65535;
+const MIGRATION_CONNECTION_ID_LIMIT: u64 = 4;
 const MAX_QUIC_DATAGRAM: usize = 1350;
+const MAX_DATAGRAMS_PER_FLUSH: usize = 64;
 const CONTROL_STREAM_MAX_LINE: usize = 64 * 1024;
 const MAX_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const STREAM_QUEUE_MS: u32 = 400;
@@ -48,8 +55,25 @@ enum ControlMessage {
         queue: Option<Vec<String>>,
         start_ms: Option<u32>,
     },
+    #[serde(rename = "source_range")]
+    SourceRange {
+        request_id: u64,
+        track_id: String,
+        offset: u64,
+        length: u32,
+        source_version: Option<String>,
+    },
+    #[serde(rename = "source_open")]
+    SourceOpen {
+        request_id: u64,
+        track_id: String,
+        offset: u64,
+        source_version: Option<String>,
+    },
     #[serde(rename = "advance")]
     Advance,
+    #[serde(rename = "cancel")]
+    Cancel { stream_id: u64 },
     #[serde(rename = "buffer")]
     Buffer {
         request_id: Option<u64>,
@@ -101,12 +125,23 @@ enum ControlResponse<'a> {
     },
     #[serde(rename = "open_ok")]
     OpenOk { track_id: &'a str },
+    #[serde(rename = "source")]
+    Source {
+        request_id: u64,
+        track_id: &'a str,
+        stream_id: u64,
+        offset: u64,
+        length: u64,
+        total_length: u64,
+        source_version: &'a str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamRole {
     Active,
     Prefetch,
+    Source,
 }
 
 struct ControlParser {
@@ -178,6 +213,7 @@ struct OutgoingStream {
     quality: TranscodeQuality,
     rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
     _cache_guard: Option<CacheGuard>,
+    _source_guard: Option<source::SourceGuard>,
     pending: VecDeque<Bytes>,
     offset: usize,
     finished: bool,
@@ -187,6 +223,7 @@ struct OutgoingStream {
     last_drain: Instant,
     producer_failure: Option<String>,
     profile: Option<StreamProfile>,
+    _active_stream: crate::network_metrics::ActiveStreamGuard,
 }
 
 impl OutgoingStream {
@@ -200,6 +237,7 @@ impl OutgoingStream {
         quality: TranscodeQuality,
         rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
         _cache_guard: Option<CacheGuard>,
+        active_stream: crate::network_metrics::ActiveStreamGuard,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -213,6 +251,7 @@ impl OutgoingStream {
             quality,
             rx,
             _cache_guard,
+            _source_guard: None,
             pending: VecDeque::new(),
             offset: 0,
             finished: false,
@@ -222,6 +261,7 @@ impl OutgoingStream {
             last_drain: now,
             producer_failure: None,
             profile: None,
+            _active_stream: active_stream,
         }
     }
 
@@ -230,6 +270,7 @@ impl OutgoingStream {
             return;
         }
         while self.buffered_bytes < MAX_STREAM_BUFFER_BYTES
+            && (self.role != StreamRole::Source || self.buffered_bytes == 0)
             && self.pending.len() < (STREAM_QUEUE_MS / self.frame_ms).max(1) as usize
         {
             match self.rx.try_recv() {
@@ -272,11 +313,14 @@ struct SessionState {
     pending_operation: Option<OperationTiming>,
     authed: bool,
     auth_token: Option<zeroize::Zeroizing<String>>,
+    presence: Option<crate::presence::SessionConnection>,
     auth_checked: Instant,
     user_id: Option<String>,
     control_stream: Option<u64>,
     control_outbox: ControlOutbox,
     control_parser: ControlParser,
+    source_pending: Option<source::PendingSource>,
+    source_ready: Option<ReadySource>,
     next_uni_stream_id: u64,
     stream_generation: u64,
     open_request_id: Option<u64>,
@@ -305,11 +349,14 @@ impl SessionState {
             pending_operation: None,
             authed: false,
             auth_token: None,
+            presence: None,
             auth_checked: now,
             user_id: None,
             control_stream: None,
             control_outbox: ControlOutbox::new(),
             control_parser: ControlParser::new(),
+            source_pending: None,
+            source_ready: None,
             next_uni_stream_id: 3,
             stream_generation: 0,
             open_request_id: None,
@@ -337,15 +384,98 @@ impl SessionState {
         self.stream_generation = self.stream_generation.saturating_add(1);
         self.stream_generation
     }
+
+    fn stop_streams(&mut self) {
+        // Drop channel receivers and pinned ranges before waiting for workers.
+        self.outgoing.clear();
+        self.source_pending = None;
+        self.source_ready = None;
+        self.track_streams.clear();
+        self.queue.clear();
+        self.control_outbox.pending.clear();
+        self.control_parser.buffer.clear();
+        self.auth_token = None;
+        self.presence = None;
+        self.authed = false;
+        self.user_id = None;
+    }
 }
 
 struct ClientConn {
     conn: quiche::Connection,
     session: SessionState,
     timeout_at: Option<Instant>,
+    pending_datagram: Option<PendingDatagram>,
+}
+
+struct PendingDatagram {
+    bytes: Vec<u8>,
+    info: quiche::SendInfo,
+}
+
+struct ReadySource {
+    request_id: u64,
+    track_id: String,
+    transfer: source::SourceTransfer,
+}
+
+enum TransportEvent<T> {
+    Shutdown,
+    Tick,
+    SendReady,
+    Incoming(T),
+}
+
+async fn next_transport_event<T>(
+    shutdown: impl std::future::Future<Output = ()>,
+    tick: impl std::future::Future<Output = tokio::time::Instant>,
+    send_ready: impl std::future::Future<Output = ()>,
+    receive: impl std::future::Future<Output = T>,
+) -> TransportEvent<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown => TransportEvent::Shutdown,
+        _ = tick => TransportEvent::Tick,
+        _ = send_ready => TransportEvent::SendReady,
+        incoming = receive => TransportEvent::Incoming(incoming),
+    }
+}
+
+async fn datagram_ready(
+    socket_blocked: bool,
+    deadline: Option<Instant>,
+    writable: impl std::future::Future<Output = ()>,
+) {
+    if socket_blocked {
+        // Tokio clears writable readiness when packet send returns WouldBlock.
+        // An already-due pacing deadline must not spin while the socket is full.
+        writable.await;
+    } else if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline.into()).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn retire_peer_closed_session(
+    session: &mut SessionState,
+    conn: &quiche::Connection,
+    pending_datagram: &mut Option<PendingDatagram>,
+) -> bool {
+    if !conn.is_draining() && !conn.is_closed() && conn.peer_error().is_none() {
+        return false;
+    }
+    // The transport tombstone remains until QUIC's draining deadline, but no
+    // authenticated playback, file or producer should survive the peer close.
+    session.stop_streams();
+    *pending_datagram = None;
+    true
 }
 
 pub async fn run(state: AppState) -> Result<(), String> {
+    if state.shutdown.is_cancelled() {
+        return Ok(());
+    }
     let config = state.config.read().clone();
     if !config.quic_enabled {
         tracing::info!("QUIC disabled in config.");
@@ -355,28 +485,65 @@ pub async fn run(state: AppState) -> Result<(), String> {
     let (cert_path, key_path) = ensure_quic_certs(&state, &config)?;
     let bind_addr = resolve_quic_bind_addr(&config)?;
 
-    let mut quic_config = build_quic_config(&cert_path, &key_path)?;
-    let socket = UdpSocket::bind(bind_addr)
+    let mut quic_config =
+        build_quic_config(&cert_path, &key_path, config.quic_allow_client_migration)?;
+    let network = state.process_metrics.network();
+    let socket = DatagramSocket::bind(&bind_addr)
         .await
         .map_err(|err| format!("quic bind error: {}", err))?;
-    let local_addr = socket
-        .local_addr()
-        .map_err(|err| format!("quic local addr error: {}", err))?;
+    let local_addr = socket.local_addr();
 
     tracing::info!("QUIC listening on {}", local_addr);
 
     let mut connections: HashMap<Vec<u8>, ClientConn> = HashMap::new();
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
-    let mut send_buf = vec![0u8; MAX_UDP_SIZE];
-    let mut pending_udp: VecDeque<(Vec<u8>, std::net::SocketAddr)> = VecDeque::new();
+    let mut recv_buf = vec![0u8; socket.receive_capacity(MAX_QUIC_DATAGRAM)];
+    let mut send_buf = vec![0u8; MAX_QUIC_DATAGRAM];
+    let mut socket_blocked = false;
 
     let mut tick = tokio::time::interval(Duration::from_millis(25));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        tokio::select! {
-            result = socket.recv_from(&mut recv_buf) => {
-                let (len, from) = match result {
+        let send_deadline = connections
+            .values()
+            .filter_map(|client| {
+                client
+                    .pending_datagram
+                    .as_ref()
+                    .map(|packet| packet.info.at)
+            })
+            .min();
+        match next_transport_event(
+            state.shutdown.cancelled(),
+            tick.tick(),
+            datagram_ready(socket_blocked, send_deadline, async {
+                let _ = socket.writable().await;
+            }),
+            socket.recv(&mut recv_buf),
+        )
+        .await
+        {
+            TransportEvent::Shutdown => break,
+            TransportEvent::SendReady => {
+                socket_blocked = false;
+                for client in connections.values_mut() {
+                    let blocked = flush_conn(
+                        &mut client.conn,
+                        &socket,
+                        &mut send_buf,
+                        &mut client.pending_datagram,
+                        &network,
+                    );
+                    client.timeout_at = client.conn.timeout().map(|t| Instant::now() + t);
+                    if blocked {
+                        socket_blocked = true;
+                        break;
+                    }
+                }
+            }
+            TransportEvent::Incoming(result) => {
+                let (len, from, received_to) = match result {
                     Ok(value) => value,
                     Err(err) => {
                         if err.kind() == std::io::ErrorKind::ConnectionReset
@@ -389,6 +556,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                         continue;
                     }
                 };
+                network.record_received(len);
                 let packet = &mut recv_buf[..len];
                 let hdr = match quiche::Header::from_slice(packet, SERVER_CONN_ID_LEN) {
                     Ok(hdr) => hdr,
@@ -403,10 +571,19 @@ pub async fn run(state: AppState) -> Result<(), String> {
                     .cloned()
                     .unwrap_or_else(|| conn_id.clone());
                 if !connections.contains_key(&lookup_id) {
+                    // Unknown/retired short-header IDs must not create a new
+                    // application session or trigger version negotiation.
+                    if hdr.ty != quiche::Type::Initial {
+                        continue;
+                    }
                     if !quiche::version_is_supported(hdr.version) {
                         match quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut send_buf) {
                             Ok(len) => {
-                                let _ = socket.send_to(&send_buf[..len], from).await;
+                                if let Ok(sent) =
+                                    socket.try_send(&send_buf[..len], received_to, from)
+                                {
+                                    network.record_sent(sent);
+                                }
                             }
                             Err(err) => {
                                 tracing::debug!("quic version negotiation failed: {:?}", err);
@@ -414,16 +591,16 @@ pub async fn run(state: AppState) -> Result<(), String> {
                         }
                         continue;
                     }
-                    let scid = generate_cid();
+                    let scid = unused_cid(&conn_id_map);
                     let scid_conn_id = quiche::ConnectionId::from_ref(&scid);
                     let conn = quiche::accept(
                         &scid_conn_id,
                         Some(&hdr.dcid),
-                        local_addr,
+                        received_to,
                         from,
                         &mut quic_config,
                     )
-                        .map_err(|err| format!("quic accept error: {:?}", err))?;
+                    .map_err(|err| format!("quic accept error: {:?}", err))?;
                     let timeout_at = conn.timeout().map(|t| Instant::now() + t);
                     let primary_id = scid.to_vec();
                     connections.insert(
@@ -432,6 +609,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                             conn,
                             session: SessionState::new(),
                             timeout_at,
+                            pending_datagram: None,
                         },
                     );
                     conn_id_map.insert(primary_id.clone(), primary_id.clone());
@@ -446,7 +624,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
 
                 let recv_info = quiche::RecvInfo {
                     from,
-                    to: local_addr,
+                    to: received_to,
                 };
                 if let Err(err) = client.conn.recv(packet, recv_info) {
                     if err != quiche::Error::Done {
@@ -454,25 +632,62 @@ pub async fn run(state: AppState) -> Result<(), String> {
                     }
                     continue;
                 }
-                refresh_conn_ids(&mut conn_id_map, &mut client.conn, &lookup_id);
+                if retire_peer_closed_session(
+                    &mut client.session,
+                    &client.conn,
+                    &mut client.pending_datagram,
+                ) {
+                    continue;
+                }
+                refresh_conn_ids(
+                    &mut conn_id_map,
+                    &mut client.conn,
+                    &lookup_id,
+                    config.quic_allow_client_migration,
+                );
                 handle_readable(&state, client);
+                flush_source_requests(&state, client);
                 flush_control(&mut client.session, &mut client.conn);
                 flush_streams(&mut client.session, &mut client.conn);
 
-                flush_conn(&mut client.conn, &socket, &mut send_buf, &mut pending_udp);
+                if !socket_blocked {
+                    socket_blocked = flush_conn(
+                        &mut client.conn,
+                        &socket,
+                        &mut send_buf,
+                        &mut client.pending_datagram,
+                        &network,
+                    );
+                }
                 client.timeout_at = client.conn.timeout().map(|t| Instant::now() + t);
             }
-            _ = tick.tick() => {
+            TransportEvent::Tick => {
                 let now = Instant::now();
                 let mut closed = Vec::new();
                 for (id, client) in connections.iter_mut() {
-                    if client.session.authed && client.session.auth_checked.elapsed() >= Duration::from_secs(1) {
+                    retire_peer_closed_session(
+                        &mut client.session,
+                        &client.conn,
+                        &mut client.pending_datagram,
+                    );
+                    if client.session.authed
+                        && client.session.auth_checked.elapsed() >= Duration::from_secs(1)
+                    {
                         client.session.auth_checked = now;
-                        let valid = client.session.auth_token.as_ref().is_some_and(|token| state.auth.user_from_token(token).is_ok_and(|user| user.is_some()));
+                        let valid = client.session.auth_token.as_ref().is_some_and(|token| {
+                            state
+                                .auth
+                                .user_from_token(token)
+                                .is_ok_and(|user| user.is_some())
+                        });
                         if !valid {
                             client.session.authed = false;
                             client.session.auth_token = None;
+                            client.session.presence = None;
                             client.session.outgoing.clear();
+                            client.session.source_pending = None;
+                            client.session.source_ready = None;
+                            client.pending_datagram = None;
                             let _ = client.conn.close(true, 401, b"session expired or revoked");
                         }
                     }
@@ -505,32 +720,55 @@ pub async fn run(state: AppState) -> Result<(), String> {
                         closed.push(id.clone());
                         continue;
                     }
-                    refresh_conn_ids(&mut conn_id_map, &mut client.conn, id);
+                    if client.conn.is_draining() || client.conn.peer_error().is_some() {
+                        continue;
+                    }
+                    refresh_conn_ids(
+                        &mut conn_id_map,
+                        &mut client.conn,
+                        id,
+                        config.quic_allow_client_migration,
+                    );
                     handle_readable(&state, client);
+                    flush_source_requests(&state, client);
                     flush_control(&mut client.session, &mut client.conn);
                     flush_streams(&mut client.session, &mut client.conn);
-                    flush_conn(&mut client.conn, &socket, &mut send_buf, &mut pending_udp);
+                    if !socket_blocked {
+                        socket_blocked = flush_conn(
+                            &mut client.conn,
+                            &socket,
+                            &mut send_buf,
+                            &mut client.pending_datagram,
+                            &network,
+                        );
+                    }
                     client.timeout_at = client.conn.timeout().map(|t| Instant::now() + t);
-                    maybe_log_streams(&mut client.session, &client.conn);
+                    maybe_log_streams(&mut client.session, &mut client.conn);
                 }
                 for id in closed {
-                    if let Some(client) = connections.get(&id) {
-                        for scid in client.conn.source_ids() {
-                            conn_id_map.remove(scid.as_ref());
-                        }
-                    }
+                    // This also removes the original destination CID alias,
+                    // which isn't one of the server's source IDs.
+                    conn_id_map.retain(|_, owner| owner != &id);
                     connections.remove(&id);
-                    conn_id_map.remove(&id);
                 }
             }
         }
     }
+    for client in connections.values_mut() {
+        client.session.stop_streams();
+        client.pending_datagram = None;
+        let _ = client.conn.close(true, 0, b"server shutting down");
+    }
+    connections.clear();
+    conn_id_map.clear();
+    Ok(())
 }
 
 fn refresh_conn_ids(
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     conn: &mut quiche::Connection,
     primary_id: &Vec<u8>,
+    allow_migration: bool,
 ) {
     for scid in conn.source_ids() {
         conn_id_map
@@ -539,6 +777,42 @@ fn refresh_conn_ids(
     }
     while let Some(retired) = conn.retired_scid_next() {
         conn_id_map.remove(retired.as_ref());
+    }
+    if allow_migration && conn.is_established() && !conn.is_draining() && !conn.is_closed() {
+        // quiche queues NEW_CONNECTION_ID inside new_scid. Install dispatch
+        // before the caller can drain conn.send and announce the new ID.
+        for _ in 0..conn.scids_left() {
+            let cid = unused_cid(conn_id_map);
+            let mut reset_token = [0; 16];
+            rand::rng().fill_bytes(&mut reset_token);
+            match conn.new_scid(
+                &quiche::ConnectionId::from_ref(&cid),
+                u128::from_be_bytes(reset_token),
+                false,
+            ) {
+                Ok(_) => {
+                    conn_id_map.insert(cid, primary_id.clone());
+                }
+                Err(error) => {
+                    tracing::debug!("QUIC spare connection ID unavailable: {:?}", error);
+                    break;
+                }
+            }
+        }
+    }
+    while let Some(event) = conn.path_event_next() {
+        // quiche validates new peer paths. Observing a path never recreates
+        // SessionState, authentication, source producers or stream owners.
+        tracing::debug!("QUIC path event: {:?}", event);
+    }
+}
+
+fn unused_cid(routes: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    loop {
+        let cid = generate_cid();
+        if !routes.contains_key(&cid) {
+            return cid;
+        }
     }
 }
 
@@ -555,7 +829,11 @@ fn ensure_quic_certs(
     crate::tls::identity(config, &state.config_path, true).map_err(|error| error.to_string())
 }
 
-fn build_quic_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<quiche::Config, String> {
+fn build_quic_config(
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+    allow_migration: bool,
+) -> Result<quiche::Config, String> {
     let mut config =
         quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("{:?}", e))?;
     config
@@ -585,7 +863,10 @@ fn build_quic_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<quiche::
     config.set_initial_max_stream_data_uni(10_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(32);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(!allow_migration);
+    if allow_migration {
+        config.set_active_connection_id_limit(MIGRATION_CONNECTION_ID_LIMIT);
+    }
     Ok(config)
 }
 
@@ -623,6 +904,9 @@ fn handle_readable(state: &AppState, client: &mut ClientConn) {
 }
 
 fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: ControlMessage) {
+    if let Some(presence) = &client.session.presence {
+        presence.touch();
+    }
     match msg {
         ControlMessage::Auth { token } => {
             tracing::info!("QUIC auth attempt");
@@ -639,6 +923,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             }
             match state.auth.user_from_token(&token) {
                 Ok(Some(user)) => {
+                    client.session.presence = Some(state.auth.connect_session(&token));
                     client.session.authed = true;
                     client.session.auth_token = Some(zeroize::Zeroizing::new(token));
                     client.session.auth_checked = Instant::now();
@@ -683,6 +968,82 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 }
             }
         }
+        ControlMessage::SourceRange {
+            request_id,
+            track_id,
+            offset,
+            length,
+            source_version,
+        } => {
+            if !client.session.authed {
+                send_control(
+                    client,
+                    ControlResponse::Error {
+                        message: "unauthorized",
+                        request_id: Some(request_id),
+                    },
+                );
+                return;
+            }
+            cancel_source_ranges(&mut client.session, &mut client.conn);
+            if let Err(error) = start_source_request(
+                state,
+                &mut client.session,
+                track_id,
+                request_id,
+                offset,
+                Some(length),
+                source_version,
+            ) {
+                send_control(
+                    client,
+                    ControlResponse::Error {
+                        message: &error,
+                        request_id: Some(request_id),
+                    },
+                );
+            }
+        }
+        ControlMessage::SourceOpen {
+            request_id,
+            track_id,
+            offset,
+            source_version,
+        } => {
+            if !client.session.authed {
+                send_control(
+                    client,
+                    ControlResponse::Error {
+                        message: "unauthorized",
+                        request_id: Some(request_id),
+                    },
+                );
+                return;
+            }
+            cancel_source_ranges(&mut client.session, &mut client.conn);
+            if let Err(error) = start_source_request(
+                state,
+                &mut client.session,
+                track_id,
+                request_id,
+                offset,
+                None,
+                source_version,
+            ) {
+                send_control(
+                    client,
+                    ControlResponse::Error {
+                        message: &error,
+                        request_id: Some(request_id),
+                    },
+                );
+            }
+        }
+        ControlMessage::Cancel { stream_id } => {
+            if client.session.authed {
+                cancel_stream(&mut client.session, &mut client.conn, stream_id);
+            }
+        }
         ControlMessage::Open {
             request_id,
             track_id,
@@ -711,6 +1072,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 return;
             }
             client.session.open_request_id = request_id;
+            cancel_source_ranges(&mut client.session, &mut client.conn);
             client.session.pending_seek_id = None;
             client.session.pending_operation =
                 OperationTiming::new(client.session.profile_id, "open", request_id, None);
@@ -826,6 +1188,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 return;
             }
             client.session.open_request_id = request_id;
+            cancel_source_ranges(&mut client.session, &mut client.conn);
             client.session.pending_seek_id = Some(seek_id);
             client.session.pending_operation =
                 OperationTiming::new(client.session.profile_id, "seek", request_id, Some(seek_id));
@@ -957,6 +1320,9 @@ fn prune_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     }
     let mut remove_ids = Vec::new();
     for (stream_id, outgoing) in session.outgoing.iter() {
+        if outgoing.role == StreamRole::Source {
+            continue;
+        }
         if outgoing.generation != session.stream_generation || !allowed.contains(&outgoing.track_id)
         {
             remove_ids.push((*stream_id, outgoing.track_id.clone()));
@@ -1011,6 +1377,9 @@ fn spawn_track_transcode(
     start_ms: u32,
     operation: Option<OperationTiming>,
 ) -> Result<PreparedRangeStream, String> {
+    if state.shutdown.is_cancelled() {
+        return Err("server shutting down".into());
+    }
     let library = state
         .library_state
         .read()
@@ -1033,7 +1402,6 @@ fn spawn_track_transcode(
         .map_err(|error| error.to_string())?;
     let source_version = key.source_version().to_owned();
     let end_of_track = range_end_ms >= meta.duration_ms;
-    debug_assert_eq!(MEMORY_CACHE_MAX_BYTES, 256 * 1024 * 1024);
     let shared = state.stream_cache.enabled();
     let writer = state
         .stream_cache
@@ -1069,8 +1437,17 @@ fn spawn_track_transcode(
         let permits = Arc::clone(
             PRODUCERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_RANGE_PRODUCERS))),
         );
-        tokio::spawn(async move {
-            let Ok(permit) = permits.acquire_owned().await else {
+        let shutdown = state.shutdown.clone();
+        state.shutdown.spawn(async move {
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    writer.fail("server shutting down");
+                    return;
+                }
+                permit = permits.acquire_owned() => permit,
+            };
+            let Ok(permit) = permit else {
                 writer.fail("range producer unavailable");
                 return;
             };
@@ -1078,43 +1455,34 @@ fn spawn_track_transcode(
                 writer.fail("range request superseded before production");
                 return;
             }
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let selector = BitrateSelector {
-                    quality,
-                    fixed_bitrate_bps: None,
-                };
-                match crate::transcode::transcode_raw_opus_range_cache(
-                    &path,
-                    selector,
-                    frame_ms,
-                    meta,
-                    range_start_ms,
-                    range_end_ms,
-                    &mut writer,
-                ) {
-                    Ok(()) => {
-                        let _ = writer.finalize();
-                    }
-                    Err(error) => {
-                        tracing::warn!("range transcode failed: {}", error);
-                        writer.fail(error);
-                    }
-                }
-            })
+            if let Err(error) = crate::workers::transcode(
+                &shutdown,
+                &path,
+                quality,
+                frame_ms,
+                meta,
+                range_start_ms,
+                range_end_ms,
+                writer,
+                permit,
+            )
             .await
-            .ok();
+            {
+                if !shutdown.is_cancelled() {
+                    tracing::warn!("range transcode worker failed: {}", error);
+                }
+            }
         });
     }
     let queue_frames = (STREAM_QUEUE_MS / frame_ms).max(1) as usize;
     let (tx, rx) = tokio::sync::mpsc::channel(queue_frames);
-    tokio::task::spawn_blocking(move || {
+    state.shutdown.spawn_blocking(move || {
         if let Some(timing) = operation {
             timing.stage("source_prepared");
         }
         if let Err(error) = reader.stream_to(position_ms, &tx) {
             if !tx.is_closed() {
-                let _ = tx.blocking_send(Err(std::io::Error::other(error)));
+                let _ = reader.send_error(&tx, error);
             }
         }
     });
@@ -1143,9 +1511,24 @@ fn range_bounds(position_ms: u32, duration_ms: u32) -> (u32, u32) {
 
 fn remove_track_stream(session: &mut SessionState, conn: &mut quiche::Connection, track_id: &str) {
     if let Some(stream_id) = session.track_streams.remove(track_id) {
-        session.outgoing.remove(&stream_id);
-        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+        cancel_stream(session, conn, stream_id);
     }
+}
+
+fn cancel_stream(session: &mut SessionState, conn: &mut quiche::Connection, stream_id: u64) {
+    // Stream IDs are scoped to this connection. Never let a stale cancellation
+    // remove its replacement, a control stream, or a stream not yet allocated.
+    if stream_id % 4 != 3 || stream_id >= session.next_uni_stream_id {
+        return;
+    }
+    if let Some(outgoing) = session.outgoing.remove(&stream_id) {
+        if session.track_streams.get(&outgoing.track_id) == Some(&stream_id) {
+            session.track_streams.remove(&outgoing.track_id);
+        }
+    }
+    // A finished producer may already be absent while QUIC still owns its
+    // buffered audio. Reset that stream too, so the client can collect it.
+    let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
 }
 
 fn start_track_stream(
@@ -1188,7 +1571,8 @@ fn start_track_stream(
         state, &track_id, frame_ms, mode, quality, start_ms, operation,
     )?;
 
-    let stream_id = client.session.next_server_uni_stream();
+    let stream_id = create_server_uni_stream(&mut client.session, &mut client.conn)
+        .map_err(|error| format!("stream capacity unavailable: {error:?}"))?;
     client
         .session
         .track_streams
@@ -1205,6 +1589,7 @@ fn start_track_stream(
             quality,
             prepared.rx,
             Some(prepared.guard),
+            state.process_metrics.network().stream_started(),
         ),
     );
     if let Some(outgoing) = client.session.outgoing.get_mut(&stream_id) {
@@ -1225,6 +1610,7 @@ fn start_track_stream(
     let role_label = match role {
         StreamRole::Active => "active",
         StreamRole::Prefetch => "prefetch",
+        StreamRole::Source => "source",
     };
     send_control(
         client,
@@ -1250,6 +1636,194 @@ fn seek_reset_frame(seek_id: u32) -> Bytes {
     marker.extend_from_slice(&SEEK_RESET_MARKER.to_le_bytes());
     marker.extend_from_slice(&seek_id.to_le_bytes());
     Bytes::from(marker)
+}
+
+fn cancel_source_ranges(session: &mut SessionState, conn: &mut quiche::Connection) {
+    // Dropping pending demand cancels its tracked read. Any late result owns
+    // only its old one-shot receiver and cannot be attached to a new request.
+    session.source_pending = None;
+    session.source_ready = None;
+    let streams: Vec<u64> = session
+        .outgoing
+        .iter()
+        .filter(|(_, outgoing)| outgoing.role == StreamRole::Source)
+        .map(|(stream_id, _)| *stream_id)
+        .collect();
+    for stream_id in streams {
+        session.outgoing.remove(&stream_id);
+        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+    }
+}
+
+fn start_source_request(
+    state: &AppState,
+    session: &mut SessionState,
+    track_id: String,
+    request_id: u64,
+    offset: u64,
+    length: Option<u32>,
+    source_version: Option<String>,
+) -> Result<(), String> {
+    let library = state
+        .library_state
+        .read()
+        .library
+        .clone()
+        .ok_or("library not ready")?;
+    let track = library
+        .get_track(&track_id)
+        .map_err(|error| error.to_string())?
+        .ok_or("track not found")?;
+    let path = library
+        .resolve_relpath(&track.file_relpath)
+        .ok_or("music root not configured")?;
+    session.source_pending = Some(match length {
+        Some(length) => source::prepare(
+            &state.shutdown,
+            track_id,
+            path,
+            request_id,
+            offset,
+            length,
+            source_version,
+        )?,
+        None => source::prepare_open(
+            &state.shutdown,
+            track_id,
+            path,
+            request_id,
+            offset,
+            source_version,
+        )?,
+    });
+    Ok(())
+}
+
+fn flush_source_requests(state: &AppState, client: &mut ClientConn) {
+    if !client.session.authed || state.shutdown.is_cancelled() {
+        client.session.source_pending = None;
+        client.session.source_ready = None;
+        return;
+    }
+    if client.session.source_ready.is_none() {
+        let ready = client
+            .session
+            .source_pending
+            .as_mut()
+            .and_then(|pending| pending.take_ready());
+        let Some(ready) = ready else {
+            return;
+        };
+        let pending = client
+            .session
+            .source_pending
+            .take()
+            .expect("ready source request");
+        match ready {
+            Ok(transfer) => {
+                client.session.source_ready = Some(ReadySource {
+                    request_id: pending.request_id,
+                    track_id: pending.track_id.clone(),
+                    transfer,
+                })
+            }
+            Err(error) => {
+                send_control(
+                    client,
+                    ControlResponse::Error {
+                        message: &error,
+                        request_id: Some(pending.request_id),
+                    },
+                );
+                return;
+            }
+        }
+    }
+    flush_source_ready(
+        &mut client.session,
+        &mut client.conn,
+        &state.process_metrics.network(),
+    );
+}
+
+fn flush_source_ready(
+    session: &mut SessionState,
+    conn: &mut quiche::Connection,
+    network: &crate::network_metrics::NetworkMetrics,
+) {
+    if session.source_ready.is_none() {
+        return;
+    }
+    let stream_id = match create_server_uni_stream(session, conn) {
+        Ok(stream_id) => stream_id,
+        // The peer can be returning credit for a superseded stream. Retain
+        // ownership and retry without consuming another ID or announcing a
+        // stream that transport cancellation could not subsequently reset.
+        Err(quiche::Error::StreamLimit) => return,
+        Err(error) => {
+            let ready = session.source_ready.take().expect("ready source transfer");
+            let message = format!("source stream unavailable: {error:?}");
+            enqueue_control(
+                &mut session.control_outbox,
+                ControlResponse::Error {
+                    message: &message,
+                    request_id: Some(ready.request_id),
+                },
+            );
+            return;
+        }
+    };
+    let ReadySource {
+        request_id,
+        track_id,
+        transfer,
+    } = session.source_ready.take().expect("ready source transfer");
+    let source::SourceTransfer {
+        offset,
+        length,
+        total_length,
+        source_version,
+        rx,
+        guard,
+    } = transfer;
+    let mut outgoing = OutgoingStream::new(
+        stream_id,
+        session.stream_generation,
+        track_id.clone(),
+        StreamRole::Source,
+        20,
+        TranscodeMode::Fixed,
+        TranscodeQuality::High,
+        rx,
+        None,
+        network.stream_started(),
+    );
+    outgoing.request_id = Some(request_id);
+    outgoing._source_guard = Some(guard);
+    session.outgoing.insert(stream_id, outgoing);
+    enqueue_control(
+        &mut session.control_outbox,
+        ControlResponse::Source {
+            request_id,
+            track_id: &track_id,
+            stream_id,
+            offset,
+            length,
+            total_length,
+            source_version: &source_version,
+        },
+    );
+}
+
+fn create_server_uni_stream(
+    session: &mut SessionState,
+    conn: &mut quiche::Connection,
+) -> Result<u64, quiche::Error> {
+    let stream_id = session.next_uni_stream_id;
+    // Creating an empty, unfinished stream emits no source bytes but gives
+    // RESET_STREAM a transport state to retire if preparation is superseded.
+    conn.stream_send(stream_id, &[], false)?;
+    Ok(session.next_server_uni_stream())
 }
 
 fn enqueue_control(outbox: &mut ControlOutbox, message: ControlResponse<'_>) {
@@ -1306,7 +1880,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     let active_paused = active_backpressure_paused(session, now);
     let active_track = session.active_track.clone();
     for (stream_id, outgoing) in session.outgoing.iter() {
-        if outgoing.role == StreamRole::Active {
+        if outgoing.role != StreamRole::Prefetch {
             active_ids.push(*stream_id);
         } else {
             prefetch_ids.push(*stream_id);
@@ -1341,6 +1915,14 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
         }
         outgoing.drain_incoming();
         if let Some(failure) = outgoing.producer_failure.take() {
+            if outgoing.role == StreamRole::Source {
+                // A source error must never become successful EOF, even when
+                // all announced bytes preceded a final identity-check failure.
+                active_failures.push((outgoing.track_id.clone(), failure, outgoing.request_id));
+                let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 1);
+                finished.push((stream_id, outgoing.track_id.clone()));
+                continue;
+            }
             if outgoing.role == StreamRole::Active
                 && active_track.as_deref() == Some(outgoing.track_id.as_str())
             {
@@ -1398,7 +1980,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
                             stream_id,
                             err
                         );
-                        if outgoing.role == StreamRole::Active {
+                        if outgoing.role != StreamRole::Prefetch {
                             active_failures.push((
                                 outgoing.track_id.clone(),
                                 err.to_string(),
@@ -1419,7 +2001,7 @@ fn flush_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
                 Ok(_) => {}
                 Err(quiche::Error::Done) => continue,
                 Err(error) => {
-                    if !peer_cancelled_stream(&error) && outgoing.role == StreamRole::Active {
+                    if !peer_cancelled_stream(&error) && outgoing.role != StreamRole::Prefetch {
                         active_failures.push((
                             outgoing.track_id.clone(),
                             error.to_string(),
@@ -1462,7 +2044,7 @@ fn remove_finished_streams(session: &mut SessionState, streams: Vec<(u64, String
     }
 }
 
-fn maybe_log_streams(session: &mut SessionState, conn: &quiche::Connection) {
+fn maybe_log_streams(session: &mut SessionState, conn: &mut quiche::Connection) {
     let now = Instant::now();
     if now.duration_since(session.last_debug) < Duration::from_secs(5) {
         return;
@@ -1522,51 +2104,67 @@ fn maybe_log_streams(session: &mut SessionState, conn: &quiche::Connection) {
     }
 }
 
-fn flush_udp_queue(socket: &UdpSocket, pending: &mut VecDeque<(Vec<u8>, std::net::SocketAddr)>) {
-    while let Some((packet, addr)) = pending.pop_front() {
-        match socket.try_send_to(&packet, addr) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                pending.push_front((packet, addr));
-                tracing::debug!("quic send stalled with {} queued datagrams", pending.len());
-                break;
-            }
-            Err(err) => {
-                tracing::debug!("quic pending send error: {:?}", err);
-            }
-        }
-    }
-}
-
 fn flush_conn(
     conn: &mut quiche::Connection,
-    socket: &UdpSocket,
+    socket: &DatagramSocket,
     out: &mut [u8],
-    pending: &mut VecDeque<(Vec<u8>, std::net::SocketAddr)>,
-) {
-    flush_udp_queue(socket, pending);
-    if !pending.is_empty() {
-        return;
-    }
+    pending: &mut Option<PendingDatagram>,
+    network: &crate::network_metrics::NetworkMetrics,
+) -> bool {
+    flush_conn_datagrams(conn, out, pending, Instant::now, |bytes, info| {
+        let sent = socket.try_send(bytes, info.from, info.to)?;
+        network.record_sent(sent);
+        Ok(sent)
+    })
+}
 
+// Returns true only when socket writable readiness must be awaited. Each peer
+// owns at most one encoded datagram; its future pacing deadline cannot block
+// another peer, and transport buffers retain all other unsent payload.
+fn flush_conn_datagrams(
+    conn: &mut quiche::Connection,
+    out: &mut [u8],
+    pending: &mut Option<PendingDatagram>,
+    mut now: impl FnMut() -> Instant,
+    mut send: impl FnMut(&[u8], quiche::SendInfo) -> std::io::Result<usize>,
+) -> bool {
+    if conn.is_draining() || conn.is_closed() || conn.peer_error().is_some() {
+        *pending = None;
+        return false;
+    }
+    let mut sent_packets = 0;
     loop {
-        match conn.send(out) {
-            Ok((len, send_info)) => match socket.try_send_to(&out[..len], send_info.to) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    pending.push_back((out[..len].to_vec(), send_info.to));
-                    tracing::debug!("quic send backpressure queued {} datagrams", pending.len());
-                    break;
+        if pending.is_none() {
+            match conn.send(out) {
+                Ok((len, info)) => {
+                    *pending = Some(PendingDatagram {
+                        bytes: out[..len].to_vec(),
+                        info,
+                    });
                 }
+                Err(quiche::Error::Done) => return false,
                 Err(err) => {
                     tracing::debug!("quic send error: {:?}", err);
-                    break;
+                    return false;
                 }
-            },
-            Err(quiche::Error::Done) => break,
+            }
+        }
+        let packet = pending.as_ref().unwrap();
+        if packet.info.at > now() || sent_packets == MAX_DATAGRAMS_PER_FLUSH {
+            // The due packet also schedules a new event when the burst budget
+            // is reached, yielding to shutdown and transport ticks first.
+            return false;
+        }
+        match send(&packet.bytes, packet.info) {
+            Ok(_) => {
+                *pending = None;
+                sent_packets += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return true,
             Err(err) => {
+                *pending = None;
                 tracing::debug!("quic send error: {:?}", err);
-                break;
+                return false;
             }
         }
     }
@@ -1579,6 +2177,624 @@ fn is_bidi_stream(stream_id: u64) -> bool {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    struct TestIdentity {
+        directory: PathBuf,
+    }
+
+    impl TestIdentity {
+        fn new() -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!("phonolite-quic-lifecycle-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let pair = rcgen::generate_simple_self_signed(vec!["quic.tech".into()]).unwrap();
+            std::fs::write(directory.join("cert.pem"), pair.cert.pem()).unwrap();
+            std::fs::write(directory.join("key.pem"), pair.key_pair.serialize_pem()).unwrap();
+            Self { directory }
+        }
+
+        fn pipe(&self, streams: u64) -> quiche::test_utils::Pipe {
+            self.paced_pipe(streams, None)
+        }
+
+        fn paced_pipe(
+            &self,
+            streams: u64,
+            max_pacing_rate: Option<u64>,
+        ) -> quiche::test_utils::Pipe {
+            self.configured_pipe(streams, max_pacing_rate, None)
+        }
+
+        fn configured_pipe(
+            &self,
+            streams: u64,
+            max_pacing_rate: Option<u64>,
+            initial_window_packets: Option<usize>,
+        ) -> quiche::test_utils::Pipe {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            config
+                .load_cert_chain_from_pem_file(self.directory.join("cert.pem").to_str().unwrap())
+                .unwrap();
+            config
+                .load_priv_key_from_pem_file(self.directory.join("key.pem").to_str().unwrap())
+                .unwrap();
+            config.set_application_protos(&[b"phonolite-quic"]).unwrap();
+            config.set_initial_max_data(1024 * 1024);
+            config.set_initial_max_stream_data_uni(64 * 1024);
+            config.set_initial_max_streams_uni(streams);
+            config.set_max_send_udp_payload_size(MAX_QUIC_DATAGRAM);
+            if let Some(rate) = max_pacing_rate {
+                config.set_max_pacing_rate(rate);
+            }
+            if let Some(packets) = initial_window_packets {
+                config.set_initial_congestion_window_packets(packets);
+                config.set_initial_max_stream_data_uni(512 * 1024);
+                config.enable_pacing(false);
+            }
+            config.verify_peer(false);
+            let mut pipe = quiche::test_utils::Pipe::with_config(&mut config).unwrap();
+            pipe.handshake().unwrap();
+            pipe
+        }
+    }
+
+    #[tokio::test]
+    async fn paced_datagram_wake_waits_for_socket_readiness_after_would_block() {
+        let due = Some(Instant::now() - Duration::from_secs(1));
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            datagram_ready(true, due, std::future::pending())
+        )
+        .await
+        .is_err());
+        datagram_ready(true, None, std::future::ready(())).await;
+        datagram_ready(false, due, std::future::pending()).await;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            datagram_ready(false, None, std::future::ready(()))
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn paced_datagram_retains_exact_packet_until_due_and_through_socket_backpressure() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.pipe(3);
+        pipe.advance().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let info = quiche::SendInfo {
+            from: "127.0.0.1:443".parse().unwrap(),
+            to: "127.0.0.1:444".parse().unwrap(),
+            at: deadline,
+        };
+        let bytes = vec![9; MAX_QUIC_DATAGRAM];
+        let mut pending = Some(PendingDatagram {
+            bytes: bytes.clone(),
+            info,
+        });
+        let mut output = [0; MAX_QUIC_DATAGRAM];
+        for _ in 0..8 {
+            assert!(!flush_conn_datagrams(
+                &mut pipe.server,
+                &mut output,
+                &mut pending,
+                || deadline - Duration::from_nanos(1),
+                |_, _| panic!("packet sent before quiche's pacing deadline")
+            ));
+            assert_eq!(pending.as_ref().unwrap().bytes, bytes);
+        }
+        for _ in 0..8 {
+            assert!(flush_conn_datagrams(
+                &mut pipe.server,
+                &mut output,
+                &mut pending,
+                || deadline,
+                |packet, send_info| {
+                    assert_eq!(packet, bytes);
+                    assert_eq!(send_info, info);
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                }
+            ));
+            assert_eq!(pending.as_ref().unwrap().bytes.len(), MAX_QUIC_DATAGRAM);
+        }
+        let mut sent = Vec::new();
+        flush_conn_datagrams(
+            &mut pipe.server,
+            &mut output,
+            &mut pending,
+            || deadline,
+            |packet, send_info| {
+                sent.push((packet.to_vec(), send_info));
+                Ok(packet.len())
+            },
+        );
+        assert_eq!(sent.first().unwrap(), &(bytes, info));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn paced_peer_does_not_block_another_peer_and_draining_discards_queued_application_bytes() {
+        let identity = TestIdentity::new();
+        let mut delayed = identity.pipe(3);
+        let mut ready = identity.pipe(3);
+        delayed.advance().unwrap();
+        ready.advance().unwrap();
+        let now = Instant::now();
+        let packet = |at, value| {
+            Some(PendingDatagram {
+                bytes: vec![value; MAX_QUIC_DATAGRAM],
+                info: quiche::SendInfo {
+                    from: "127.0.0.1:443".parse().unwrap(),
+                    to: "127.0.0.1:444".parse().unwrap(),
+                    at,
+                },
+            })
+        };
+        let mut future = packet(now + Duration::from_secs(1), 1);
+        let mut due = packet(now, 2);
+        let mut output = [0; MAX_QUIC_DATAGRAM];
+        assert!(!flush_conn_datagrams(
+            &mut delayed.server,
+            &mut output,
+            &mut future,
+            || now,
+            |_, _| panic!("delayed peer sent early")
+        ));
+        let mut other_sent = false;
+        flush_conn_datagrams(
+            &mut ready.server,
+            &mut output,
+            &mut due,
+            || now,
+            |bytes, _| {
+                other_sent = true;
+                assert_eq!(bytes, vec![2; MAX_QUIC_DATAGRAM]);
+                Ok(bytes.len())
+            },
+        );
+        assert!(other_sent);
+        assert!(due.is_none());
+        assert!(future.is_some());
+        delayed.client.close(true, 0, b"cancel source").unwrap();
+        delayed.advance().unwrap();
+        assert!(delayed.server.is_draining());
+        assert!(!flush_conn_datagrams(
+            &mut delayed.server,
+            &mut output,
+            &mut future,
+            || now + Duration::from_secs(2),
+            |_, _| panic!("retired peer sent queued bytes")
+        ));
+        assert!(future.is_none());
+    }
+
+    #[test]
+    fn datagram_burst_yields_with_one_pending_packet_and_preserves_stream_bytes_and_fin() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.configured_pipe(3, None, Some(256));
+        pipe.advance().unwrap();
+        let expected: Vec<_> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+        assert_eq!(
+            pipe.server.stream_send(3, &expected, true),
+            Ok(expected.len())
+        );
+        let mut pending = None;
+        let mut output = [0; MAX_QUIC_DATAGRAM];
+        let mut received = Vec::new();
+        let mut finished = false;
+        for iteration in 0..16 {
+            let mut flight = Vec::new();
+            assert!(!flush_conn_datagrams(
+                &mut pipe.server,
+                &mut output,
+                &mut pending,
+                Instant::now,
+                |bytes, info| {
+                    flight.push((bytes.to_vec(), info));
+                    Ok(bytes.len())
+                },
+            ));
+            assert!(flight.len() <= MAX_DATAGRAMS_PER_FLUSH);
+            if iteration == 0 {
+                assert_eq!(flight.len(), MAX_DATAGRAMS_PER_FLUSH);
+                assert!(pending.as_ref().unwrap().bytes.len() <= MAX_QUIC_DATAGRAM);
+            }
+            quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+            let mut bytes = [0; 64 * 1024];
+            loop {
+                match pipe.client.stream_recv(3, &mut bytes) {
+                    Ok((length, fin)) => {
+                        received.extend_from_slice(&bytes[..length]);
+                        finished |= fin;
+                        if fin {
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+            if finished {
+                break;
+            }
+            let acknowledgements = quiche::test_utils::emit_flight(&mut pipe.client).unwrap();
+            quiche::test_utils::process_flight(&mut pipe.server, acknowledgements).unwrap();
+        }
+        assert!(finished, "the paced sender must retain final stream FIN");
+        assert_eq!(received, expected);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn delayed_quiche_packets_retain_stream_audio_and_fin() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.pipe(3);
+        pipe.advance().unwrap();
+        let audio = b"audio retained until its release deadline";
+        assert_eq!(pipe.server.stream_send(3, audio, true), Ok(audio.len()));
+        let mut output = [0; MAX_QUIC_DATAGRAM];
+        let (length, mut info) = pipe.server.send(&mut output).unwrap();
+        // Supply a future release time independently of the congestion
+        // controller. Preserve real QUIC bytes to verify audio and FIN too.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        info.at = deadline;
+        let bytes = output[..length].to_vec();
+        let mut pending = Some(PendingDatagram {
+            bytes: bytes.clone(),
+            info,
+        });
+        assert!(!flush_conn_datagrams(
+            &mut pipe.server,
+            &mut output,
+            &mut pending,
+            || deadline - Duration::from_nanos(1),
+            |_, _| panic!("quiche packet was sent early")
+        ));
+        assert_eq!(pending.as_ref().unwrap().info.at, deadline);
+        assert_eq!(pending.as_ref().unwrap().bytes, bytes);
+        let mut flight = Vec::new();
+        assert!(!flush_conn_datagrams(
+            &mut pipe.server,
+            &mut output,
+            &mut pending,
+            || deadline,
+            |bytes, info| {
+                flight.push((bytes.to_vec(), info));
+                Ok(bytes.len())
+            },
+        ));
+        assert_eq!(flight[0].0, bytes);
+        quiche::test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        let mut received = [0; 64];
+        assert_eq!(
+            pipe.client.stream_recv(3, &mut received),
+            Ok((audio.len(), true))
+        );
+        assert_eq!(&received[..audio.len()], audio);
+    }
+
+    impl Drop for TestIdentity {
+        fn drop(&mut self) {
+            for file in ["cert.pem", "key.pem", "source.flac"] {
+                let _ = std::fs::remove_file(self.directory.join(file));
+            }
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_due_ticks_and_shutdown_are_serviced_before_ready_datagrams() {
+        let mut tick = tokio::time::interval(Duration::from_millis(25));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(matches!(
+            next_transport_event(
+                std::future::pending(),
+                tick.tick(),
+                std::future::ready(()),
+                std::future::ready(())
+            )
+            .await,
+            TransportEvent::Tick
+        ));
+        assert!(matches!(
+            next_transport_event(
+                std::future::pending(),
+                std::future::pending(),
+                std::future::pending(),
+                std::future::ready(())
+            )
+            .await,
+            TransportEvent::Incoming(())
+        ));
+        assert!(matches!(
+            next_transport_event(
+                std::future::ready(()),
+                std::future::ready(tokio::time::Instant::now()),
+                std::future::ready(()),
+                std::future::ready(())
+            )
+            .await,
+            TransportEvent::Shutdown
+        ));
+        assert!(matches!(
+            next_transport_event(
+                std::future::pending(),
+                std::future::pending(),
+                std::future::ready(()),
+                std::future::ready(())
+            )
+            .await,
+            TransportEvent::SendReady
+        ));
+    }
+
+    #[test]
+    fn source_announced_streams_return_credit_when_cancelled_before_the_first_byte() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.pipe(3);
+        let mut session = SessionState::new();
+        for _ in 0..64 {
+            let stream_id = create_server_uni_stream(&mut session, &mut pipe.server).unwrap();
+            assert_eq!(
+                pipe.server
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0),
+                Ok(())
+            );
+            pipe.advance().unwrap();
+            let _ = pipe.client.stream_recv(stream_id, &mut [0; 1]);
+            pipe.advance().unwrap();
+        }
+        assert_eq!(session.next_uni_stream_id, 3 + 64 * 4);
+    }
+
+    #[tokio::test]
+    async fn source_waiting_for_peer_stream_credit_retains_ownership_and_reuses_the_id() {
+        let identity = TestIdentity::new();
+        let path = identity.directory.join("source.flac");
+        std::fs::write(&path, vec![7; 2 * 1024 * 1024]).unwrap();
+        let mut pipe = identity.pipe(1);
+        let mut session = SessionState::new();
+        let occupied = create_server_uni_stream(&mut session, &mut pipe.server).unwrap();
+        let shutdown = crate::shutdown::Shutdown::new();
+        let network = crate::network_metrics::NetworkMetrics::default();
+        let mut pending =
+            source::prepare_open(&shutdown, "source".into(), path, 42, 0, None).unwrap();
+        let transfer = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(result) = pending.take_ready() {
+                    break result.unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(pending);
+        session.source_ready = Some(ReadySource {
+            request_id: 42,
+            track_id: "source".into(),
+            transfer,
+        });
+        flush_source_ready(&mut session, &mut pipe.server, &network);
+        assert!(session.source_ready.is_some());
+        assert_eq!(session.next_uni_stream_id, 7);
+        assert!(session.outgoing.is_empty());
+        assert!(session.control_outbox.pending.is_empty());
+        pipe.server
+            .stream_shutdown(occupied, quiche::Shutdown::Write, 0)
+            .unwrap();
+        pipe.advance().unwrap();
+        let _ = pipe.client.stream_recv(occupied, &mut [0; 1]);
+        pipe.advance().unwrap();
+        flush_source_ready(&mut session, &mut pipe.server, &network);
+        assert!(session.source_ready.is_none());
+        assert!(session.outgoing.contains_key(&7));
+        assert!(pipe.server.stream_capacity(7).is_ok());
+        assert_eq!(session.next_uni_stream_id, 11);
+        let response: serde_json::Value =
+            serde_json::from_slice(session.control_outbox.pending.front().unwrap()).unwrap();
+        assert_eq!(response["request_id"], 42);
+        assert_eq!(response["stream_id"], 7);
+        cancel_source_ranges(&mut session, &mut pipe.server);
+        assert!(shutdown.drain(Duration::from_secs(2)).await);
+        assert!(shutdown.pending_jobs().is_empty());
+        assert_eq!(network.active_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_peer_close_releases_pending_ready_and_outgoing_resources_before_draining_ends()
+    {
+        let identity = TestIdentity::new();
+        let path = identity.directory.join("source.flac");
+        std::fs::write(&path, vec![9; 2 * 1024 * 1024]).unwrap();
+        for stage in ["pending", "ready", "outgoing"] {
+            let mut pipe = identity.pipe(3);
+            let mut session = SessionState::new();
+            let shutdown = crate::shutdown::Shutdown::new();
+            let network = crate::network_metrics::NetworkMetrics::default();
+            session.authed = true;
+            session.user_id = Some("listener".into());
+            session.auth_token = Some(zeroize::Zeroizing::new("test token".into()));
+            let mut pending =
+                source::prepare_open(&shutdown, "source".into(), path.clone(), 42, 0, None)
+                    .unwrap();
+            if stage == "pending" {
+                session.source_pending = Some(pending);
+            } else {
+                let transfer = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(result) = pending.take_ready() {
+                            break result.unwrap();
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                drop(pending);
+                session.source_ready = Some(ReadySource {
+                    request_id: 42,
+                    track_id: "source".into(),
+                    transfer,
+                });
+                if stage == "outgoing" {
+                    flush_source_ready(&mut session, &mut pipe.server, &network);
+                    assert_eq!(network.active_streams(), 1);
+                }
+            }
+            pipe.client.close(true, 0, b"source cancelled").unwrap();
+            pipe.advance().unwrap();
+            assert!(pipe.server.peer_error().is_some());
+            assert!(pipe.server.is_draining());
+            assert!(
+                !pipe.server.is_closed(),
+                "transport state must remain available through its draining deadline"
+            );
+            let mut pending_datagram = Some(PendingDatagram {
+                bytes: b"retired encrypted application packet".to_vec(),
+                info: quiche::SendInfo {
+                    from: "127.0.0.1:443".parse().unwrap(),
+                    to: "127.0.0.1:444".parse().unwrap(),
+                    at: Instant::now() + Duration::from_secs(1),
+                },
+            });
+            assert!(retire_peer_closed_session(
+                &mut session,
+                &pipe.server,
+                &mut pending_datagram
+            ));
+            assert!(pending_datagram.is_none());
+            assert!(session.source_pending.is_none());
+            assert!(session.source_ready.is_none());
+            assert!(session.outgoing.is_empty());
+            assert!(!session.authed);
+            assert!(session.auth_token.is_none());
+            assert!(session.user_id.is_none());
+            assert_eq!(network.active_streams(), 0);
+            assert!(shutdown.drain(Duration::from_secs(2)).await);
+            assert!(shutdown.pending_jobs().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_open_control_and_response_keep_continuous_lengths_above_u32() {
+        let mut parser = ControlParser::new();
+        let messages = parser.push(br#"{"type":"source_open","request_id":43,"track_id":"original","offset":4294967319,"source_version":"version"}
+"#);
+        let [ControlMessage::SourceOpen {
+            request_id,
+            track_id,
+            offset,
+            source_version,
+        }] = messages.as_slice()
+        else {
+            panic!("source_open control must be recognized");
+        };
+        assert_eq!(*request_id, 43);
+        assert_eq!(track_id, "original");
+        assert_eq!(*offset, 4_294_967_319);
+        assert_eq!(source_version.as_deref(), Some("version"));
+        let response = serde_json::to_value(ControlResponse::Source {
+            request_id: 43,
+            track_id: "original",
+            stream_id: 7,
+            offset: 0,
+            length: 8_589_934_592,
+            total_length: 8_589_934_592,
+            source_version: "version",
+        })
+        .unwrap();
+        assert_eq!(response["length"], 8_589_934_592u64);
+    }
+    #[test]
+    fn source_range_control_preserves_large_offsets_and_request_identity() {
+        let mut parser = ControlParser::new();
+        let messages = parser.push(br#"{"type":"source_range","request_id":42,"track_id":"original","offset":4294967319,"length":262144,"source_version":"version"}
+"#);
+        let [ControlMessage::SourceRange {
+            request_id,
+            track_id,
+            offset,
+            length,
+            source_version,
+        }] = messages.as_slice()
+        else {
+            panic!("source_range control must be recognized");
+        };
+        assert_eq!(*request_id, 42);
+        assert_eq!(track_id, "original");
+        assert_eq!(*offset, 4_294_967_319);
+        assert_eq!(*length, source::MAX_SOURCE_RANGE_BYTES);
+        assert_eq!(source_version.as_deref(), Some("version"));
+    }
+
+    #[test]
+    fn source_range_response_identifies_exact_unframed_payload() {
+        let response = ControlResponse::Source {
+            request_id: 42,
+            track_id: "original",
+            stream_id: 11,
+            offset: 4_294_967_319,
+            length: 262_144,
+            total_length: 8_589_934_592,
+            source_version: "version",
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["type"], "source");
+        assert_eq!(json["request_id"], 42);
+        assert_eq!(json["stream_id"], 11);
+        assert_eq!(json["offset"], 4_294_967_319u64);
+        assert_eq!(json["length"], 262_144);
+        assert_eq!(json["total_length"], 8_589_934_592u64);
+        assert_eq!(json["source_version"], "version");
+        assert!(json.get("frame_ms").is_none());
+    }
+
+    #[test]
+    fn source_range_outgoing_keeps_byte_budget_and_never_adds_opus_framing() {
+        let expected: Vec<u8> = (0..source::MAX_SOURCE_RANGE_BYTES)
+            .map(|index| (index * 37) as u8)
+            .collect();
+        let network = crate::network_metrics::NetworkMetrics::default();
+        let mut outgoing = OutgoingStream::new(
+            3,
+            0,
+            "original".into(),
+            StreamRole::Source,
+            20,
+            TranscodeMode::Fixed,
+            TranscodeQuality::High,
+            source::window_receiver(Bytes::copy_from_slice(&expected)),
+            None,
+            network.stream_started(),
+        );
+        let mut actual = Vec::new();
+        while !outgoing.finished || !outgoing.pending.is_empty() {
+            outgoing.drain_incoming();
+            assert!(outgoing.buffered_bytes <= MAX_STREAM_BUFFER_BYTES);
+            if let Some(bytes) = outgoing.pending.front() {
+                // QUIC may accept only part of a source chunk. The next drain
+                // must not add another full chunk over the remaining byte cap.
+                let end = bytes.len().min(outgoing.offset + 16 * 1024);
+                actual.extend_from_slice(&bytes[outgoing.offset..end]);
+                outgoing.buffered_bytes -= end - outgoing.offset;
+                outgoing.offset = end;
+                if outgoing.offset == bytes.len() {
+                    outgoing.pending.pop_front();
+                    outgoing.offset = 0;
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        assert!(outgoing.producer_failure.is_none());
+        assert_eq!(network.active_streams(), 1);
+        drop(outgoing);
+        assert_eq!(network.active_streams(), 0);
+    }
+
     #[test]
     fn request_generation_and_seek_range_are_announced_out_of_band() {
         let response = ControlResponse::Stream {
@@ -1680,6 +2896,7 @@ mod streaming_tests {
             TranscodeQuality::High,
             rx,
             None,
+            crate::network_metrics::NetworkMetrics::default().stream_started(),
         );
         stream.drain_incoming();
         assert_eq!(stream.pending.len(), 20);
@@ -1702,9 +2919,39 @@ mod streaming_tests {
         assert_eq!(seek_reset_frame(9).as_ref(), &[255, 255, 9, 0, 0, 0]);
     }
     #[test]
+    fn cancelled_audio_returns_credit_even_after_the_producer_has_finished() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.pipe(3);
+        let mut session = SessionState::new();
+        let audio = [7; 8 * 1024];
+        for _ in 0..64 {
+            let stream_id = create_server_uni_stream(&mut session, &mut pipe.server).unwrap();
+            assert_eq!(
+                pipe.server.stream_send(stream_id, &audio, false),
+                Ok(audio.len())
+            );
+            pipe.advance().unwrap();
+            // The application can remove a finished producer before QUIC has
+            // delivered its buffered bytes. Cancellation must still reset it.
+            assert!(session.outgoing.is_empty());
+            cancel_stream(&mut session, &mut pipe.server, stream_id);
+            pipe.advance().unwrap();
+            assert_eq!(
+                pipe.client.stream_discard(stream_id, usize::MAX),
+                Err(quiche::Error::StreamReset(0))
+            );
+            pipe.advance().unwrap();
+        }
+    }
+
+    #[test]
     fn cancelled_stream_releases_paused_reader_and_preserves_current_replacement() {
+        let identity = TestIdentity::new();
+        let mut pipe = identity.pipe(3);
+        let network = crate::network_metrics::NetworkMetrics::default();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut session = SessionState::new();
+        session.next_uni_stream_id = 11;
         session.client_buffer_ms = 10000;
         session.track_streams.insert("track".into(), 7);
         session.outgoing.insert(
@@ -1719,15 +2966,73 @@ mod streaming_tests {
                 TranscodeQuality::High,
                 rx,
                 None,
+                network.stream_started(),
             ),
         );
+        assert_eq!(network.active_streams(), 1);
         tx.try_send(Ok(Bytes::from_static(&[1, 0, 2]))).unwrap();
         assert!(peer_cancelled_stream(&quiche::Error::StreamStopped(0)));
         assert!(peer_cancelled_stream(&quiche::Error::StreamReset(0)));
         assert!(!peer_cancelled_stream(&quiche::Error::Done));
-        remove_finished_streams(&mut session, vec![(3, "track".into())]);
+        cancel_stream(&mut session, &mut pipe.server, 3);
         assert!(tx.is_closed());
         assert!(session.outgoing.is_empty());
+        assert_eq!(network.active_streams(), 0);
         assert_eq!(session.track_streams.get("track"), Some(&7));
+        cancel_stream(&mut session, &mut pipe.server, 7);
+        assert_eq!(session.track_streams.get("track"), Some(&7));
+        cancel_stream(&mut session, &mut pipe.server, 0);
+        cancel_stream(&mut session, &mut pipe.server, 11);
+        assert_eq!(session.next_uni_stream_id, 11);
+        let message: ControlMessage =
+            serde_json::from_str(r#"{"type":"cancel","stream_id":3}"#).unwrap();
+        assert!(matches!(message, ControlMessage::Cancel { stream_id: 3 }));
+    }
+
+    #[test]
+    fn stopping_a_session_closes_all_paused_output_channels_and_drops_buffers() {
+        let network = crate::network_metrics::NetworkMetrics::default();
+        let mut session = SessionState::new();
+        let mut senders = Vec::new();
+        for stream_id in [3, 7] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(Bytes::from_static(&[1]))).unwrap();
+            let track_id = format!("track-{stream_id}");
+            session.track_streams.insert(track_id.clone(), stream_id);
+            let mut outgoing = OutgoingStream::new(
+                stream_id,
+                1,
+                track_id,
+                StreamRole::Active,
+                20,
+                TranscodeMode::Fixed,
+                TranscodeQuality::High,
+                rx,
+                None,
+                network.stream_started(),
+            );
+            outgoing.pending.push_back(Bytes::from_static(&[2]));
+            session.outgoing.insert(stream_id, outgoing);
+            senders.push(tx);
+        }
+        session.queue.push_back("next".into());
+        session
+            .control_outbox
+            .enqueue(Bytes::from_static(b"pending control"));
+        session
+            .control_parser
+            .buffer
+            .extend_from_slice(b"partial control");
+        session.auth_token = Some(zeroize::Zeroizing::new("session-secret".into()));
+        assert_eq!(network.active_streams(), 2);
+        session.stop_streams();
+        assert_eq!(network.active_streams(), 0);
+        assert!(senders.iter().all(|tx| tx.is_closed()));
+        assert!(session.outgoing.is_empty());
+        assert!(session.track_streams.is_empty());
+        assert!(session.queue.is_empty());
+        assert!(session.control_outbox.pending.is_empty());
+        assert!(session.control_parser.buffer.is_empty());
+        assert!(session.auth_token.is_none());
     }
 }

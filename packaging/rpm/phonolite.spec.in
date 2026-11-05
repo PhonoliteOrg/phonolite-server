@@ -1,0 +1,52 @@
+Name: phonolite-server
+Version: @VERSION@
+Release: 1.@BASELINE@
+Summary: Self-hosted music streaming server
+License: AGPL-3.0-or-later
+Packager: @MAINTAINER@
+Source0: phonolite-server
+Source1: phonolite-server.service
+Source2: LICENSE
+Requires(post): shadow-utils, coreutils, /usr/bin/getent, systemd
+Requires(preun): systemd
+Requires(postun): systemd
+
+# This release executable is already compiled. Keep RPM's automatic ELF
+# dependency discovery, without generating a second debug package.
+%global debug_package %{nil}
+%global _build_id_links none
+
+%description
+Embedded web console, local music catalog and encrypted audio streaming.
+
+%prep
+
+%build
+
+%install
+install -D -m 0755 %{SOURCE0} %{buildroot}/usr/bin/phonolite-server
+install -D -m 0644 %{SOURCE1} %{buildroot}/usr/lib/systemd/system/phonolite-server.service
+install -D -m 0644 %{SOURCE2} %{buildroot}/usr/share/licenses/phonolite-server/LICENSE
+
+%post
+@HOOKS@
+if [ "$1" -gt 1 ]; then
+    phonolite_upgrade
+else
+    phonolite_first_install
+fi
+
+%preun
+@HOOKS@
+if [ "$1" -eq 0 ]; then
+    phonolite_remove
+fi
+
+%postun
+@HOOKS@
+phonolite_reload
+
+%files
+/usr/bin/phonolite-server
+/usr/lib/systemd/system/phonolite-server.service
+%license /usr/share/licenses/phonolite-server/LICENSE

@@ -1,0 +1,17 @@
+pkgname=phonolite-server
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Self-hosted music streaming server'
+arch=('@ARCH@')
+license=('AGPL-3.0-or-later')
+depends=(@DEPENDENCIES@ 'systemd' 'shadow')
+options=('!strip' '!debug')
+install=phonolite.install
+source=('phonolite-server' 'phonolite-server.service' 'LICENSE')
+sha256sums=(@CHECKSUMS@)
+
+package() {
+    install -D -m 0755 "$srcdir/phonolite-server" "$pkgdir/usr/bin/phonolite-server"
+    install -D -m 0644 "$srcdir/phonolite-server.service" "$pkgdir/usr/lib/systemd/system/phonolite-server.service"
+    install -D -m 0644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/phonolite-server/LICENSE"
+}

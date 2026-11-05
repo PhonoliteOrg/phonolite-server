@@ -54,14 +54,7 @@ pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) ->
         return html_error(&state, StatusCode::FORBIDDEN, "forbidden".to_string());
     }
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if let Err(err) = crate::process_control::spawn_restart() {
-            warn!("Restart failed: {}", err);
-        }
-        #[cfg(not(unix))]
-        std::process::exit(0);
-    });
+    crate::process_control::after_response(state.shutdown.clone(), true);
 
     if wants_json(&headers) {
         json_ok_response()
@@ -86,7 +79,24 @@ pub async fn admin_shutdown(State(state): State<AppState>, headers: HeaderMap) -
         return html_error(&state, StatusCode::FORBIDDEN, "forbidden".to_string());
     }
 
-    if let Err(err) = state.auth.clear_sessions() {
+    let auth = state.auth.clone();
+    let shutdown = state.shutdown.clone();
+    let mutation = state
+        .shutdown
+        .spawn_blocking_commit("shutdown-sessions", move || {
+            if shutdown.is_cancelled() {
+                return Err("server is already shutting down".to_string());
+            }
+            auth.clear_sessions().map_err(|error| error.to_string())?;
+            // The worker owns scheduling, including if the response is dropped.
+            crate::process_control::after_response(shutdown, false);
+            Ok::<(), String>(())
+        })
+        .await;
+    if let Err(err) = mutation
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+    {
         if wants_json(&headers) {
             return json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,11 +110,6 @@ pub async fn admin_shutdown(State(state): State<AppState>, headers: HeaderMap) -
             format!("shutdown failed: {}", err),
         );
     }
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        std::process::exit(0);
-    });
 
     if wants_json(&headers) {
         json_ok_response()
@@ -185,7 +190,9 @@ pub async fn admin_update_settings(
         return admin_settings_page(&state, Some(format!("save failed: {}", err)));
     }
 
-    *state.config.write() = config;
+    state
+        .metadata_coordinator
+        .reconfigure(|| *state.config.write() = config);
     if let Err(err) = state
         .log_control
         .set_debug_enabled(form.log_debug_enabled.is_some())
@@ -394,7 +401,12 @@ pub async fn admin_add_metadata_source(
     if let Err(err) = save_config(&state.config_path, &config) {
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
-    *state.config.write() = config;
+    state
+        .metadata_coordinator
+        .reconfigure(|| *state.config.write() = config);
+    if let Some(library) = state.library_state.read().library.clone() {
+        crate::scan::start_enrichment_sweep(state.clone(), library, false);
+    }
     let html = render_metadata_sources(&state, &[source]);
     row_response(&headers, html)
 }
@@ -451,7 +463,12 @@ pub async fn admin_update_metadata_source(
     if let Err(err) = save_config(&state.config_path, &config) {
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
-    *state.config.write() = config;
+    state
+        .metadata_coordinator
+        .reconfigure(|| *state.config.write() = config);
+    if let Some(library) = state.library_state.read().library.clone() {
+        crate::scan::start_enrichment_sweep(state.clone(), library, false);
+    }
     if wants_json(&headers) {
         row_response(&headers, render_metadata_sources(&state, &[updated_source]))
     } else {
@@ -502,10 +519,13 @@ pub async fn admin_delete_metadata_source(
     if let Err(err) = save_config(&state.config_path, &config) {
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
-    *state.config.write() = config;
+    state
+        .metadata_coordinator
+        .reconfigure(|| *state.config.write() = config);
     let library = state.library_state.read().library.clone();
     if let Err(err) = clear_provider_metadata_assets(&state).await {
         warn!(
+            target: "metadata_external",
             "Failed to clear metadata assets after source delete: {}",
             err
         );
@@ -555,7 +575,12 @@ pub async fn admin_toggle_metadata_source(
     if let Err(err) = save_config(&state.config_path, &config) {
         return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", err));
     }
-    *state.config.write() = config;
+    state
+        .metadata_coordinator
+        .reconfigure(|| *state.config.write() = config);
+    if let Some(library) = state.library_state.read().library.clone() {
+        crate::scan::start_enrichment_sweep(state.clone(), library, false);
+    }
     json_ok_response()
 }
 

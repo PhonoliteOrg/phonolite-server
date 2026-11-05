@@ -29,6 +29,8 @@ pub const LOG_ERROR_FILE: &str = "errors.log";
 pub const LOG_ISSUE_FILE: &str = "issues.log";
 pub const LOG_ACTIVITY_FILE: &str = "activities.log";
 pub const LOG_DEBUG_FILE: &str = "debug.log";
+pub const LOG_METADATA_REQUESTS_FILE: &str = "metadata_requests.log";
+pub const LOG_METADATA_EXTERNAL_FILE: &str = "metadata_external.log";
 
 #[derive(Clone)]
 pub struct LogControl {
@@ -38,6 +40,15 @@ pub struct LogControl {
 }
 
 impl LogControl {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            reload: Arc::new(|_| Ok(())),
+            debug_enabled: Arc::new(AtomicBool::new(false)),
+            clear_all: Arc::new(|| Ok(())),
+        }
+    }
+
     pub fn debug_enabled(&self) -> bool {
         self.debug_enabled.load(Ordering::Relaxed)
     }
@@ -133,6 +144,8 @@ struct LogOutputs {
     issues: LogWriter,
     activities: LogWriter,
     debug: LogWriter,
+    metadata_requests: LogWriter,
+    metadata_external: LogWriter,
 }
 
 impl LogOutputs {
@@ -145,6 +158,8 @@ impl LogOutputs {
             issues: LogWriter::new(log_dir.join(LOG_ISSUE_FILE))?,
             activities: LogWriter::new(log_dir.join(LOG_ACTIVITY_FILE))?,
             debug: LogWriter::new(log_dir.join(LOG_DEBUG_FILE))?,
+            metadata_requests: LogWriter::new(log_dir.join(LOG_METADATA_REQUESTS_FILE))?,
+            metadata_external: LogWriter::new(log_dir.join(LOG_METADATA_EXTERNAL_FILE))?,
         })
     }
 
@@ -156,6 +171,8 @@ impl LogOutputs {
         self.issues.clear()?;
         self.activities.clear()?;
         self.debug.clear()?;
+        self.metadata_requests.clear()?;
+        self.metadata_external.clear()?;
         Ok(())
     }
 
@@ -167,6 +184,19 @@ impl LogOutputs {
             return MultiWriter { writers };
         }
         writers.push(self.all.clone());
+        // Metadata diagnostics keep their severity, but live in their own
+        // categories instead of duplicating them across the severity views.
+        match target {
+            "metadata_request" => {
+                writers.push(self.metadata_requests.clone());
+                return MultiWriter { writers };
+            }
+            "metadata_external" => {
+                writers.push(self.metadata_external.clone());
+                return MultiWriter { writers };
+            }
+            _ => {}
+        }
         if target == "activity" {
             writers.push(self.activities.clone());
             return MultiWriter { writers };
@@ -396,6 +426,8 @@ mod tests {
                 LOG_ISSUE_FILE,
                 LOG_ACTIVITY_FILE,
                 LOG_DEBUG_FILE,
+                LOG_METADATA_REQUESTS_FILE,
+                LOG_METADATA_EXTERNAL_FILE,
             ] {
                 let _ = fs::remove_file(self.0.join(name));
             }
@@ -430,6 +462,8 @@ mod tests {
             LOG_ISSUE_FILE,
             LOG_ACTIVITY_FILE,
             LOG_DEBUG_FILE,
+            LOG_METADATA_REQUESTS_FILE,
+            LOG_METADATA_EXTERNAL_FILE,
         ];
         for name in managed_files {
             let contents = fs::read_to_string(directory.0.join(name)).unwrap();
@@ -457,6 +491,145 @@ mod tests {
                 "",
                 "managed log was not cleared: {name}"
             );
+        }
+    }
+
+    #[test]
+    fn metadata_categories_preserve_severity_and_write_only_to_their_category_and_all() {
+        let directory = TestLogDirectory(
+            std::env::temp_dir().join(format!("phonolite-metadata-logs-{}", uuid::Uuid::new_v4())),
+        );
+        let outputs = LogOutputs::new(&directory.0).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(LogFormatter::new())
+                    .with_writer(outputs.clone())
+                    .with_ansi(false),
+            )
+            .with(make_filter(true));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "metadata_request", status = 200, "request success diagnostic");
+            tracing::warn!(target: "metadata_request", status = 429, "request warning diagnostic");
+            tracing::error!(target: "metadata_request", status = 503, "request error diagnostic");
+            tracing::debug!(target: "metadata_request", "request debug diagnostic");
+            tracing::info!(target: "metadata_external", status = 200, "provider success diagnostic");
+            tracing::warn!(target: "metadata_external", status = 429, "provider warning diagnostic");
+            tracing::error!(target: "metadata_external", status = 503, "provider error diagnostic");
+            tracing::debug!(target: "metadata_external", "provider debug diagnostic");
+        });
+        let diagnostics = [
+            (
+                LOG_METADATA_REQUESTS_FILE,
+                "INFO",
+                "request success diagnostic",
+                Some(200),
+            ),
+            (
+                LOG_METADATA_REQUESTS_FILE,
+                "WARN",
+                "request warning diagnostic",
+                Some(429),
+            ),
+            (
+                LOG_METADATA_REQUESTS_FILE,
+                "ERROR",
+                "request error diagnostic",
+                Some(503),
+            ),
+            (
+                LOG_METADATA_REQUESTS_FILE,
+                "DEBUG",
+                "request debug diagnostic",
+                None,
+            ),
+            (
+                LOG_METADATA_EXTERNAL_FILE,
+                "INFO",
+                "provider success diagnostic",
+                Some(200),
+            ),
+            (
+                LOG_METADATA_EXTERNAL_FILE,
+                "WARN",
+                "provider warning diagnostic",
+                Some(429),
+            ),
+            (
+                LOG_METADATA_EXTERNAL_FILE,
+                "ERROR",
+                "provider error diagnostic",
+                Some(503),
+            ),
+            (
+                LOG_METADATA_EXTERNAL_FILE,
+                "DEBUG",
+                "provider debug diagnostic",
+                None,
+            ),
+        ];
+        let managed_files = [
+            LOG_ALL_FILE,
+            LOG_INFO_FILE,
+            LOG_WARN_FILE,
+            LOG_ERROR_FILE,
+            LOG_ISSUE_FILE,
+            LOG_ACTIVITY_FILE,
+            LOG_DEBUG_FILE,
+            LOG_METADATA_REQUESTS_FILE,
+            LOG_METADATA_EXTERNAL_FILE,
+        ];
+        for name in managed_files {
+            let contents = fs::read_to_string(directory.0.join(name)).unwrap();
+            for (category, level, message, status) in diagnostics {
+                let line = contents.lines().find(|line| line.contains(message));
+                assert_eq!(
+                    line.is_some(),
+                    name == LOG_ALL_FILE || name == category,
+                    "metadata routing for {message} in {name}"
+                );
+                if let Some(line) = line {
+                    assert_eq!(line.split_whitespace().nth(1), Some(level));
+                    if let Some(status) = status {
+                        assert!(line.contains(&format!("status={status}")));
+                    }
+                }
+            }
+        }
+        outputs.clear_all().unwrap();
+        for name in managed_files {
+            assert_eq!(fs::read_to_string(directory.0.join(name)).unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn metadata_logs_use_the_shared_line_limit_and_remain_writable_after_rotation() {
+        let directory = TestLogDirectory(std::env::temp_dir().join(format!(
+            "phonolite-metadata-rotation-{}",
+            uuid::Uuid::new_v4()
+        )));
+        let outputs = LogOutputs::new(&directory.0).unwrap();
+        let records = (0..=LOG_MAX_LINES)
+            .map(|index| format!("record {index}\n"))
+            .collect::<String>();
+        for (name, mut writer) in [
+            (
+                LOG_METADATA_REQUESTS_FILE,
+                outputs.metadata_requests.clone(),
+            ),
+            (
+                LOG_METADATA_EXTERNAL_FILE,
+                outputs.metadata_external.clone(),
+            ),
+        ] {
+            writer.write_all(records.as_bytes()).unwrap();
+            let contents = fs::read_to_string(directory.0.join(name)).unwrap();
+            assert_eq!(contents.lines().count(), LOG_TRIM_TO);
+            assert!(contents.ends_with(&format!("record {LOG_MAX_LINES}\n")));
+            writer.write_all(b"after rotation\n").unwrap();
+            let contents = fs::read_to_string(directory.0.join(name)).unwrap();
+            assert_eq!(contents.lines().count(), LOG_TRIM_TO + 1);
+            assert!(contents.ends_with("after rotation\n"));
         }
     }
 }

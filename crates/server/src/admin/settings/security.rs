@@ -8,7 +8,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Deserializer};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -26,7 +26,8 @@ pub(crate) struct RotationState {
     security: Arc<SecurityState>,
     config_path: PathBuf,
     events: crate::metadata_events::MetadataEventBus,
-    restart: fn(),
+    restart: Arc<dyn Fn() + Send + Sync>,
+    shutdown: crate::shutdown::Shutdown,
 }
 
 impl FromRef<AppState> for RotationState {
@@ -36,7 +37,11 @@ impl FromRef<AppState> for RotationState {
             security: state.security.clone(),
             config_path: state.config_path.clone(),
             events: state.metadata_events.clone(),
-            restart: restart_after_response,
+            restart: {
+                let shutdown = state.shutdown.clone();
+                Arc::new(move || crate::process_control::after_response(shutdown.clone(), true))
+            },
+            shutdown: state.shutdown.clone(),
         }
     }
 }
@@ -117,54 +122,69 @@ async fn rotate_keys(
         Err(_) => return failure(StatusCode::CONFLICT, "Key rotation is already in progress."),
     };
     let worker = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let (_permit, _lock) = (permit, lock);
-        let authenticated = worker
-            .auth
-            .authenticate(&user.username, &payload.password)
-            .map_err(|_| {
+    let result = state
+        .shutdown
+        .spawn_blocking_commit("identity-rotation", move || {
+            let (_permit, _lock) = (permit, lock);
+            if worker.shutdown.is_cancelled() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server is shutting down.".to_string(),
+                ));
+            }
+            let authenticated = worker
+                .auth
+                .authenticate(&user.username, &payload.password)
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Key rotation is unavailable.".to_string(),
+                    )
+                })?;
+            if authenticated.as_ref().map(|current| current.id.as_str()) != Some(user.id.as_str()) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Current password is incorrect.".to_string(),
+                ));
+            }
+            // Recheck authorization after the password KDF, so an expired/revoked
+            // session or demoted administrator cannot commit a rotation.
+            let current = worker.auth.user_from_token(&token).map_err(|_| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Key rotation is unavailable.".to_string(),
                 )
             })?;
-        if authenticated.as_ref().map(|current| current.id.as_str()) != Some(user.id.as_str()) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Current password is incorrect.".to_string(),
-            ));
-        }
-        // Recheck authorization after the password KDF, so an expired/revoked
-        // session or demoted administrator cannot commit a rotation.
-        let current = worker.auth.user_from_token(&token).map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Key rotation is unavailable.".to_string(),
-            )
-        })?;
-        if !current.is_some_and(|current| {
-            current.id == user.id && matches!(current.role, UserRole::Admin | UserRole::SuperAdmin)
-        }) {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Your session has ended. Sign in again.".to_string(),
-            ));
-        }
-        let fingerprint = crate::tls::prepare_rotation(&worker.config_path, || {
-            worker
-                .auth
-                .clear_sessions()
-                .map_err(|error| error.to_string())
+            if !current.is_some_and(|current| {
+                current.id == user.id
+                    && matches!(current.role, UserRole::Admin | UserRole::SuperAdmin)
+            }) {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Your session has ended. Sign in again.".to_string(),
+                ));
+            }
+            if worker.shutdown.is_cancelled() {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server is shutting down.".to_string(),
+                ));
+            }
+            let fingerprint = crate::tls::prepare_rotation(&worker.config_path, || {
+                worker
+                    .auth
+                    .clear_sessions()
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|message| (StatusCode::CONFLICT, message))?;
+            worker.security.invalidate_all_attempts();
+            worker.events.emit_identity_rotation();
+            // Scheduling belongs to the worker: cancellation/disposal cannot leave
+            // a committed rotation waiting for the HTTP handler to be polled again.
+            (worker.restart)();
+            Ok::<_, (StatusCode, String)>(fingerprint)
         })
-        .map_err(|message| (StatusCode::CONFLICT, message))?;
-        worker.security.invalidate_all_attempts();
-        worker.events.emit_identity_rotation();
-        // Scheduling belongs to the worker: cancellation/disposal cannot leave
-        // a committed rotation waiting for the HTTP handler to be polled again.
-        (worker.restart)();
-        Ok::<_, (StatusCode, String)>(fingerprint)
-    })
-    .await;
+        .await;
     match result {
         Ok(Ok(fingerprint)) => {
             let mut response = Json(serde_json::json!({
@@ -193,17 +213,6 @@ fn failure(status: StatusCode, message: &str) -> Response {
     response
 }
 
-fn restart_after_response() {
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Err(error) = crate::process_control::spawn_restart() {
-            tracing::error!("Key rotation restart failed; start the server manually: {error}");
-        }
-        // Stop using the old identity even if launching the replacement fails.
-        std::process::exit(0);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +221,7 @@ mod tests {
         http::Request,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tower::ServiceExt;
 
     static RESTARTS: AtomicUsize = AtomicUsize::new(0);
@@ -270,7 +280,8 @@ mod tests {
             auth: auth.clone(),
             config_path: root.join("config.yaml"),
             events: crate::metadata_events::MetadataEventBus::new(16),
-            restart: record_restart,
+            restart: Arc::new(record_restart),
+            shutdown: Default::default(),
         };
         let body = "password=correct-password&confirm=rotate";
         assert_eq!(

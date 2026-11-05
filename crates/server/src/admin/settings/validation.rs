@@ -261,6 +261,7 @@ mod validation_tests {
     #[test]
     fn admin_bind_setting_accepts_interface_and_wildcard_ips_without_changing_active_config() {
         let current = ServerConfig::default();
+        let original_bind = current.admin_bind_addr.clone();
         let mut form = form();
         for address in [
             "127.0.0.1",
@@ -273,7 +274,7 @@ mod validation_tests {
             form.admin_bind_addr = address.into();
             let updated = validate_settings(&form, &current).unwrap();
             assert_eq!(updated.admin_bind_addr, address.trim());
-            assert_eq!(current.admin_bind_addr, "127.0.0.1");
+            assert_eq!(current.admin_bind_addr, original_bind);
         }
         form.admin_bind_addr = "192.168.1.10:3002".into();
         assert_eq!(

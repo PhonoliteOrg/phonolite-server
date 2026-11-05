@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use common::{
     artist_identity_id, artist_identity_key, relpath_from, stable_id, Album, Artist, ArtistCredits,
@@ -39,7 +40,9 @@ pub(super) fn build_catalog(
     file_sizes: &HashMap<PathBuf, u64>,
     resolutions: &HashMap<String, ArtistCredits>,
     progress: Option<ScanObserver<'_>>,
+    cancellation: &AtomicBool,
 ) -> Result<LibraryStats, LibraryError> {
+    crate::check_cancelled(cancellation)?;
     // Resolve ambiguous display joins against identities from the complete
     // inventory so scan order cannot turn a known band into multiple artists.
     let mut known_artists = HashSet::new();
@@ -50,6 +53,7 @@ pub(super) fn build_catalog(
             .map(|credit| artist_identity_key(&credit.name))
     }));
     for tag in tags.values().filter_map(|tag| tag.as_ref().ok()) {
+        crate::check_cancelled(cancellation)?;
         for (display, names, structured) in [
             (tag.artist.as_deref(), &tag.artists, tag.artists_structured),
             (
@@ -69,8 +73,9 @@ pub(super) fn build_catalog(
     }
     let mut album_dirs = Vec::new();
     for root in roots {
+        crate::check_cancelled(cancellation)?;
         album_dirs.extend(
-            collect_album_dirs(&root.path, tags.keys())
+            collect_album_dirs(&root.path, tags.keys(), cancellation)?
                 .into_iter()
                 .map(|dir| (root, dir)),
         );
@@ -84,6 +89,7 @@ pub(super) fn build_catalog(
         });
     }
     for (_, dir) in &album_dirs {
+        crate::check_cancelled(cancellation)?;
         if let Some(name) = dir
             .parent()
             .and_then(Path::file_name)
@@ -96,6 +102,7 @@ pub(super) fn build_catalog(
     }
     let mut files_by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for path in tags.keys() {
+        crate::check_cancelled(cancellation)?;
         for parent in path.ancestors().skip(1).take(2) {
             files_by_dir
                 .entry(parent.to_path_buf())
@@ -104,10 +111,11 @@ pub(super) fn build_catalog(
         }
     }
     for files in files_by_dir.values_mut() {
+        crate::check_cancelled(cancellation)?;
         files.sort();
     }
 
-    let write_txn = db.begin_write()?;
+    let write_txn = crate::begin_write_cancellable(db, cancellation)?;
 
     clear_table(&write_txn, META_TABLE)?;
     clear_table(&write_txn, ARTISTS_TABLE)?;
@@ -153,6 +161,7 @@ pub(super) fn build_catalog(
         let mut next_track_order_by_album: HashMap<String, usize> = HashMap::new();
 
         for (index, (root, album_dir)) in album_dirs.into_iter().enumerate() {
+            crate::check_cancelled(cancellation)?;
             if let Some(progress) = progress {
                 progress(ScanProgress::IndexingAlbums {
                     completed: index,
@@ -239,6 +248,7 @@ pub(super) fn build_catalog(
             let mut track_artist_names = Vec::new();
             let mut track_artist_keys = HashSet::new();
             for file in &files {
+                crate::check_cancelled(cancellation)?;
                 if let Some(tag) = tags.get(file).and_then(|tag| tag.as_ref().ok()) {
                     let names = resolved_credit_names(
                         tag.artist.as_deref(),
@@ -324,6 +334,7 @@ pub(super) fn build_catalog(
             }
 
             for file in files {
+                crate::check_cancelled(cancellation)?;
                 let relpath = match relpath_from(&root.path, &file) {
                     Some(rel) => prefix_relpath(&root.id, &rel),
                     None => continue,
@@ -386,7 +397,7 @@ pub(super) fn build_catalog(
                 let title =
                     clean_tag_text(tag.title.as_deref()).unwrap_or_else(|| file_stem(&file));
                 let duration_ms = tag.duration_ms.unwrap_or(0);
-                let codec = match audio_codec(&file) {
+                let codec = match tag.codec.clone().or_else(|| audio_codec(&file)) {
                     Some(codec) => codec,
                     None => continue,
                 };
@@ -711,6 +722,7 @@ pub(super) fn build_catalog(
             }
 
             for info in tag_error_files {
+                crate::check_cancelled(cancellation)?;
                 let bytes = encode_value(&info)?;
                 tag_error_files_table.insert(info.file_relpath.as_str(), bytes.as_slice())?;
             }
@@ -728,6 +740,7 @@ pub(super) fn build_catalog(
             });
 
             for draft in track_drafts.into_iter() {
+                crate::check_cancelled(cancellation)?;
                 let track_names = if draft.artists.is_empty() {
                     album_artist_names.clone()
                 } else {
@@ -923,6 +936,7 @@ pub(super) fn build_catalog(
         clear_table(&write_txn, ARTIST_ALBUMS_TABLE)?;
         let mut artist_albums_table = write_txn.open_table(ARTIST_ALBUMS_TABLE)?;
         for entry in albums_table.iter()? {
+            crate::check_cancelled(cancellation)?;
             let (album_id, value) = entry?;
             let album: Album = decode_value(value.value())?;
             let mut all_credits = album_credits_table
@@ -935,6 +949,7 @@ pub(super) fn build_catalog(
             let mut end = prefix.clone();
             end.push('\u{10ffff}');
             for entry in album_tracks_table.range(prefix.as_str()..end.as_str())? {
+                crate::check_cancelled(cancellation)?;
                 let (key, _) = entry?;
                 let (_, track_id) = crate::storage::split_key_last(key.value())?;
                 if let Some(value) = track_credits_table.get(track_id)? {
@@ -942,6 +957,7 @@ pub(super) fn build_catalog(
                 }
             }
             for credit in all_credits {
+                crate::check_cancelled(cancellation)?;
                 let mut credited_artist = match artists_table.get(credit.artist_id.as_str())? {
                     Some(value) => decode_value::<Artist>(value.value())?,
                     None => {
@@ -980,7 +996,8 @@ pub(super) fn build_catalog(
         stats
     };
 
-    write_txn.commit()?;
+    crate::check_cancelled(cancellation)?;
+    write_txn.commit_cancellable(cancellation)?;
     Ok(stats)
 }
 
@@ -1133,14 +1150,24 @@ struct TrackIdentity {
     duration_ms: u32,
 }
 
-fn collect_album_dirs<'a>(root: &Path, files: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
-    let dirs_with_audio: HashSet<_> = files
-        .filter(|file| file.starts_with(root))
-        .filter_map(|file| file.parent().map(Path::to_path_buf))
-        .collect();
+fn collect_album_dirs<'a>(
+    root: &Path,
+    files: impl Iterator<Item = &'a PathBuf>,
+    cancellation: &AtomicBool,
+) -> Result<Vec<PathBuf>, LibraryError> {
+    let mut dirs_with_audio = HashSet::new();
+    for file in files {
+        crate::check_cancelled(cancellation)?;
+        if file.starts_with(root) {
+            if let Some(parent) = file.parent() {
+                dirs_with_audio.insert(parent.to_path_buf());
+            }
+        }
+    }
 
     let mut has_descendant_audio = HashSet::new();
     for dir in &dirs_with_audio {
+        crate::check_cancelled(cancellation)?;
         let mut ancestor = dir.parent();
         while let Some(current) = ancestor {
             if !current.starts_with(root) {
@@ -1162,6 +1189,7 @@ fn collect_album_dirs<'a>(root: &Path, files: impl Iterator<Item = &'a PathBuf>)
 
     let mut parent_to_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for dir in &album_dirs {
+        crate::check_cancelled(cancellation)?;
         if let Some(parent) = dir.parent() {
             if parent == root {
                 continue;
@@ -1175,6 +1203,7 @@ fn collect_album_dirs<'a>(root: &Path, files: impl Iterator<Item = &'a PathBuf>)
 
     let mut promoted: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
     for (parent, children) in parent_to_children {
+        crate::check_cancelled(cancellation)?;
         if children.is_empty() {
             continue;
         }
@@ -1194,6 +1223,7 @@ fn collect_album_dirs<'a>(root: &Path, files: impl Iterator<Item = &'a PathBuf>)
     }
 
     for (parent, children) in promoted {
+        crate::check_cancelled(cancellation)?;
         for child in children {
             album_dirs.remove(&child);
         }
@@ -1202,16 +1232,29 @@ fn collect_album_dirs<'a>(root: &Path, files: impl Iterator<Item = &'a PathBuf>)
 
     let mut album_dirs: Vec<PathBuf> = album_dirs.into_iter().collect();
     album_dirs.sort();
-    album_dirs
+    Ok(album_dirs)
 }
 
 pub(super) fn audio_codec(path: &Path) -> Option<Codec> {
+    // Keep the pre-existing fallback for damaged legacy files. New formats must
+    // provide a parsed codec so ambiguous or unsupported encodings are not
+    // guessed from their container extension.
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     match ext.as_str() {
         "mp3" => Some(Codec::Mp3),
         "flac" => Some(Codec::Flac),
         _ => None,
     }
+}
+
+pub(super) fn is_audio_file(path: &Path) -> bool {
+    let Some(extension) = path.extension() else {
+        return false;
+    };
+    matches!(
+        extension.to_string_lossy().to_ascii_lowercase().as_str(),
+        "mp3" | "flac" | "m4a" | "aac" | "mp4" | "opus" | "ogg" | "oga" | "wav" | "aif" | "aiff"
+    )
 }
 
 fn build_seek_index(duration_ms: u32, file_size: u64) -> SeekIndex {

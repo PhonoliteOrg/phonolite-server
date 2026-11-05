@@ -19,7 +19,13 @@ pub(crate) async fn get_json<T: DeserializeOwned>(
     let endpoint = endpoint_path(url);
 
     for attempt in 0..MAX_ATTEMPTS {
+        let request_id = crate::performance::next_id();
+        tracing::debug!(target: "metadata_external", event = "metadata_provider_request",
+            request_id, provider = "musicbrainz", endpoint = %endpoint,
+            method = "GET", attempt = attempt + 1, max_attempts = MAX_ATTEMPTS,
+            "Metadata provider request waiting for rate-limit slot");
         musicbrainz_rate_limit::wait_for_slot().await;
+        let started = std::time::Instant::now();
         let response = client
             .get(url)
             .timeout(timeout)
@@ -30,10 +36,24 @@ pub(crate) async fn get_json<T: DeserializeOwned>(
         let failure = match response {
             Ok(response) => {
                 let status = response.status();
+                tracing::info!(target: "metadata_external", event = "metadata_provider_response",
+                    request_id, provider = "musicbrainz", endpoint = %endpoint,
+                    attempt = attempt + 1, http_status = status.as_u16(),
+                    content_length = response.content_length(),
+                    elapsed_ms = crate::performance::milliseconds(started.elapsed()),
+                    "Metadata provider returned HTTP response");
                 if status.is_success() {
                     match response.bytes().await {
                         Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
-                            Ok(payload) => return Ok(payload),
+                            Ok(payload) => {
+                                tracing::info!(target: "metadata_external",
+                                    event = "metadata_provider_response_decoded", request_id,
+                                    provider = "musicbrainz", endpoint = %endpoint,
+                                    attempt = attempt + 1, bytes = bytes.len(),
+                                    elapsed_ms = crate::performance::milliseconds(started.elapsed()),
+                                    "Metadata provider response decoded");
+                                return Ok(payload);
+                            }
                             Err(err) => RequestFailure {
                                 stage: "decode",
                                 status: Some(status),
@@ -77,7 +97,8 @@ pub(crate) async fn get_json<T: DeserializeOwned>(
         };
 
         let diagnostic = retry_diagnostic(attempt, failure.can_retry);
-        tracing::warn!(
+        tracing::warn!(target: "metadata_external",
+            event = "metadata_provider_request_failed", request_id, provider = "musicbrainz",
             endpoint = %endpoint,
             stage = failure.stage,
             attempt = attempt + 1,

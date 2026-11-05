@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if ! getent group phonolite >/dev/null; then
+            addgroup --system phonolite
+        fi
+        if ! getent passwd phonolite >/dev/null; then
+            adduser --system --ingroup phonolite --home /var/lib/phonolite \
+                --no-create-home --disabled-login --shell /usr/sbin/nologin phonolite
+        fi
+        install -d -o phonolite -g phonolite -m 0700 /var/lib/phonolite
+
+        deb-systemd-helper unmask phonolite-server.service >/dev/null || true
+        deb-systemd-helper update-state phonolite-server.service >/dev/null || true
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+            # Let the user start a fresh installation and complete web setup.
+            # On upgrade, preserve the administrator's running/stopped choice.
+            if [ -n "${2:-}" ] && systemctl --system is-active --quiet phonolite-server.service; then
+                deb-systemd-invoke restart phonolite-server.service || true
+            fi
+        fi
+
+        if [ -f /etc/systemd/system/phonolite-server.service ] && \
+            grep -q '^ExecStart=/usr/local/bin/phonolite-server$' /etc/systemd/system/phonolite-server.service; then
+            printf '%s\n' 'An earlier manual service in /etc/systemd/system/phonolite-server.service overrides the packaged unit.'
+            printf '%s\n' 'Back up and remove that manual unit and /usr/local/bin/phonolite-server before using the Debian service.'
+        fi
+        if [ -z "${2:-}" ]; then
+            printf '%s\n' 'Phonolite installed. Start and enable it: sudo systemctl enable --now phonolite-server'
+            printf '%s\n' 'Then open https://YOUR_SERVER_IP:3002/ to create your administrator account in the web console.'
+            printf '%s\n' 'Existing configuration and data in /var/lib/phonolite are preserved.'
+        fi
+        ;;
+esac
+
+exit 0

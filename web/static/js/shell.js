@@ -28,8 +28,11 @@ export function libraryIndexStatusText(data) {
       albums: "Album sweep",
     }[metadata.phase] || "Metadata sweep";
     const progress = metadata.progress?.phase === metadata.phase ? metadata.progress : undefined;
+    if (progress?.interactive === true) {
+      label = { artists: "Artist metadata", album_artists: "Album credits", albums: "Album metadata" }[metadata.phase] || "Metadata";
+    }
     const current = progress?.current;
-    const hasPosition = count(progress?.checked) && count(progress?.total);
+    const hasPosition = progress?.interactive !== true && count(progress?.checked) && count(progress?.total);
     if (hasPosition) {
       // Logs number the item being processed, before its lookup finishes.
       const position = Math.min(Math.min(progress.checked, progress.total) + (current ? 1 : 0), progress.total);

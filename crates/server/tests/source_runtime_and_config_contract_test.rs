@@ -12,10 +12,13 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
     assert_contains_all(
         &main_rs,
         &[
-            "#[tokio::main]",
+            "tokio::runtime::Builder::new_multi_thread()",
+            "runtime.shutdown_timeout(shutdown::RUNTIME_TIMEOUT)",
+            "shutdown.drain(shutdown::DRAIN_TIMEOUT)",
             "load_or_create_config(&config_path)",
             "logging::init_logging(&config_path, &config)",
-            "Library::open_db(&index_path)?",
+            "Library::open_db_with_cache(",
+            "config.resources.catalogue_database_mib * resources::MIB",
             "AuthStore::new(Arc::clone(&db), session_ttl)",
             "UserDataStore::new(Arc::clone(&user_db))",
             "StatsStore::new(Arc::clone(&stats_db))",
@@ -30,8 +33,10 @@ fn main_bootstrap_wires_startup_state_and_http_stack() {
         ],
     );
     assert!(
-        main_rs.find("std::env::var(\"PHONOLITE_START_DELAY_MS\")").unwrap()
-            < main_rs.find("Library::open_db(&index_path)?").unwrap(),
+        main_rs
+            .find("std::env::var(\"PHONOLITE_START_DELAY_MS\")")
+            .unwrap()
+            < main_rs.find("Library::open_db_with_cache(").unwrap(),
         "a replacement process must wait before acquiring database locks"
     );
 }

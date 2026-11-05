@@ -117,11 +117,17 @@ pub struct Track {
     pub genres: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     Mp3,
     Flac,
+    // Append variants: persisted Track records use bincode enum indices.
+    Aac,
+    Alac,
+    Opus,
+    Vorbis,
+    Pcm,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

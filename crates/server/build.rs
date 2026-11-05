@@ -74,7 +74,10 @@ fn compile_windows_icon(manifest: &Path, web: &Path) -> io::Result<()> {
             String::from_utf8_lossy(&result.stderr)
         )));
     }
-    println!("cargo:rustc-link-arg-bin=phonolite-server={}", compiled.display());
+    println!(
+        "cargo:rustc-link-arg-bin=phonolite-server={}",
+        compiled.display()
+    );
     Ok(())
 }
 

@@ -1,3 +1,7 @@
+#[path = "account_notifications.rs"]
+mod notifications;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,6 +11,11 @@ use sha2::{Digest, Sha256};
 
 const USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_users_v1");
 const SESSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_sessions_v1");
+// Keep purpose metadata separate so existing serialized sessions remain readable.
+const CONSOLE_SESSIONS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("auth_console_sessions_v1");
+const USER_ACTIVITY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("auth_user_activity_v1");
 const SECURITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_security_v1");
 const OPAQUE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("auth_opaque_credentials_v1");
@@ -40,6 +49,18 @@ struct StoredSession {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserLogin {
+    pub logged_in_at: u64,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserActivity {
+    pub active_sessions: u64,
+    pub last_login: Option<UserLogin>,
+}
+
 #[derive(Debug)]
 pub enum AuthError {
     UserNotFound,
@@ -70,6 +91,8 @@ impl std::error::Error for AuthError {}
 pub struct AuthStore {
     db: Arc<Database>,
     session_ttl: Duration,
+    presence: crate::presence::SessionPresence,
+    access_changes: notifications::AccountNotifications,
 }
 
 // The exact records used for reauthentication are compared again at commit.
@@ -84,14 +107,125 @@ struct PasswordChange {
 
 impl AuthStore {
     pub fn new(db: Arc<Database>, session_ttl: Duration) -> Self {
-        Self { db, session_ttl }
+        Self {
+            db,
+            session_ttl,
+            presence: Default::default(),
+            access_changes: Default::default(),
+        }
+    }
+
+    /// Subscribers revalidate their own token against the database after a wake.
+    pub(crate) fn subscribe_access_changes(&self, user: &str) -> notifications::Subscription {
+        self.access_changes.subscribe(user)
+    }
+
+    fn notify_access_change(&self, user: &str) {
+        self.access_changes.notify(user);
+    }
+
+    /// Revoke only this account's app sessions, preserving console logins and
+    /// validating the initiating session in the same write transaction.
+    pub fn revoke_own_sessions(&self, token: &str, keep_current: bool) -> Result<u64, AuthError> {
+        let txn = ::library::begin_write(&self.db).map_err(db_error)?;
+        let digest = token_digest(token);
+        let session = txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(db_error)?
+            .get(digest.as_str())
+            .map_err(db_error)?
+            .map(|v| bincode::deserialize::<StoredSession>(v.value()).map_err(db_error))
+            .transpose()?
+            .ok_or(AuthError::InvalidToken)?;
+        if session.expires_at <= unix_seconds() {
+            return Err(AuthError::TokenExpired);
+        }
+        let user = txn
+            .open_table(USERS_TABLE)
+            .map_err(db_error)?
+            .get(session.user_id.as_str())
+            .map_err(db_error)?
+            .map(|v| bincode::deserialize::<AuthUser>(v.value()).map_err(db_error))
+            .transpose()?
+            .ok_or(AuthError::InvalidToken)?;
+        if user.disabled {
+            return Err(AuthError::InvalidToken);
+        }
+        let count = self.revoke_account_sessions_in(
+            &txn,
+            &session.user_id,
+            keep_current.then_some(digest.as_str()),
+        )?;
+        txn.commit().map_err(db_error)?;
+        self.notify_access_change(&session.user_id);
+        Ok(count)
+    }
+
+    /// Sign out all app sessions for an account without ending console logins.
+    pub fn revoke_account_sessions(&self, user_id: &str) -> Result<u64, AuthError> {
+        let txn = ::library::begin_write(&self.db).map_err(db_error)?;
+        if txn
+            .open_table(USERS_TABLE)
+            .map_err(db_error)?
+            .get(user_id)
+            .map_err(db_error)?
+            .is_none()
+        {
+            return Err(AuthError::UserNotFound);
+        }
+        let count = self.revoke_account_sessions_in(&txn, user_id, None)?;
+        txn.commit().map_err(db_error)?;
+        self.notify_access_change(user_id);
+        Ok(count)
+    }
+
+    fn revoke_account_sessions_in(
+        &self,
+        txn: &redb::WriteTransaction,
+        user: &str,
+        except_digest: Option<&str>,
+    ) -> Result<u64, AuthError> {
+        let mut table = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+        let console_sessions = txn.open_table(CONSOLE_SESSIONS_TABLE).map_err(db_error)?;
+        let mut keys = Vec::new();
+        for item in table.iter().map_err(db_error)? {
+            let (key, value) = item.map_err(db_error)?;
+            let session: StoredSession = bincode::deserialize(value.value()).map_err(db_error)?;
+            if session.user_id == user
+                && Some(key.value()) != except_digest
+                && console_sessions
+                    .get(key.value())
+                    .map_err(db_error)?
+                    .is_none()
+            {
+                keys.push(key.value().to_owned());
+            }
+        }
+        let count = keys.len() as u64;
+        for key in keys {
+            table.remove(key.as_str()).map_err(db_error)?;
+        }
+        Ok(count)
+    }
+
+    /// Observe only authenticated bearer requests from a client, never console
+    /// cookie authentication or server-side token validation.
+    pub(crate) fn observe_connection(
+        &self,
+        token: &str,
+        connection: &crate::presence::HttpConnection,
+    ) {
+        connection.observe(&self.presence, token_digest(token));
+    }
+
+    /// Retain this handle for the lifetime of an authenticated live transport.
+    pub(crate) fn connect_session(&self, token: &str) -> crate::presence::SessionConnection {
+        self.presence.connect(token_digest(token))
     }
 
     pub fn init_tables(&self) -> Result<(), AuthError> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let write_txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         // This is a new authentication schema. Never deserialize or convert
         // accounts, credentials, or sessions from a previous implementation.
         if write_txn.list_tables().map_err(db_error)?.any(|table| {
@@ -154,6 +288,14 @@ impl AuthStore {
                     "OPAQUE credential records are incomplete; restore a security backup",
                 ));
             }
+            // Activity is additive metadata; existing users and sessions retain
+            // their original serialized layouts and need no conversion.
+            write_txn
+                .open_table(USER_ACTIVITY_TABLE)
+                .map_err(db_error)?;
+            write_txn
+                .open_table(CONSOLE_SESSIONS_TABLE)
+                .map_err(db_error)?;
         }
         write_txn
             .commit()
@@ -247,10 +389,8 @@ impl AuthStore {
             return Err(AuthError::InvalidUsername);
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(USERS_TABLE)
@@ -323,7 +463,20 @@ impl AuthStore {
     }
 
     pub fn create_session(&self, user_id: &str) -> Result<SessionToken, AuthError> {
-        self.create_session_inner(user_id, None)
+        self.create_session_with_device(user_id, "Unknown device")
+    }
+
+    pub fn create_session_with_device(
+        &self,
+        user_id: &str,
+        device: &str,
+    ) -> Result<SessionToken, AuthError> {
+        self.create_session_inner(user_id, None, Some(device))
+    }
+
+    /// Console authentication does not update the client's login/device history.
+    pub fn create_console_session(&self, user_id: &str) -> Result<SessionToken, AuthError> {
+        self.create_session_inner(user_id, None, None)
     }
 
     pub fn create_bound_session(
@@ -331,15 +484,27 @@ impl AuthStore {
         user_id: &str,
         record_hash: &[u8],
     ) -> Result<SessionToken, AuthError> {
-        self.create_session_inner(user_id, Some(record_hash))
+        self.create_bound_session_with_device(user_id, record_hash, "Unknown device")
+    }
+
+    pub fn create_bound_session_with_device(
+        &self,
+        user_id: &str,
+        record_hash: &[u8],
+        device: &str,
+    ) -> Result<SessionToken, AuthError> {
+        self.create_session_inner(user_id, Some(record_hash), Some(device))
     }
 
     fn create_session_inner(
         &self,
         user_id: &str,
         record_hash: Option<&[u8]>,
+        device: Option<&str>,
     ) -> Result<SessionToken, AuthError> {
         let token_str = generate_token();
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -352,10 +517,6 @@ impl AuthStore {
             expires_at,
         };
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             // Validate under the same write transaction that creates the session.
             // A concurrent password reset cannot mint a session from an old proof.
@@ -389,6 +550,33 @@ impl AuthStore {
             table
                 .insert(token_digest(&token_str).as_str(), bytes.as_slice())
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
+            if device.is_none() {
+                txn.open_table(CONSOLE_SESSIONS_TABLE)
+                    .map_err(db_error)?
+                    .insert(token_digest(&token_str).as_str(), user_id)
+                    .map_err(db_error)?;
+            }
+            if let Some(device) = device {
+                let device: String = device
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .take(256)
+                    .collect();
+                let device = device.trim();
+                let login = UserLogin {
+                    logged_in_at: now,
+                    device: if device.is_empty() {
+                        "Unknown device".to_string()
+                    } else {
+                        device.to_string()
+                    },
+                };
+                let bytes = bincode::serialize(&login).map_err(db_error)?;
+                txn.open_table(USER_ACTIVITY_TABLE)
+                    .map_err(db_error)?
+                    .insert(user_id, bytes.as_slice())
+                    .map_err(db_error)?;
+            }
         }
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
@@ -397,36 +585,48 @@ impl AuthStore {
     }
 
     pub fn revoke_session(&self, token: &str) -> Result<(), AuthError> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
-        {
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
+        txn.open_table(CONSOLE_SESSIONS_TABLE)
+            .map_err(db_error)?
+            .remove(token_digest(token).as_str())
+            .map_err(db_error)?;
+        let user = {
             let mut table = txn
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            table
+            let removed = table
                 .remove(token_digest(token).as_str())
-                .map_err(|e| AuthError::DbError(e.to_string()))?;
-        }
+                .map_err(db_error)?;
+            removed
+                .map(|value| {
+                    bincode::deserialize::<StoredSession>(value.value())
+                        .map(|s| s.user_id)
+                        .map_err(db_error)
+                })
+                .transpose()?
+        };
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        if let Some(user) = user {
+            self.notify_access_change(&user);
+        }
         Ok(())
     }
 
     pub fn clear_sessions(&self) -> Result<(), AuthError> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(SESSIONS_TABLE)
                 .map_err(|e| AuthError::DbError(e.to_string()))?;
-            remove_sessions(&mut table, None)?;
+            let mut console_sessions = txn.open_table(CONSOLE_SESSIONS_TABLE).map_err(db_error)?;
+            remove_sessions(&mut table, &mut console_sessions, None)?;
         }
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        self.access_changes.notify_all();
         Ok(())
     }
 
@@ -542,6 +742,47 @@ impl AuthStore {
         Ok(users)
     }
 
+    pub fn user_activity(&self) -> Result<HashMap<String, UserActivity>, AuthError> {
+        let txn = self.db.begin_read().map_err(db_error)?;
+        let users = txn.open_table(USERS_TABLE).map_err(db_error)?;
+        let logins = txn.open_table(USER_ACTIVITY_TABLE).map_err(db_error)?;
+        let sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
+        let mut activity = HashMap::new();
+        let mut enabled_users = HashSet::new();
+        for entry in users.iter().map_err(db_error)? {
+            let (id, value) = entry.map_err(db_error)?;
+            let user: AuthUser = bincode::deserialize(value.value()).map_err(db_error)?;
+            if !user.disabled {
+                enabled_users.insert(id.value().to_string());
+            }
+            let last_login = logins
+                .get(id.value())
+                .map_err(db_error)?
+                .map(|value| bincode::deserialize(value.value()).map_err(db_error))
+                .transpose()?;
+            activity.insert(
+                id.value().to_string(),
+                UserActivity {
+                    active_sessions: 0,
+                    last_login,
+                },
+            );
+        }
+        let now = unix_seconds();
+        for digest in self.presence.active_sessions() {
+            let Some(value) = sessions.get(digest.as_str()).map_err(db_error)? else {
+                continue;
+            };
+            let session: StoredSession = bincode::deserialize(value.value()).map_err(db_error)?;
+            if session.expires_at > now && enabled_users.contains(&session.user_id) {
+                if let Some(user) = activity.get_mut(&session.user_id) {
+                    user.active_sessions += 1;
+                }
+            }
+        }
+        Ok(activity)
+    }
+
     pub fn update_user(
         &self,
         id: &str,
@@ -553,10 +794,8 @@ impl AuthStore {
         if username.is_empty() || username.len() > 128 {
             return Err(AuthError::InvalidUsername);
         }
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(USERS_TABLE)
@@ -613,6 +852,7 @@ impl AuthStore {
         self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        self.notify_access_change(id);
         Ok(())
     }
 
@@ -626,10 +866,8 @@ impl AuthStore {
             password.as_bytes(),
         )
         .map_err(db_error)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             let table = txn
                 .open_table(USERS_TABLE)
@@ -645,6 +883,7 @@ impl AuthStore {
         self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        self.notify_access_change(id);
         Ok(())
     }
 
@@ -714,7 +953,7 @@ impl AuthStore {
     }
 
     fn commit_password_change(&self, change: PasswordChange) -> Result<(), AuthError> {
-        let txn = self.db.begin_write().map_err(db_error)?;
+        let txn = ::library::begin_write(&self.db).map_err(db_error)?;
         {
             let users = txn.open_table(USERS_TABLE).map_err(db_error)?;
             let value = users
@@ -747,6 +986,12 @@ impl AuthStore {
                 .insert(user.id.as_str(), change.replacement_record.as_slice())
                 .map_err(db_error)?;
         }
+        let console_session = txn
+            .open_table(CONSOLE_SESSIONS_TABLE)
+            .map_err(db_error)?
+            .get(change.token_digest.as_str())
+            .map_err(db_error)?
+            .is_some();
         self.revoke_user_sessions_in(&txn, &change.user.id)?;
         {
             // This exact session was reauthenticated and checked above. Keep its
@@ -757,16 +1002,21 @@ impl AuthStore {
             sessions
                 .insert(change.token_digest.as_str(), bytes.as_slice())
                 .map_err(db_error)?;
+            if console_session {
+                txn.open_table(CONSOLE_SESSIONS_TABLE)
+                    .map_err(db_error)?
+                    .insert(change.token_digest.as_str(), change.user.id.as_str())
+                    .map_err(db_error)?;
+            }
         }
         txn.commit().map_err(db_error)?;
+        self.notify_access_change(&change.user.id);
         Ok(())
     }
 
     pub fn delete_user(&self, id: &str) -> Result<(), AuthError> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| AuthError::DbError(e.to_string()))?;
+        let txn =
+            ::library::begin_write(&self.db).map_err(|e| AuthError::DbError(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(USERS_TABLE)
@@ -801,10 +1051,15 @@ impl AuthStore {
                 .map_err(db_error)?
                 .remove(id)
                 .map_err(db_error)?;
+            txn.open_table(USER_ACTIVITY_TABLE)
+                .map_err(db_error)?
+                .remove(id)
+                .map_err(db_error)?;
         }
         self.revoke_user_sessions_in(&txn, id)?;
         txn.commit()
             .map_err(|e| AuthError::DbError(e.to_string()))?;
+        self.notify_access_change(id);
         Ok(())
     }
 
@@ -900,7 +1155,8 @@ impl AuthStore {
         id: &str,
     ) -> Result<(), AuthError> {
         let mut sessions = txn.open_table(SESSIONS_TABLE).map_err(db_error)?;
-        remove_sessions(&mut sessions, Some(id))
+        let mut console_sessions = txn.open_table(CONSOLE_SESSIONS_TABLE).map_err(db_error)?;
+        remove_sessions(&mut sessions, &mut console_sessions, Some(id))
     }
 }
 
@@ -915,6 +1171,7 @@ fn unix_seconds() -> u64 {
 }
 fn remove_sessions(
     table: &mut redb::Table<&str, &[u8]>,
+    console_sessions: &mut redb::Table<&str, &str>,
     user_id: Option<&str>,
 ) -> Result<(), AuthError> {
     let mut keys = Vec::new();
@@ -929,6 +1186,7 @@ fn remove_sessions(
     }
     for key in keys {
         table.remove(key.as_str()).map_err(db_error)?;
+        console_sessions.remove(key.as_str()).map_err(db_error)?;
     }
     Ok(())
 }
@@ -973,7 +1231,7 @@ mod tests {
     }
 
     fn set_disabled(store: &AuthStore, user_id: &str, disabled: bool) {
-        let txn = store.db.begin_write().unwrap();
+        let txn = ::library::begin_write(&store.db).unwrap();
         {
             let mut table = txn.open_table(super::USERS_TABLE).unwrap();
             let bytes = table.get(user_id).unwrap().unwrap().value().to_vec();
@@ -983,6 +1241,140 @@ mod tests {
             table.insert(user_id, bytes.as_slice()).unwrap();
         }
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn account_revocation_is_atomic_scoped_and_wakes_live_subscribers() {
+        let (store, _db) = test_store();
+        let user = store
+            .create_user("alice", "password", UserRole::Admin)
+            .unwrap();
+        let other = store
+            .create_user("bob", "password", UserRole::User)
+            .unwrap();
+        let current = store.create_session(&user.id).unwrap();
+        let second = store.create_session(&user.id).unwrap();
+        let foreign = store.create_session(&other.id).unwrap();
+        let console = store.create_console_session(&user.id).unwrap();
+        let second_console = store.create_console_session(&user.id).unwrap();
+        let mut access = store.subscribe_access_changes(&user.id);
+        assert_eq!(store.revoke_own_sessions(&current.token, true).unwrap(), 1);
+        assert!(access.has_changed().unwrap());
+        access.borrow_and_update();
+        assert!(store.user_from_token(&current.token).unwrap().is_some());
+        assert!(store.user_from_token(&second.token).unwrap().is_none());
+        assert!(store.user_from_token(&console.token).unwrap().is_some());
+        assert!(store
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_some());
+        assert!(store.user_from_token(&foreign.token).unwrap().is_some());
+        assert!(store.revoke_own_sessions(&second.token, false).is_err());
+        assert!(!access.has_changed().unwrap());
+        assert_eq!(store.revoke_own_sessions(&current.token, false).unwrap(), 1);
+        assert!(store.user_from_token(&current.token).unwrap().is_none());
+        assert!(store.user_from_token(&console.token).unwrap().is_some());
+        assert!(store
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_some());
+        assert!(store.user_from_token(&foreign.token).unwrap().is_some());
+        assert_eq!(store.revoke_account_sessions(&other.id).unwrap(), 1);
+        assert!(store.user_from_token(&foreign.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn console_revocation_preserves_console_sessions_across_reopening() {
+        let (store, db) = test_store();
+        let user = store.create_superadmin("admin", "password").unwrap();
+        let other = store
+            .create_user("other", "password", UserRole::Admin)
+            .unwrap();
+        let client = store.create_session(&user.id).unwrap();
+        let console = store.create_console_session(&user.id).unwrap();
+        let second_console = store.create_console_session(&user.id).unwrap();
+        let foreign = store.create_session(&other.id).unwrap();
+        let foreign_console = store.create_console_session(&other.id).unwrap();
+        drop(store);
+
+        let reopened = AuthStore::new(
+            Arc::new(Database::open(&db.path).unwrap()),
+            Duration::from_secs(60),
+        );
+        reopened.init_tables().unwrap();
+        assert_eq!(reopened.revoke_account_sessions(&user.id).unwrap(), 1);
+        assert!(reopened.user_from_token(&client.token).unwrap().is_none());
+        for token in [&console, &second_console, &foreign, &foreign_console] {
+            assert!(reopened.user_from_token(&token.token).unwrap().is_some());
+        }
+        assert_eq!(reopened.revoke_account_sessions(&user.id).unwrap(), 0);
+        reopened.revoke_session(&console.token).unwrap();
+        assert!(reopened.user_from_token(&console.token).unwrap().is_none());
+        assert!(reopened
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_some());
+        let read = reopened.db.begin_read().unwrap();
+        let markers = read.open_table(super::CONSOLE_SESSIONS_TABLE).unwrap();
+        assert!(markers
+            .get(super::token_digest(&console.token).as_str())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn security_mutations_still_revoke_console_sessions_and_remove_markers() {
+        let (store, _db) = test_store();
+        store.create_superadmin("owner", "password").unwrap();
+        for action in ["password", "update", "delete", "clear"] {
+            let user = store
+                .create_user(action, "password", UserRole::Admin)
+                .unwrap();
+            let client = store.create_session(&user.id).unwrap();
+            let console = store.create_console_session(&user.id).unwrap();
+            match action {
+                "password" => store.update_password(&user.id, "replacement").unwrap(),
+                "update" => store
+                    .update_user(&user.id, action, None, UserRole::User)
+                    .unwrap(),
+                "delete" => store.delete_user(&user.id).unwrap(),
+                "clear" => store.clear_sessions().unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(store.user_from_token(&client.token).unwrap().is_none());
+            assert!(store.user_from_token(&console.token).unwrap().is_none());
+            let read = store.db.begin_read().unwrap();
+            let markers = read.open_table(super::CONSOLE_SESSIONS_TABLE).unwrap();
+            assert!(markers.is_empty().unwrap());
+        }
+    }
+
+    #[test]
+    fn password_change_preserves_only_the_reauthenticated_session_and_its_purpose() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("admin", "password").unwrap();
+        let console = store.create_console_session(&user.id).unwrap();
+        let second_console = store.create_console_session(&user.id).unwrap();
+        let client = store.create_session(&user.id).unwrap();
+        store
+            .change_own_password(&console.token, "password", "replacement")
+            .unwrap();
+        assert!(store.user_from_token(&console.token).unwrap().is_some());
+        assert!(store
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_none());
+        assert!(store.user_from_token(&client.token).unwrap().is_none());
+        assert_eq!(store.revoke_account_sessions(&user.id).unwrap(), 0);
+        assert!(store.user_from_token(&console.token).unwrap().is_some());
+
+        let client = store.create_session(&user.id).unwrap();
+        store
+            .change_own_password(&client.token, "replacement", "next password")
+            .unwrap();
+        assert!(store.user_from_token(&console.token).unwrap().is_none());
+        assert!(store.user_from_token(&client.token).unwrap().is_some());
+        assert_eq!(store.revoke_account_sessions(&user.id).unwrap(), 1);
     }
 
     #[test]
@@ -997,6 +1389,190 @@ mod tests {
         assert_eq!(authenticated.id, user.id);
         assert_eq!(from_token.username, "admin");
         assert_eq!(from_token.role, UserRole::SuperAdmin);
+    }
+
+    #[test]
+    fn console_sign_ins_do_not_create_or_overwrite_client_activity() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("admin", "hunter2").unwrap();
+        let console = store.create_console_session(&user.id).unwrap();
+        assert_eq!(
+            store.user_from_token(&console.token).unwrap(),
+            Some(user.clone())
+        );
+        assert_eq!(
+            store.user_activity().unwrap()[&user.id],
+            super::UserActivity::default()
+        );
+
+        let client = store
+            .create_session_with_device(&user.id, "Phonolite on Android")
+            .unwrap();
+        let connection = crate::presence::HttpConnection::default();
+        store.observe_connection(&client.token, &connection);
+        let client_activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(client_activity.active_sessions, 1);
+        assert_eq!(
+            client_activity.last_login.as_ref().unwrap().device,
+            "Phonolite on Android"
+        );
+
+        let second_console = store.create_console_session(&user.id).unwrap();
+        assert!(store
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_some());
+        assert_eq!(store.user_activity().unwrap()[&user.id], client_activity);
+        store.revoke_session(&console.token).unwrap();
+        assert_eq!(store.user_activity().unwrap()[&user.id], client_activity);
+
+        connection.close();
+        let offline = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(offline.active_sessions, 0);
+        assert_eq!(offline.last_login, client_activity.last_login);
+        assert!(store
+            .user_from_token(&second_console.token)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn user_activity_counts_live_sessions_and_preserves_last_login_on_revocation() {
+        let (store, _db) = test_store();
+        let user = store.create_superadmin("admin", "hunter2").unwrap();
+        let empty = store.user_activity().unwrap();
+        assert_eq!(empty[&user.id], super::UserActivity::default());
+
+        let first = store
+            .create_session_with_device(&user.id, "Firefox on Windows")
+            .unwrap();
+        let second = store
+            .create_session_with_device(&user.id, "Phonolite on Android")
+            .unwrap();
+        assert_eq!(store.user_activity().unwrap()[&user.id].active_sessions, 0);
+        let first_connection = store.connect_session(&first.token);
+        let _second_connection = store.connect_session(&second.token);
+        let duplicate_transport = store.connect_session(&second.token);
+        assert_eq!(
+            store.clone().user_activity().unwrap()[&user.id].active_sessions,
+            2
+        );
+        drop(duplicate_transport);
+        drop(first_connection);
+        assert_eq!(store.user_activity().unwrap()[&user.id].active_sessions, 1);
+        let _first_connection = store.connect_session(&first.token);
+        let _expired_connection = store.connect_session("expired-token");
+        let txn = ::library::begin_write(&store.db).unwrap();
+        {
+            let bytes = bincode::serialize(&super::StoredSession {
+                user_id: user.id.clone(),
+                expires_at: super::unix_seconds(),
+            })
+            .unwrap();
+            txn.open_table(super::SESSIONS_TABLE)
+                .unwrap()
+                .insert(
+                    super::token_digest("expired-token").as_str(),
+                    bytes.as_slice(),
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(activity.active_sessions, 2);
+        let login = activity.last_login.unwrap();
+        assert_eq!(login.device, "Phonolite on Android");
+        assert_eq!(login.logged_in_at, second.expires_at - 60);
+
+        store.revoke_session(&first.token).unwrap();
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(activity.active_sessions, 1);
+        assert_eq!(activity.last_login.as_ref(), Some(&login));
+        store.clear_sessions().unwrap();
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(activity.active_sessions, 0);
+        assert_eq!(activity.last_login.as_ref(), Some(&login));
+    }
+
+    #[test]
+    fn user_activity_is_additive_to_existing_accounts_and_sessions_and_survives_reopen() {
+        let (store, db) = test_store();
+        let user = store.create_superadmin("admin", "hunter2").unwrap();
+        let session = store.create_session(&user.id).unwrap();
+        // Simulate a database written before activity tracking existed.
+        let txn = ::library::begin_write(&store.db).unwrap();
+        txn.delete_table(super::USER_ACTIVITY_TABLE).unwrap();
+        txn.commit().unwrap();
+        drop(store);
+
+        let store = AuthStore::new(
+            Arc::new(Database::open(&db.path).unwrap()),
+            Duration::from_secs(60),
+        );
+        store.init_tables().unwrap();
+        assert_eq!(
+            store.user_from_token(&session.token).unwrap(),
+            Some(user.clone())
+        );
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(
+            activity.active_sessions, 0,
+            "persisted tokens are offline after restart"
+        );
+        assert!(activity.last_login.is_none());
+        let _connection = store.connect_session(&session.token);
+        assert_eq!(store.user_activity().unwrap()[&user.id].active_sessions, 1);
+
+        store
+            .create_session_with_device(&user.id, "Safari on iPhone")
+            .unwrap();
+        store.clear_sessions().unwrap();
+        drop(store);
+        let store = AuthStore::new(
+            Arc::new(Database::open(&db.path).unwrap()),
+            Duration::from_secs(60),
+        );
+        store.init_tables().unwrap();
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(activity.active_sessions, 0);
+        assert_eq!(activity.last_login.unwrap().device, "Safari on iPhone");
+    }
+
+    #[test]
+    fn user_activity_excludes_disabled_accounts_and_rejected_logins_and_cleans_deleted_users() {
+        let (store, _db) = test_store();
+        let user = store
+            .create_user("listener", "hunter2", UserRole::User)
+            .unwrap();
+        let session = store
+            .create_session_with_device(&user.id, "Firefox on Linux")
+            .unwrap();
+        let _connection = store.connect_session(&session.token);
+        let original = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert!(matches!(
+            store.create_bound_session_with_device(&user.id, &[0; 32], "bad proof"),
+            Err(super::AuthError::InvalidPassword)
+        ));
+        assert_eq!(store.user_activity().unwrap()[&user.id], original);
+
+        set_disabled(&store, &user.id, true);
+        assert!(store
+            .create_session_with_device(&user.id, "disabled")
+            .is_err());
+        let activity = store.user_activity().unwrap().remove(&user.id).unwrap();
+        assert_eq!(activity.active_sessions, 0);
+        assert_eq!(activity.last_login, original.last_login);
+
+        store.delete_user(&user.id).unwrap();
+        assert!(!store.user_activity().unwrap().contains_key(&user.id));
+        let txn = store.db.begin_read().unwrap();
+        assert!(txn
+            .open_table(super::USER_ACTIVITY_TABLE)
+            .unwrap()
+            .get(user.id.as_str())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1149,7 +1725,7 @@ mod tests {
                 "disable" => set_disabled(&store, &user.id, true),
                 "delete" => store.delete_user(&user.id).unwrap(),
                 "expiry" => {
-                    let txn = store.db.begin_write().unwrap();
+                    let txn = ::library::begin_write(&store.db).unwrap();
                     {
                         let expired = bincode::serialize(&super::StoredSession {
                             user_id: user.id.clone(),
@@ -1305,7 +1881,7 @@ mod tests {
             let _cleanup = TestDb { path: path.clone() };
             let db = Arc::new(Database::create(&path).unwrap());
             let old: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
-            let write = db.begin_write().unwrap();
+            let write = ::library::begin_write(&db).unwrap();
             {
                 write
                     .open_table(old)
@@ -1350,7 +1926,7 @@ mod tests {
     #[test]
     fn missing_or_unknown_profile_is_rejected_without_regeneration() {
         let (store, _db) = test_store();
-        let write = store.db.begin_write().unwrap();
+        let write = ::library::begin_write(&store.db).unwrap();
         {
             write
                 .open_table(super::SECURITY_TABLE)
@@ -1363,7 +1939,7 @@ mod tests {
             store.init_tables(),
             Err(super::AuthError::IncompatibleSchema)
         ));
-        let write = store.db.begin_write().unwrap();
+        let write = ::library::begin_write(&store.db).unwrap();
         {
             write
                 .open_table(super::SECURITY_TABLE)
@@ -1382,7 +1958,7 @@ mod tests {
     fn missing_setup_is_never_silently_regenerated_for_enrolled_users() {
         let (store, _db) = test_store();
         store.create_superadmin("root", "secret").unwrap();
-        let write = store.db.begin_write().unwrap();
+        let write = ::library::begin_write(&store.db).unwrap();
         {
             write
                 .open_table(super::SECURITY_TABLE)

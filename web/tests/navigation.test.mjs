@@ -177,11 +177,11 @@ function harness({ href = "https://console.example/library", state = null, lifec
 
 test("console navigation accepts only supported same-origin views", () => {
   const base = "https://console.example/library";
-  for (const route of ["/", "/users", "/library", "/settings", "/logs", "/login", "/setup"]) {
+  for (const route of ["/", "/users", "/library", "/settings", "/logs", "/performance", "/login", "/setup"]) {
     assert.equal(consoleUrl(`${route}?message=saved`, base).pathname, route);
   }
   assert.equal(consoleUrl("/library?filter=albums#results", base).search, "?filter=albums");
-  for (const route of ["https://other.example/users", "/assets/js/app.js", "/status/library", "/logs/tail", "/users/delete", "javascript:alert(1)"]) {
+  for (const route of ["https://other.example/users", "/assets/js/app.js", "/status/library", "/logs/tail", "/performance/data", "/users/delete", "javascript:alert(1)"]) {
     assert.equal(consoleUrl(route, base), null);
   }
 });

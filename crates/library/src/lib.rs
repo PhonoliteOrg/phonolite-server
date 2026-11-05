@@ -3,19 +3,33 @@
 //! The public API is stable; private modules own read queries, enrichment
 //! transactions, storage encoding, and filesystem indexing independently.
 pub mod backup;
+mod browse_projection;
+#[cfg(test)]
+mod cancellation_tests;
+mod catalogue_metadata;
 mod credits;
 mod enrichment;
 mod indexing;
+mod metadata_retry;
 mod normalization;
 mod queries;
 pub mod search;
 mod source_identity;
 mod storage;
+mod write_admission;
 
+pub use browse_projection::ArtistBrowseSummary;
+pub use catalogue_metadata::{AlbumViewMetadata, TrackDisplayMetadata, TrackViewMetadata};
 pub use credits::resolve_display_credit;
+pub use metadata_retry::MetadataAttempt;
+pub use metadata_retry::{
+    flush_cancelled_metadata_attempts, recover_interrupted_metadata_attempts,
+};
 pub use source_identity::{AlbumSourceIdentity, ALBUM_SOURCE_IDENTITY_SCHEMA_VERSION};
+pub use write_admission::{begin_write, begin_write_cancellable, AdmittedWriteTransaction};
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,6 +62,26 @@ pub enum ScanProgress {
 }
 
 type ScanObserver<'a> = &'a (dyn Fn(ScanProgress) + Sync);
+/// Production servers can isolate parsers; local tools retain the direct reader.
+pub type TagReader =
+    dyn Fn(&Path, &AtomicBool) -> Result<metadata::TagInfo, String> + Send + Sync + 'static;
+
+/// Source changes published by one atomic scan. Metadata workers can target
+/// these identities without walking the catalog again after a file event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanChanges {
+    pub artists: std::collections::BTreeSet<String>,
+    pub albums: std::collections::BTreeSet<String>,
+    pub removed_artists: std::collections::BTreeSet<String>,
+    pub removed_albums: std::collections::BTreeSet<String>,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanOutcome {
+    pub stats: LibraryStats,
+    pub changes: ScanChanges,
+}
 
 /// Catalog albums with a persisted description and genres, rather than attempted lookups.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,9 +124,91 @@ impl LibraryRoot {
 pub struct Library {
     roots: Vec<LibraryRoot>,
     db: Arc<Database>,
+    cache_generation: Arc<std::sync::atomic::AtomicU64>,
+    metadata_generation: Arc<std::sync::atomic::AtomicU64>,
+    browse_projection: Arc<browse_projection::ProjectionState>,
+    search_state: Arc<search::SearchState>,
+    cancellation: Arc<AtomicBool>,
+    tag_reader: Option<Arc<TagReader>>,
+    cancel_reads: bool,
+}
+
+fn next_catalog_generation() -> u64 {
+    // Revisions must not collide with an app's retained window after restart.
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let next = NEXT.get_or_init(|| {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        std::sync::atomic::AtomicU64::new(seed)
+    });
+    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Library {
+    /// Operational views stop disposable queries on shutdown. The default view
+    /// remains readable so callers can inspect the last committed catalogue.
+    pub fn with_cancellable_reads(mut self) -> Self {
+        self.cancel_reads = true;
+        self
+    }
+
+    fn check_read_cancelled(&self) -> Result<(), LibraryError> {
+        if self.cancel_reads {
+            self.check_cancelled()
+        } else {
+            Ok(())
+        }
+    }
+    /// Scan cancellation is shared by every clone, including metadata repairs.
+    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    fn check_cancelled(&self) -> Result<(), LibraryError> {
+        check_cancelled(&self.cancellation)
+    }
+
+    /// Identifies this loaded catalog for in-memory caches. Clones share an
+    /// identity; reopening or rebuilding the catalog creates a fresh identity.
+    pub fn catalog_generation(&self) -> u64 {
+        self.cache_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Committed metadata freshness, independent of browse membership/order.
+    pub fn metadata_revision(&self) -> u64 {
+        self.metadata_generation.load(Ordering::Acquire)
+    }
+
+    pub fn browse_revision(&self) -> String {
+        self.catalog_generation().to_string()
+    }
+
+    fn metadata_changed(&self) {
+        self.metadata_generation
+            .store(next_catalog_generation(), Ordering::Release);
+    }
+
+    /// Restores write source tables directly, so discard derived summary rows.
+    fn metadata_restored(&self) {
+        self.browse_projection.invalidate();
+        self.metadata_changed();
+    }
+
+    fn catalog_changed(&self) {
+        self.cache_generation.store(
+            next_catalog_generation(),
+            std::sync::atomic::Ordering::Release,
+        );
+        self.metadata_changed();
+    }
+
     pub fn load_or_scan(
         roots: Vec<LibraryRoot>,
         db_path: PathBuf,
@@ -101,6 +217,17 @@ impl Library {
         let library = Self {
             roots,
             db: Arc::new(db),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            tag_reader: None,
+            cancel_reads: false,
+            cache_generation: Arc::new(
+                std::sync::atomic::AtomicU64::new(next_catalog_generation()),
+            ),
+            metadata_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                next_catalog_generation(),
+            )),
+            browse_projection: Arc::new(Default::default()),
+            search_state: Arc::new(Default::default()),
         };
 
         let mut scanned = false;
@@ -119,12 +246,28 @@ impl Library {
             }
             Some(version) => {
                 warn!("Index version mismatch ({}); rescanning", version);
-                indexing::scan(&library.roots, &library.db, true, None, None)?;
+                indexing::scan(
+                    &library.roots,
+                    &library.db,
+                    true,
+                    None,
+                    None,
+                    &library.cancellation,
+                    library.tag_reader.as_ref(),
+                )?;
                 scanned = true;
             }
             None => {
                 warn!("Index missing; scanning");
-                indexing::scan(&library.roots, &library.db, true, None, None)?;
+                indexing::scan(
+                    &library.roots,
+                    &library.db,
+                    true,
+                    None,
+                    None,
+                    &library.cancellation,
+                    library.tag_reader.as_ref(),
+                )?;
                 scanned = true;
             }
         }
@@ -136,7 +279,7 @@ impl Library {
         roots: Vec<LibraryRoot>,
         db: Arc<Database>,
     ) -> Result<(Self, bool), LibraryError> {
-        Self::load_or_scan_db(roots, db, None)
+        Self::load_or_scan_db(roots, db, None, Arc::new(AtomicBool::new(false)))
     }
 
     pub fn load_or_scan_with_db_and_progress(
@@ -144,15 +287,60 @@ impl Library {
         db: Arc<Database>,
         progress: ScanObserver<'_>,
     ) -> Result<(Self, bool), LibraryError> {
-        Self::load_or_scan_db(roots, db, Some(progress))
+        Self::load_or_scan_db(roots, db, Some(progress), Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn load_or_scan_with_db_and_progress_cancellable(
+        roots: Vec<LibraryRoot>,
+        db: Arc<Database>,
+        progress: ScanObserver<'_>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<(Self, bool), LibraryError> {
+        Self::load_or_scan_db(roots, db, Some(progress), cancellation)
+    }
+
+    pub fn load_or_scan_with_db_and_progress_cancellable_with_reader(
+        roots: Vec<LibraryRoot>,
+        db: Arc<Database>,
+        progress: ScanObserver<'_>,
+        cancellation: Arc<AtomicBool>,
+        tag_reader: Arc<TagReader>,
+    ) -> Result<(Self, bool), LibraryError> {
+        Self::load_or_scan_db_with_reader(roots, db, Some(progress), cancellation, Some(tag_reader))
     }
 
     fn load_or_scan_db(
         roots: Vec<LibraryRoot>,
         db: Arc<Database>,
         progress: Option<ScanObserver<'_>>,
+        cancellation: Arc<AtomicBool>,
     ) -> Result<(Self, bool), LibraryError> {
-        let library = Self { roots, db };
+        Self::load_or_scan_db_with_reader(roots, db, progress, cancellation, None)
+    }
+
+    fn load_or_scan_db_with_reader(
+        roots: Vec<LibraryRoot>,
+        db: Arc<Database>,
+        progress: Option<ScanObserver<'_>>,
+        cancellation: Arc<AtomicBool>,
+        tag_reader: Option<Arc<TagReader>>,
+    ) -> Result<(Self, bool), LibraryError> {
+        let library = Self {
+            roots,
+            db,
+            cancellation,
+            tag_reader,
+            cancel_reads: false,
+            cache_generation: Arc::new(
+                std::sync::atomic::AtomicU64::new(next_catalog_generation()),
+            ),
+            metadata_generation: Arc::new(std::sync::atomic::AtomicU64::new(
+                next_catalog_generation(),
+            )),
+            browse_projection: Arc::new(Default::default()),
+            search_state: Arc::new(Default::default()),
+        };
+        library.check_cancelled()?;
         let mut scanned = false;
         match read_version(&library.db)? {
             Some(version) if version == INDEX_VERSION => {
@@ -160,7 +348,15 @@ impl Library {
                     info!(
                         "Restoring local metadata before verified enrichment in existing database"
                     );
-                    indexing::scan(&library.roots, &library.db, false, None, progress)?;
+                    indexing::scan(
+                        &library.roots,
+                        &library.db,
+                        false,
+                        None,
+                        progress,
+                        &library.cancellation,
+                        library.tag_reader.as_ref(),
+                    )?;
                     scanned = true;
                 } else {
                     info!("Loaded index from existing database");
@@ -168,12 +364,28 @@ impl Library {
             }
             Some(version) => {
                 warn!("Index version mismatch ({}); rescanning", version);
-                indexing::scan(&library.roots, &library.db, true, None, progress)?;
+                indexing::scan(
+                    &library.roots,
+                    &library.db,
+                    true,
+                    None,
+                    progress,
+                    &library.cancellation,
+                    library.tag_reader.as_ref(),
+                )?;
                 scanned = true;
             }
             None => {
                 warn!("Index missing; scanning");
-                indexing::scan(&library.roots, &library.db, true, None, progress)?;
+                indexing::scan(
+                    &library.roots,
+                    &library.db,
+                    true,
+                    None,
+                    progress,
+                    &library.cancellation,
+                    library.tag_reader.as_ref(),
+                )?;
                 scanned = true;
             }
         }
@@ -185,21 +397,69 @@ impl Library {
         Ok(Arc::new(db))
     }
 
+    pub fn open_db_with_cache(
+        path: &Path,
+        cache_bytes: usize,
+    ) -> Result<Arc<Database>, LibraryError> {
+        Ok(Arc::new(storage::open_or_create_db_with_cache(
+            path,
+            cache_bytes,
+        )?))
+    }
+
     pub fn rescan(&self) -> Result<LibraryStats, LibraryError> {
         let started = std::time::Instant::now();
-        let _scan = indexing::SCAN_LOCK.lock();
-        let write = self.db.begin_write()?;
+        let _scan = indexing::scan_lock(&self.cancellation)?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         backup::discard_retained(&write)?;
-        write.commit()?;
-        indexing::scan_locked(&self.roots, &self.db, true, None, started, None)
+        self.check_cancelled()?;
+        write.commit_cancellable(&self.cancellation)?;
+        let result = indexing::scan_locked(
+            &self.roots,
+            &self.db,
+            true,
+            None,
+            started,
+            None,
+            &self.cancellation,
+            self.tag_reader.as_ref(),
+        );
+        if result.is_ok() {
+            self.catalog_changed();
+        }
+        result
     }
 
     pub fn incremental_scan(&self) -> Result<LibraryStats, LibraryError> {
-        indexing::scan(&self.roots, &self.db, false, None, None)
+        let result = indexing::scan(
+            &self.roots,
+            &self.db,
+            false,
+            None,
+            None,
+            &self.cancellation,
+            self.tag_reader.as_ref(),
+        );
+        if result.is_ok() {
+            self.catalog_changed();
+        }
+        result
     }
 
     pub fn incremental_scan_paths(&self, paths: &[PathBuf]) -> Result<LibraryStats, LibraryError> {
-        indexing::scan(&self.roots, &self.db, false, Some(paths), None)
+        let result = indexing::scan(
+            &self.roots,
+            &self.db,
+            false,
+            Some(paths),
+            None,
+            &self.cancellation,
+            self.tag_reader.as_ref(),
+        );
+        if result.is_ok() {
+            self.catalog_changed();
+        }
+        result
     }
 
     pub fn scan_with_progress(
@@ -208,7 +468,53 @@ impl Library {
         changed_paths: Option<&[PathBuf]>,
         progress: ScanObserver<'_>,
     ) -> Result<LibraryStats, LibraryError> {
-        indexing::scan(&self.roots, &self.db, force, changed_paths, Some(progress))
+        let result = indexing::scan(
+            &self.roots,
+            &self.db,
+            force,
+            changed_paths,
+            Some(progress),
+            &self.cancellation,
+            self.tag_reader.as_ref(),
+        );
+        if result.is_ok() {
+            self.catalog_changed();
+        }
+        result
+    }
+
+    pub fn scan_with_changes(
+        &self,
+        force: bool,
+        changed_paths: Option<&[PathBuf]>,
+        progress: ScanObserver<'_>,
+    ) -> Result<ScanOutcome, LibraryError> {
+        self.scan_with_changes_and_prepare(force, changed_paths, progress, &|| {})
+    }
+
+    /// Invalidate metadata just before publication, leaving unchanged file
+    /// notifications free to reuse valid, already-running provider lookups.
+    pub fn scan_with_changes_and_prepare(
+        &self,
+        force: bool,
+        changed_paths: Option<&[PathBuf]>,
+        progress: ScanObserver<'_>,
+        before_commit: &(dyn Fn() + Sync),
+    ) -> Result<ScanOutcome, LibraryError> {
+        let result = indexing::scan_detailed(
+            &self.roots,
+            &self.db,
+            force,
+            changed_paths,
+            Some(progress),
+            &self.cancellation,
+            Some(before_commit),
+            self.tag_reader.as_ref(),
+        );
+        if result.as_ref().is_ok_and(|outcome| outcome.changes.changed) {
+            self.catalog_changed();
+        }
+        result
     }
 
     pub fn roots(&self) -> &[LibraryRoot] {
@@ -275,6 +581,7 @@ pub struct TagErrorFile {
 
 #[derive(Debug)]
 pub enum LibraryError {
+    Cancelled,
     Io(std::io::Error),
     Metadata(MetadataError),
     Redb(redb::Error),
@@ -287,6 +594,7 @@ pub enum LibraryError {
 impl std::fmt::Display for LibraryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LibraryError::Cancelled => write!(f, "library work cancelled"),
             LibraryError::Io(err) => write!(f, "io error: {}", err),
             LibraryError::Metadata(err) => write!(f, "metadata error: {:?}", err),
             LibraryError::Redb(err) => write!(f, "db error: {}", err),
@@ -299,6 +607,14 @@ impl std::fmt::Display for LibraryError {
                 write!(f, "index version mismatch: {}", version)
             }
         }
+    }
+}
+
+fn check_cancelled(cancellation: &AtomicBool) -> Result<(), LibraryError> {
+    if cancellation.load(Ordering::Acquire) {
+        Err(LibraryError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

@@ -1,13 +1,13 @@
 //! Connection-bound OPAQUE authentication. Pending state never survives a restart.
 use crate::{
     auth::{AuthStore, SessionToken},
-    http::json_error,
+    http::{json_error, login_device},
     security_protocol::{self as protocol, Suite},
     state::{AppState, JsonResult},
 };
 use axum::{
     extract::{Extension, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -275,9 +275,16 @@ fn begin(
 pub async fn finish(
     State(state): State<AppState>,
     Extension(tls): Extension<TlsConnection>,
+    headers: HeaderMap,
     Json(payload): Json<FinishRequest>,
 ) -> JsonResult<FinishResponse> {
-    let session = complete(&state.auth, &state.security, tls, payload)?;
+    let session = complete(
+        &state.auth,
+        &state.security,
+        tls,
+        payload,
+        &login_device(&headers),
+    )?;
     let config = state.config.read();
     Ok(Json(FinishResponse {
         token: session.token,
@@ -293,6 +300,7 @@ fn complete(
     security: &SecurityState,
     tls: TlsConnection,
     payload: FinishRequest,
+    device: &str,
 ) -> AuthResult<SessionToken> {
     let denied = || json_error(StatusCode::UNAUTHORIZED, "unable to sign in");
     if payload.attempt.len() > 64 || payload.message.len() > 2048 {
@@ -324,7 +332,7 @@ fn complete(
         )
         .map_err(|_| denied())?;
     let id = attempt.user_id.ok_or_else(denied)?;
-    auth.create_bound_session(&id, &attempt.record_hash)
+    auth.create_bound_session_with_device(&id, &attempt.record_hash, device)
         .map_err(|_| denied())
 }
 
@@ -421,10 +429,33 @@ mod tests {
             attempt: proof.attempt.clone(),
             message: proof.message.clone(),
         };
-        let session = complete(&f.auth, &f.security, tls(1), proof)
+        let session = complete(&f.auth, &f.security, tls(1), proof, "Phonolite on Android")
             .unwrap_or_else(|_| panic!("finish failed"));
         assert!(f.auth.user_from_token(&session.token).unwrap().is_some());
-        assert!(complete(&f.auth, &f.security, tls(1), replay).is_err());
+        let activity = f.auth.user_activity().unwrap();
+        let activity = activity.get(&session.user_id).unwrap();
+        assert_eq!(
+            activity.active_sessions, 0,
+            "issuing a token alone does not connect a client"
+        );
+        let _connection = f.auth.connect_session(&session.token);
+        assert_eq!(
+            f.auth.user_activity().unwrap()[&session.user_id].active_sessions,
+            1
+        );
+        assert_eq!(
+            activity.last_login.as_ref().unwrap().device,
+            "Phonolite on Android"
+        );
+        assert!(complete(&f.auth, &f.security, tls(1), replay, "Unknown device").is_err());
+        assert_eq!(
+            f.auth.user_activity().unwrap()[&session.user_id]
+                .last_login
+                .as_ref()
+                .unwrap()
+                .device,
+            "Phonolite on Android"
+        );
     }
     #[test]
     fn incorrect_password_unknown_user_and_relay_binding_fail() {
@@ -437,12 +468,12 @@ mod tests {
     fn switching_tls_connection_or_modifying_final_proof_fails() {
         let f = Fixture::new();
         let p = proof(&f, "listener", "correct password", 1).unwrap();
-        assert!(complete(&f.auth, &f.security, tls(2), p).is_err());
+        assert!(complete(&f.auth, &f.security, tls(2), p, "Unknown device").is_err());
         let mut p = proof(&f, "listener", "correct password", 1).unwrap();
         let mut bytes = STANDARD.decode(p.message).unwrap();
         bytes[0] ^= 1;
         p.message = STANDARD.encode(bytes);
-        assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
+        assert!(complete(&f.auth, &f.security, tls(1), p, "Unknown device").is_err());
     }
     #[test]
     fn password_reset_invalidates_pending_proof_and_existing_session() {
@@ -453,7 +484,7 @@ mod tests {
         f.auth
             .update_password(&user.id, "replacement password")
             .unwrap();
-        assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
+        assert!(complete(&f.auth, &f.security, tls(1), p, "Unknown device").is_err());
         assert!(f.auth.user_from_token(&session.token).unwrap().is_none());
     }
 
@@ -469,7 +500,7 @@ mod tests {
                 .unwrap();
             // Even before optional in-memory cleanup, a proof against the old
             // credential cannot mint a session after the atomic credential update.
-            assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
+            assert!(complete(&f.auth, &f.security, tls(1), p, "Unknown device").is_err());
             assert!(f.auth.user_from_token(&session.token).unwrap().is_some());
         }
     }
@@ -515,7 +546,7 @@ mod tests {
             .get_mut(&p.attempt)
             .unwrap()
             .created -= Duration::from_secs(91);
-        assert!(complete(&f.auth, &f.security, tls(1), p).is_err());
+        assert!(complete(&f.auth, &f.security, tls(1), p, "Unknown device").is_err());
         for _ in 0..19 {
             assert!(f.security.reserve(tls(1).peer, "listener").is_ok());
         }

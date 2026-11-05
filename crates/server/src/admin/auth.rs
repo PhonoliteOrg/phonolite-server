@@ -26,6 +26,9 @@ pub async fn admin_setup_submit(
     headers: HeaderMap,
     Form(form): Form<SetupForm>,
 ) -> Response {
+    if let Err(response) = ensure_auth_mutation_running(&state) {
+        return response;
+    }
     if state.auth.has_admin().unwrap_or(false) {
         return redirect_to("/login");
     }
@@ -36,7 +39,15 @@ pub async fn admin_setup_submit(
         return admin_setup_page(&state, Some("passwords do not match".to_string()));
     }
 
-    let user = match state.auth.create_superadmin(&form.username, &form.password) {
+    let result = match run_auth_commit(&state, "admin_setup", move |store| {
+        store.create_superadmin(&form.username, &form.password)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let user = match result {
         Ok(user) => user,
         Err(err) => {
             let message = format!("setup failed: {}", err);
@@ -53,7 +64,16 @@ pub async fn admin_setup_submit(
         }
     };
 
-    let session = match state.auth.create_session(&user.id) {
+    let user_id = user.id.clone();
+    let result = match run_auth_commit(&state, "admin_session_create", move |store| {
+        store.create_console_session(&user_id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let session = match result {
         Ok(session) => session,
         Err(err) => {
             return html_error(
@@ -84,11 +104,22 @@ pub async fn admin_login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    if let Err(response) = ensure_auth_mutation_running(&state) {
+        return response;
+    }
     if !state.auth.has_admin().unwrap_or(false) {
         return redirect_to("/setup");
     }
 
-    let user = match state.auth.authenticate(&form.username, &form.password) {
+    let result = match run_auth_commit(&state, "admin_authenticate", move |store| {
+        store.authenticate(&form.username, &form.password)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let user = match result {
         Ok(Some(user)) if is_admin(&user) => user,
         Ok(Some(_)) => {
             if wants_json(&headers) {
@@ -111,7 +142,16 @@ pub async fn admin_login_submit(
         }
     };
 
-    let session = match state.auth.create_session(&user.id) {
+    let user_id = user.id.clone();
+    let result = match run_auth_commit(&state, "admin_session_create", move |store| {
+        store.create_console_session(&user_id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let session = match result {
         Ok(session) => session,
         Err(err) => {
             return html_error(
@@ -131,8 +171,17 @@ pub async fn admin_login_submit(
 }
 
 pub async fn admin_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = ensure_auth_mutation_running(&state) {
+        return response;
+    }
     if let Some(token) = extract_session_cookie(&headers) {
-        let _ = state.auth.revoke_session(&token);
+        if let Err(response) = run_auth_commit(&state, "admin_session_revoke", move |store| {
+            store.revoke_session(&token)
+        })
+        .await
+        {
+            return response;
+        }
     }
     let mut response = redirect_to("/login");
     response
@@ -201,4 +250,37 @@ pub(crate) fn admin_login_page(state: &AppState, message: Option<String>) -> Res
         &body,
         PageLayout::centered(),
     )
+}
+
+pub(super) fn ensure_auth_mutation_running(state: &AppState) -> Result<(), Response> {
+    if state.shutdown.is_cancelled() {
+        Err(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ))
+    } else {
+        Ok(())
+    }
+}
+pub(super) async fn run_auth_commit<R, F>(
+    state: &AppState,
+    name: &str,
+    work: F,
+) -> Result<Result<R, crate::auth::AuthError>, Response>
+where
+    R: Send + 'static,
+    F: FnOnce(crate::auth::AuthStore) -> Result<R, crate::auth::AuthError> + Send + 'static,
+{
+    ensure_auth_mutation_running(state)?;
+    let store = state.auth.clone();
+    state
+        .shutdown
+        .spawn_blocking_commit(name, move || work(store))
+        .await
+        .map_err(|err| {
+            json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("authentication task failed: {err}"),
+            )
+        })
 }

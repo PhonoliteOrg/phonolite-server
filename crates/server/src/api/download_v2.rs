@@ -2,44 +2,56 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 
 use axum::{
-    body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
-    response::{IntoResponse, Response},
+    response::Response,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
 use crate::download_jobs::{
     DownloadJob, DownloadJobItem, DownloadJobItemStatus, DownloadJobScope, DownloadJobStatus,
+    DownloadJobStore,
 };
+use crate::download_profile::DownloadProfile;
 use crate::http::{json_error, json_error_response};
-use crate::range::{parse_range_header, ByteRange};
 use crate::state::{AppState, AuthContext, JsonResult};
 
 use super::{
-    library_or_json_error, library_or_response,
+    library_or_json_error,
     views::{build_album_view, build_artist_view, liked_set, playlist_set},
 };
 use crate::download_files::{
-    checksum_for_file, download_content_disposition, download_content_type,
-    download_etag_from_metadata, percent_encode_path_component, range_error_response,
+    download_content_type, download_etag_from_metadata, percent_encode_path_component,
 };
 use crate::offline_metadata::{offline_metadata_for_track, OFFLINE_METADATA_SCHEMA_VERSION};
 
 #[derive(Serialize)]
 pub struct ServerCapabilitiesResponse {
+    pub download_profiles: [&'static str; 5],
+    pub account_events_v2: &'static str,
+    pub shuffle_presets: &'static str,
+    pub last_track: &'static str,
+    pub playback_resume: &'static str,
+    pub playback_presence: bool,
+    pub session_management: &'static str,
+    pub catalogue_events: &'static str,
+
+    pub account_collections_sync: &'static str,
+    pub atomic_playlist_tracks: &'static str,
     pub download_jobs_v2: &'static str,
     pub metadata_snapshots_v2: &'static str,
     pub event_replay_v2: &'static str,
     pub track_file_contract_v2: &'static str,
+    pub artist_summaries: &'static str,
+    pub artist_thumbnails: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateDownloadJobRequest {
+    #[serde(default)]
+    pub profile: DownloadProfile,
     pub client_id: String,
     pub client_request_id: String,
     pub scope: DownloadJobScope,
@@ -72,10 +84,23 @@ pub struct MetadataSnapshotResponse {
 
 pub async fn get_capabilities() -> Json<ServerCapabilitiesResponse> {
     Json(ServerCapabilitiesResponse {
+        download_profiles: DownloadProfile::ALL,
+        account_events_v2: "1",
+        shuffle_presets: "1",
+        last_track: "1",
+        playback_resume: "1",
+        playback_presence: true,
+        session_management: "1",
+        catalogue_events: "1",
+
+        account_collections_sync: "1",
+        atomic_playlist_tracks: "1",
         download_jobs_v2: "1",
         metadata_snapshots_v2: "1",
         event_replay_v2: "1",
         track_file_contract_v2: "1",
+        artist_summaries: "1",
+        artist_thumbnails: "1",
     })
 }
 
@@ -84,48 +109,98 @@ pub async fn create_download_job(
     Extension(ctx): Extension<AuthContext>,
     Json(request): Json<CreateDownloadJobRequest>,
 ) -> JsonResult<DownloadJob> {
+    ensure_download_mutation_running(&state)?;
     let client_id = required_text(&request.client_id, "client_id")?;
     let client_request_id = required_text(&request.client_request_id, "client_request_id")?;
     let scope = normalize_scope(request.scope)?;
+    let profile = request.profile;
+
+    // A cached job must not outlive access to its source playlist.
+    ensure_playlist_scope_access(&state, &ctx.user.id, &scope)?;
 
     if let Some(job) = state
         .download_jobs
         .get_by_request(&ctx.user.id, &client_id, &client_request_id)
         .map_err(store_error)?
     {
+        if job.profile != profile {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "request id already belongs to a different download profile",
+            ));
+        }
+        // Idempotent request lookup returns the stored scope, which can differ
+        // from the retried request's body.
+        ensure_playlist_scope_access(&state, &ctx.user.id, &job.scope)?;
+        crate::download_renditions::schedule(&state, &job);
         return Ok(Json(job));
     }
     if let Some(job) = state
         .download_jobs
-        .get_by_scope(&ctx.user.id, &client_id, &scope)
+        .get_by_scope_profile(&ctx.user.id, &client_id, &scope, profile)
         .map_err(store_error)?
     {
+        crate::download_renditions::schedule(&state, &job);
         return Ok(Json(job));
     }
 
     let library = library_or_json_error(&state)?;
-    let liked = liked_set(&state)?;
-    let playlists = playlist_set(&state)?;
-    let track_ids = expand_scope(&state, &library, &scope)?;
-    let items = resolve_job_items(&library, &liked, &playlists, track_ids).await;
-    let job = state.download_jobs.create_record(
-        ctx.user.id.clone(),
-        client_id,
-        client_request_id,
-        scope,
-        items,
-    );
-    let job = state.download_jobs.upsert_job(job).map_err(store_error)?;
-    let _ = state
-        .download_jobs
-        .append_event(job.clone(), "job_created", "download job created");
-    Ok(Json(
-        state
-            .download_jobs
-            .get_job(&job.job_id)
-            .map_err(store_error)?
-            .unwrap_or(job),
-    ))
+    let preparation_state = state.clone();
+    let preparation_user = ctx.user.id.clone();
+    let preparation_scope = scope.clone();
+    let preparation_flag = state.shutdown.flag();
+    let mut items = state
+        .shutdown
+        .spawn_cancellable_blocking("download_job_prepare", move || {
+            Ok((|| {
+                let liked = liked_set(&preparation_state, &preparation_user)?;
+                let playlists = playlist_set(&preparation_state, &preparation_user)?;
+                let track_ids = expand_scope(
+                    &preparation_state,
+                    &library,
+                    &preparation_user,
+                    &preparation_scope,
+                )?;
+                resolve_job_items(&library, &liked, &playlists, track_ids, &preparation_flag)
+            })())
+        })
+        .await
+        .map_err(download_task_error)?
+        .map_err(|err| json_error(StatusCode::SERVICE_UNAVAILABLE, err))??;
+    for item in &mut items {
+        item.profile = profile;
+        if profile != DownloadProfile::Original
+            && item.status == DownloadJobItemStatus::ReadyToDownload
+        {
+            item.status = DownloadJobItemStatus::Queued;
+            item.download_url = None;
+            item.byte_length = None;
+            item.content_type = None;
+            item.etag = None;
+            item.sha256 = None;
+        }
+    }
+    let result = run_download_commit(&state, "download_job_create", move |store| {
+        let job = store.create_record_with_profile(
+            ctx.user.id.clone(),
+            client_id,
+            client_request_id,
+            scope,
+            items,
+            profile,
+        );
+        let job = store.upsert_job(job).map_err(store_error)?;
+        let _ = store.append_event(job.clone(), "job_created", "download job created");
+        Ok(Json(
+            store
+                .get_job(&job.job_id)
+                .map_err(store_error)?
+                .unwrap_or(job),
+        ))
+    })
+    .await?;
+    crate::download_renditions::schedule(&state, &result.0);
+    Ok(result)
 }
 
 pub async fn list_download_jobs(
@@ -133,7 +208,7 @@ pub async fn list_download_jobs(
     Extension(ctx): Extension<AuthContext>,
     Query(query): Query<DownloadJobQuery>,
 ) -> JsonResult<Vec<DownloadJob>> {
-    let jobs = state
+    let mut jobs = state
         .download_jobs
         .list_jobs(
             &ctx.user.id,
@@ -142,6 +217,9 @@ pub async fn list_download_jobs(
             query.scope_id.as_deref(),
         )
         .map_err(store_error)?;
+    for job in &mut jobs {
+        refresh_preparation(&state, job)?;
+    }
     Ok(Json(jobs))
 }
 
@@ -150,12 +228,13 @@ pub async fn get_download_job(
     Extension(ctx): Extension<AuthContext>,
     AxumPath(job_id): AxumPath<String>,
 ) -> JsonResult<DownloadJob> {
-    let Some(job) = state.download_jobs.get_job(&job_id).map_err(store_error)? else {
+    let Some(mut job) = state.download_jobs.get_job(&job_id).map_err(store_error)? else {
         return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
     };
     if job.user_id != ctx.user.id {
         return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
     }
+    refresh_preparation(&state, &mut job)?;
     Ok(Json(job))
 }
 
@@ -165,69 +244,99 @@ pub async fn apply_download_job_action(
     AxumPath(job_id): AxumPath<String>,
     Json(request): Json<DownloadJobActionRequest>,
 ) -> JsonResult<DownloadJob> {
-    let Some(mut job) = state.download_jobs.get_job(&job_id).map_err(store_error)? else {
+    let interrupted = matches!(request.action.trim(), "pause" | "cancel" | "delete");
+    let result = run_download_commit(&state, "download_job_action", move |store| {
+        let lock = crate::download_renditions::job_lock(&job_id);
+        let _guard = lock.lock();
+        let Some(mut job) = store.get_job(&job_id).map_err(store_error)? else {
+            return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
+        };
+        if job.user_id != ctx.user.id {
+            return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
+        }
+
+        match request.action.trim() {
+            "pause" => job.status = DownloadJobStatus::Paused,
+            "resume" => {
+                job.status = if job.ready_count > 0 {
+                    DownloadJobStatus::ReadyToDownload
+                } else {
+                    DownloadJobStatus::Queued
+                };
+            }
+            "cancel" => {
+                job.status = DownloadJobStatus::Canceled;
+                for item in &mut job.items {
+                    if !matches!(
+                        item.status,
+                        DownloadJobItemStatus::Complete | DownloadJobItemStatus::MetadataFailed
+                    ) {
+                        item.status = DownloadJobItemStatus::Canceled;
+                    }
+                }
+            }
+            "retry_failed" => {
+                for item in &mut job.items {
+                    if matches!(
+                        item.status,
+                        DownloadJobItemStatus::Failed | DownloadJobItemStatus::MetadataFailed
+                    ) {
+                        item.status = DownloadJobItemStatus::Queued;
+                        item.error = None;
+                    }
+                }
+                job.status = DownloadJobStatus::Queued;
+            }
+            "delete" => {
+                store.delete_job(&job).map_err(store_error)?;
+                return Ok(Json(job));
+            }
+            _ => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported download job action",
+                ))
+            }
+        }
+        let job = store.upsert_job(job).map_err(store_error)?;
+        let _ = store.append_event(
+            job.clone(),
+            "job_updated",
+            format!("download job action applied: {}", request.action.trim()),
+        );
+        Ok(Json(
+            store
+                .get_job(&job.job_id)
+                .map_err(store_error)?
+                .unwrap_or(job),
+        ))
+    })
+    .await?;
+    if interrupted {
+        crate::download_renditions::interrupt(&result.0.job_id);
+    } else {
+        crate::download_renditions::schedule(&state, &result.0);
+    }
+    Ok(result)
+}
+
+fn refresh_preparation(
+    state: &AppState,
+    job: &mut DownloadJob,
+) -> Result<(), (StatusCode, Json<crate::state::ErrorResponse>)> {
+    let lock = crate::download_renditions::job_lock(&job.job_id);
+    let _guard = lock.lock();
+    let Some(current) = state
+        .download_jobs
+        .get_job(&job.job_id)
+        .map_err(store_error)?
+    else {
         return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
     };
-    if job.user_id != ctx.user.id {
-        return Err(json_error(StatusCode::NOT_FOUND, "download job not found"));
-    }
-
-    match request.action.trim() {
-        "pause" => job.status = DownloadJobStatus::Paused,
-        "resume" => {
-            job.status = if job.ready_count > 0 {
-                DownloadJobStatus::ReadyToDownload
-            } else {
-                DownloadJobStatus::Queued
-            };
-        }
-        "cancel" => {
-            job.status = DownloadJobStatus::Canceled;
-            for item in &mut job.items {
-                if !matches!(
-                    item.status,
-                    DownloadJobItemStatus::Complete | DownloadJobItemStatus::MetadataFailed
-                ) {
-                    item.status = DownloadJobItemStatus::Canceled;
-                }
-            }
-        }
-        "retry_failed" => {
-            for item in &mut job.items {
-                if matches!(
-                    item.status,
-                    DownloadJobItemStatus::Failed | DownloadJobItemStatus::MetadataFailed
-                ) {
-                    item.status = DownloadJobItemStatus::Queued;
-                    item.error = None;
-                }
-            }
-            job.status = DownloadJobStatus::Queued;
-        }
-        "delete" => {
-            state.download_jobs.delete_job(&job).map_err(store_error)?;
-            return Ok(Json(job));
-        }
-        _ => {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "unsupported download job action",
-            ))
-        }
-    }
-    let job = state.download_jobs.upsert_job(job).map_err(store_error)?;
-    let _ = state.download_jobs.append_event(
-        job.clone(),
-        "job_updated",
-        format!("download job action applied: {}", request.action.trim()),
-    );
-    Ok(Json(
-        state
-            .download_jobs
-            .get_job(&job.job_id)
-            .map_err(store_error)?
-            .unwrap_or(job),
-    ))
+    *job = current;
+    crate::download_renditions::refresh_missing(state, job).map_err(store_error)?;
+    crate::download_renditions::schedule(state, job);
+    Ok(())
 }
 
 pub async fn download_job_events(
@@ -275,7 +384,7 @@ pub async fn metadata_events(
 
 pub async fn metadata_snapshot(
     State(state): State<AppState>,
-    Extension(_ctx): Extension<AuthContext>,
+    Extension(ctx): Extension<AuthContext>,
     AxumPath((kind, id)): AxumPath<(String, String)>,
 ) -> JsonResult<MetadataSnapshotResponse> {
     let library = library_or_json_error(&state)?;
@@ -291,8 +400,8 @@ pub async fn metadata_snapshot(
                     )
                 })?
                 .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "track not found"))?;
-            let liked = liked_set(&state)?;
-            let playlists = playlist_set(&state)?;
+            let liked = liked_set(&state, &ctx.user.id)?;
+            let playlists = playlist_set(&state, &ctx.user.id)?;
             serde_json::to_value(
                 offline_metadata_for_track(&library, &track, &liked, &playlists)
                     .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, err))?,
@@ -351,122 +460,102 @@ pub async fn download_track_file(
     AxumPath(track_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    let library = match library_or_response(&state) {
+    super::track_files::track_file_response(
+        &state,
+        &track_id,
+        &headers,
+        crate::download_files::FileDelivery::Download,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct RenditionQuery {
+    pub rendition_id: String,
+}
+
+/// Job ownership is checked independently of a cached file's reusable identity.
+pub async fn download_prepared_file(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    AxumPath((job_id, track_id)): AxumPath<(String, String)>,
+    Query(query): Query<RenditionQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match state.download_jobs.get_job(&job_id) {
+        Ok(Some(job)) if job.user_id == ctx.user.id => job,
+        _ => return json_error_response(StatusCode::NOT_FOUND, "download job not found"),
+    };
+    if let Err((status, error)) = ensure_playlist_scope_access(&state, &ctx.user.id, &job.scope) {
+        return json_error_response(status, error.0.error);
+    }
+    if matches!(
+        job.status,
+        DownloadJobStatus::Canceled | DownloadJobStatus::Removing
+    ) {
+        return json_error_response(StatusCode::GONE, "download job no longer available");
+    }
+    let Some(item) = job.items.iter().find(|item| {
+        item.track_id == track_id
+            && item.status == DownloadJobItemStatus::ReadyToDownload
+            && item.rendition_id.as_deref() == Some(query.rendition_id.as_str())
+            && item.profile == job.profile
+            && job.profile != DownloadProfile::Original
+    }) else {
+        return json_error_response(
+            StatusCode::CONFLICT,
+            "download rendition is not ready; refresh job",
+        );
+    };
+    let Some(path) = crate::download_renditions::file_path(&state, &query.rendition_id)
+        .filter(|_| crate::download_renditions::is_ready(&state, &query.rendition_id))
+    else {
+        return json_error_response(StatusCode::GONE, "download rendition expired; refresh job");
+    };
+    let library = match library_or_json_error(&state) {
         Ok(library) => library,
-        Err(response) => return response,
+        Err((status, error)) => return json_error_response(status, error.0.error),
     };
     let track = match library.get_track(&track_id) {
         Ok(Some(track)) => track,
-        Ok(None) => return json_error_response(StatusCode::NOT_FOUND, "track not found"),
-        Err(err) => {
-            return json_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("library error: {}", err),
-            )
-        }
+        _ => return json_error_response(StatusCode::NOT_FOUND, "track not found"),
     };
-    let path = match library.resolve_relpath(&track.file_relpath) {
-        Some(path) => path,
-        None => {
-            return json_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "music root not configured",
-            )
-        }
-    };
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return json_error_response(StatusCode::NOT_FOUND, "track file not found"),
-        Err(_) => return json_error_response(StatusCode::NOT_FOUND, "track file not found"),
-    };
-    let size = metadata.len();
-    let etag = download_etag_from_metadata(&track, &metadata);
-    let sha256 = checksum_for_file(&path, &metadata).await.ok();
-    let range_header = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok());
-    let if_range_matches = headers
-        .get(header::IF_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim() == etag.as_str())
-        .unwrap_or(true);
-    let range = match range_header.filter(|_| if_range_matches) {
-        Some(value) => match parse_range_header(value, size) {
-            Ok(range) => Some(range),
-            Err(err) => return range_error_response(err, size),
-        },
-        None => None,
-    };
-
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(_) => return json_error_response(StatusCode::NOT_FOUND, "track file not found"),
-    };
-
-    let (status, start, end, content_len) = match range {
-        Some(ByteRange { start, end }) => {
-            if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
-                return json_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("file seek failed: {}", err),
-                );
-            }
-            let len = end.saturating_sub(start).saturating_add(1);
-            (StatusCode::PARTIAL_CONTENT, start, Some(end), len)
-        }
-        None => (StatusCode::OK, 0, None, size),
-    };
-
-    let stream = ReaderStream::new(file.take(content_len));
-    let mut response = Response::builder().status(status);
-    let headers = response.headers_mut().expect("response headers");
-    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&download_content_type(&path))
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-    );
-    headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&content_len.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
-    );
-    headers.insert(
-        header::ETAG,
-        HeaderValue::from_str(&etag)
-            .unwrap_or_else(|_| HeaderValue::from_static("\"phonolite-download-v2\"")),
-    );
-    if let Some(sha256) = sha256 {
-        if let Ok(value) = HeaderValue::from_str(&sha256) {
-            headers.insert("x-phonolite-sha256", value);
-        }
+    let mut response = crate::download_files::track_file_response(
+        &track,
+        &path,
+        &headers,
+        crate::download_files::FileDelivery::Download,
+        &state.shutdown,
+    )
+    .await;
+    if let Ok(value) = axum::http::HeaderValue::from_str(item.profile.id()) {
+        response
+            .headers_mut()
+            .insert("x-phonolite-download-profile", value);
     }
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&download_content_disposition(&track, &path))
-            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
-    );
-    if let Some(end) = end {
-        headers.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, size))
-                .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
-        );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&query.rendition_id) {
+        response
+            .headers_mut()
+            .insert("x-phonolite-rendition-id", value);
     }
-
     response
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-async fn resolve_job_items(
+fn resolve_job_items(
     library: &library::Library,
     liked_set: &HashSet<String>,
     playlist_set: &HashSet<String>,
     track_ids: Vec<String>,
-) -> Vec<DownloadJobItem> {
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<DownloadJobItem>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let mut items = Vec::new();
     for (position, track_id) in track_ids.into_iter().enumerate() {
+        if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server shutting down",
+            ));
+        }
         let track = match library.get_track(&track_id) {
             Ok(Some(track)) => track,
             Ok(None) => {
@@ -489,7 +578,7 @@ async fn resolve_job_items(
                 continue;
             }
         };
-        let metadata = match tokio::fs::metadata(&path).await {
+        let metadata = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
             _ => {
                 items.push(failed_item(position, track.id, "track file not found"));
@@ -505,6 +594,8 @@ async fn resolve_job_items(
                 }
             };
         items.push(DownloadJobItem {
+            profile: DownloadProfile::Original,
+            rendition_id: None,
             position,
             track_id: track.id.clone(),
             status: DownloadJobItemStatus::ReadyToDownload,
@@ -520,12 +611,34 @@ async fn resolve_job_items(
             error: None,
         });
     }
-    items
+    Ok(items)
+}
+
+fn ensure_playlist_scope_access(
+    state: &AppState,
+    user_id: &str,
+    scope: &DownloadJobScope,
+) -> Result<(), (StatusCode, Json<crate::state::ErrorResponse>)> {
+    if scope.kind == "playlist" {
+        let playlist_id = required_scope_id(scope, "playlist")?;
+        state
+            .user_data
+            .get_playlist(user_id, &playlist_id)
+            .map_err(|err| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("playlist error: {:?}", err),
+                )
+            })?
+            .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "playlist not found"))?;
+    }
+    Ok(())
 }
 
 fn expand_scope(
     state: &AppState,
     library: &library::Library,
+    user_id: &str,
     scope: &DownloadJobScope,
 ) -> Result<Vec<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let mut ids =
@@ -566,7 +679,7 @@ fn expand_scope(
                 let playlist_id = required_scope_id(scope, "playlist")?;
                 state
                     .user_data
-                    .get_playlist(&playlist_id)
+                    .get_playlist(user_id, &playlist_id)
                     .map_err(|err| {
                         json_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -576,7 +689,7 @@ fn expand_scope(
                     .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "playlist not found"))?
                     .track_ids
             }
-            "liked" => state.user_data.list_likes().map_err(|err| {
+            "liked" => state.user_data.list_likes(user_id).map_err(|err| {
                 json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("likes error: {:?}", err),
@@ -663,6 +776,8 @@ fn failed_item(
     error: impl Into<String>,
 ) -> DownloadJobItem {
     DownloadJobItem {
+        profile: DownloadProfile::Original,
+        rendition_id: None,
         position,
         track_id: track_id.into(),
         status: DownloadJobItemStatus::MetadataFailed,
@@ -681,4 +796,44 @@ fn store_error(message: String) -> (StatusCode, Json<crate::state::ErrorResponse
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("download job store error: {}", message),
     )
+}
+
+fn ensure_download_mutation_running(
+    state: &AppState,
+) -> Result<(), (StatusCode, Json<crate::state::ErrorResponse>)> {
+    if state.shutdown.is_cancelled() {
+        Err(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn download_task_error(
+    error: tokio::task::JoinError,
+) -> (StatusCode, Json<crate::state::ErrorResponse>) {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("download job task failed: {error}"),
+    )
+}
+async fn run_download_commit<R, F>(
+    state: &AppState,
+    name: &str,
+    work: F,
+) -> Result<R, (StatusCode, Json<crate::state::ErrorResponse>)>
+where
+    R: Send + 'static,
+    F: FnOnce(DownloadJobStore) -> Result<R, (StatusCode, Json<crate::state::ErrorResponse>)>
+        + Send
+        + 'static,
+{
+    ensure_download_mutation_running(state)?;
+    let store = state.download_jobs.clone();
+    state
+        .shutdown
+        .spawn_blocking_commit(name, move || work(store))
+        .await
+        .map_err(download_task_error)?
 }

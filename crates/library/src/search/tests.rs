@@ -103,6 +103,134 @@ fn catalog_candidates_are_not_truncated_before_ranking() {
         .all(|(_, score)| *score < 90));
 }
 
+fn billed(library: &Library) -> Arc<HashSet<String>> {
+    let revision = library.search_revision();
+    let read = library.db.begin_read().unwrap();
+    library.search_billed_artist_ids(&read, revision).unwrap()
+}
+
+#[test]
+fn search_eligibility_reuses_one_shared_entry_and_invalidates_on_catalogue_changes() {
+    let workspace = TestCatalog::new();
+    workspace.audio("First/Record/Song.mp3");
+    let library = workspace.library();
+    let first = billed(&library);
+    assert!(Arc::ptr_eq(&first, &billed(&library.clone())));
+    library
+        .search_candidates(&LibrarySearchQuery::new("song"))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &billed(&library)));
+
+    workspace.audio("Second/Record/Other.mp3");
+    library.incremental_scan().unwrap();
+    let changed = billed(&library);
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(changed.len(), 2);
+    assert_eq!(*changed, library.billed_artist_ids().unwrap());
+}
+
+#[test]
+fn search_eligibility_invalidates_after_enrichment_and_restore() {
+    let workspace = TestCatalog::new();
+    workspace.audio("Artist/Record/Song.mp3");
+    let library = workspace.library();
+    let first = billed(&library);
+    let id = first.iter().next().unwrap();
+    library
+        .update_artist_enrichment(id, Some("Biography".into()), &[], None, None, false)
+        .unwrap();
+    let enriched = billed(&library);
+    assert!(!Arc::ptr_eq(&first, &enriched));
+    assert_eq!(*first, *enriched);
+
+    let backup = library.export_metadata().unwrap();
+    library.restore_metadata(&backup).unwrap();
+    let restored = billed(&library);
+    assert!(!Arc::ptr_eq(&enriched, &restored));
+    assert_eq!(*restored, library.billed_artist_ids().unwrap());
+}
+
+#[test]
+fn an_older_read_snapshot_never_populates_a_newer_eligibility_revision() {
+    let workspace = TestCatalog::new();
+    workspace.audio("First/Record/Song.mp3");
+    let library = workspace.library();
+    let old_revision = library.search_revision();
+    let old_read = library.db.begin_read().unwrap();
+    workspace.audio("Second/Record/Other.mp3");
+    library.incremental_scan().unwrap();
+    let current = billed(&library);
+    let old = library
+        .search_billed_artist_ids(&old_read, old_revision)
+        .unwrap();
+    assert_eq!(old.len(), 1);
+    assert_eq!(current.len(), 2);
+    assert!(Arc::ptr_eq(&current, &billed(&library)));
+}
+
+#[test]
+fn eligibility_cache_has_a_byte_budget() {
+    let mut ids = HashSet::new();
+    let mut oversized = String::with_capacity(MAX_BILLED_CACHE_BYTES);
+    oversized.push_str("artist");
+    ids.insert(oversized);
+    assert!(!billed_cache_fits(&ids));
+    assert!(billed_cache_fits(&HashSet::from(["artist".to_owned()])));
+}
+
+#[test]
+fn batch_search_metadata_matches_individual_reads_including_legacy_fallbacks() {
+    let workspace = TestCatalog::new();
+    workspace.audio("Alice/Record/Song.mp3");
+    workspace.audio("Björk/Record/Song.mp3");
+    let library = workspace.library();
+    let candidates = library
+        .search_candidates(&LibrarySearchQuery::new("record"))
+        .unwrap();
+    for legacy in [false, true] {
+        if legacy {
+            let write = library.db.begin_write().unwrap();
+            write
+                .delete_table(crate::storage::ALBUM_CREDITS_TABLE)
+                .unwrap();
+            write
+                .delete_table(crate::storage::TRACK_CREDITS_TABLE)
+                .unwrap();
+            write.commit().unwrap();
+            library.metadata_restored();
+        }
+        let metadata = library.search_metadata(&candidates).unwrap();
+        for ((album, _), display) in candidates
+            .albums
+            .iter()
+            .zip(&metadata.album_artist_displays)
+        {
+            assert_eq!(
+                *display,
+                library.album_credits(&album.id).unwrap().display_name
+            );
+        }
+        for ((track, _), display) in candidates
+            .tracks
+            .iter()
+            .zip(&metadata.track_artist_displays)
+        {
+            assert_eq!(
+                *display,
+                library.track_credits(&track.id).unwrap().display_name
+            );
+            assert_eq!(
+                metadata.artist_names[&track.artist_id],
+                library.get_artist(&track.artist_id).unwrap().unwrap().name
+            );
+            assert_eq!(
+                metadata.album_titles[&track.album_id],
+                library.get_album(&track.album_id).unwrap().unwrap().title
+            );
+        }
+    }
+}
+
 struct TestCatalog(PathBuf);
 
 impl TestCatalog {

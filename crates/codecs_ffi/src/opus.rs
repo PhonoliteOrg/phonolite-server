@@ -15,7 +15,10 @@ pub struct OpusDecoder {
 const OPUS_OK: c_int = 0;
 const OPUS_APPLICATION_AUDIO: c_int = 2049;
 const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
+const OPUS_SET_VBR_REQUEST: c_int = 4006;
 const OPUS_GET_LOOKAHEAD_REQUEST: c_int = 4027;
+const OPUS_RESET_STATE: c_int = 4028;
+const OPUS_SET_GAIN_REQUEST: c_int = 4034;
 const OPUS_MAX_FRAME_SIZE: usize = 5760;
 
 extern "C" {
@@ -36,6 +39,7 @@ extern "C" {
     fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
     fn opus_decoder_create(fs: c_int, channels: c_int, error: *mut c_int) -> *mut OpusDecoder;
     fn opus_decoder_destroy(st: *mut OpusDecoder);
+    fn opus_decoder_ctl(st: *mut OpusDecoder, request: c_int, ...) -> c_int;
     fn opus_decode(
         st: *mut OpusDecoder,
         data: *const u8,
@@ -141,6 +145,15 @@ impl OpusEncoderWrapper {
         Ok(())
     }
 
+    pub fn set_vbr(&mut self, enabled: bool) -> Result<(), OpusEncodeError> {
+        let result =
+            unsafe { opus_encoder_ctl(self.encoder, OPUS_SET_VBR_REQUEST, c_int::from(enabled)) };
+        if result != OPUS_OK {
+            return Err(OpusEncodeError::EncodeFailed);
+        }
+        Ok(())
+    }
+
     /// Encoder delay, in samples per channel, which a fresh decoder must discard.
     pub fn lookahead(&self) -> Result<u32, OpusEncodeError> {
         let mut samples: c_int = 0;
@@ -223,7 +236,7 @@ impl OpusDecoderWrapper {
     }
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<i16>, OpusDecodeError> {
-        if packet.is_empty() {
+        if packet.is_empty() || packet.len() > c_int::MAX as usize {
             return Err(OpusDecodeError::InvalidInput);
         }
         let mut out = vec![0i16; OPUS_MAX_FRAME_SIZE * self.channels as usize];
@@ -243,6 +256,24 @@ impl OpusDecoderWrapper {
         let samples = decoded as usize * self.channels as usize;
         out.truncate(samples);
         Ok(out)
+    }
+
+    /// Set the OpusHead output gain in signed Q8 decibels.
+    pub fn set_gain(&mut self, gain_q8: i16) -> Result<(), OpusDecodeError> {
+        let result =
+            unsafe { opus_decoder_ctl(self.decoder, OPUS_SET_GAIN_REQUEST, c_int::from(gain_q8)) };
+        if result != OPUS_OK {
+            return Err(OpusDecodeError::DecodeFailed);
+        }
+        Ok(())
+    }
+
+    pub fn reset(&mut self) -> Result<(), OpusDecodeError> {
+        let result = unsafe { opus_decoder_ctl(self.decoder, OPUS_RESET_STATE) };
+        if result != OPUS_OK {
+            return Err(OpusDecodeError::DecodeFailed);
+        }
+        Ok(())
     }
 
     pub fn sample_rate(&self) -> u32 {

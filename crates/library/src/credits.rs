@@ -9,6 +9,9 @@ use crate::storage::{
 };
 use crate::{ArtistReleaseContribution, ArtistReleaseRelationships, Library, LibraryError};
 
+mod read;
+pub(super) use read::CreditReader;
+
 pub(super) const DISPLAY_CREDIT_RESOLUTIONS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("display_credit_resolutions_v1");
 
@@ -356,8 +359,8 @@ pub(super) fn track_credit_search_text(credits: &ArtistCredits) -> String {
 // use verified joining words, or remove redundant names only when every part of
 // the local display is accounted for by independently indexed identities.
 fn presented_credits(
-    read: &redb::ReadTransaction,
     mut credits: ArtistCredits,
+    mut resolution: impl FnMut(&str) -> Result<Option<ArtistCredits>, LibraryError>,
 ) -> Result<ArtistCredits, LibraryError> {
     let billed: Vec<_> = credits
         .credits
@@ -373,44 +376,37 @@ fn presented_credits(
         .iter()
         .all(|&index| credits.credits[index].source != "local_tags_structured")
     {
-        match read.open_table(DISPLAY_CREDIT_RESOLUTIONS) {
-            Ok(table) => {
-                let key = display_credit_key(&credits.display_name);
-                if let Some(value) = table.get(key.as_str())? {
-                    let resolved: ArtistCredits = decode_value(value.value())?;
-                    if resolved.credits.len() == billed.len()
-                        && billed
-                            .iter()
-                            .zip(&resolved.credits)
-                            .all(|(&index, provider)| {
-                                artist_identity_key(&credits.credits[index].name)
-                                    == artist_identity_key(&provider.name)
-                            })
-                    {
-                        for (position, (&index, provider)) in
-                            billed.iter().zip(&resolved.credits).enumerate()
-                        {
-                            let credit = &mut credits.credits[index];
-                            credit.credited_name = if provider.credited_name.trim().is_empty() {
-                                provider.name.clone()
-                            } else {
-                                provider.credited_name.clone()
-                            };
-                            credit.join_phrase = if position + 1 == billed.len() {
-                                String::new()
-                            } else if provider.join_phrase.is_empty() {
-                                ", ".into()
-                            } else {
-                                provider.join_phrase.clone()
-                            };
-                        }
-                        credits.display_name = render_billed_credit(&credits, &billed);
-                        return Ok(credits);
-                    }
+        let key = display_credit_key(&credits.display_name);
+        if let Some(resolved) = resolution(&key)? {
+            if resolved.credits.len() == billed.len()
+                && billed
+                    .iter()
+                    .zip(&resolved.credits)
+                    .all(|(&index, provider)| {
+                        artist_identity_key(&credits.credits[index].name)
+                            == artist_identity_key(&provider.name)
+                    })
+            {
+                for (position, (&index, provider)) in
+                    billed.iter().zip(&resolved.credits).enumerate()
+                {
+                    let credit = &mut credits.credits[index];
+                    credit.credited_name = if provider.credited_name.trim().is_empty() {
+                        provider.name.clone()
+                    } else {
+                        provider.credited_name.clone()
+                    };
+                    credit.join_phrase = if position + 1 == billed.len() {
+                        String::new()
+                    } else if provider.join_phrase.is_empty() {
+                        ", ".into()
+                    } else {
+                        provider.join_phrase.clone()
+                    };
                 }
+                credits.display_name = render_billed_credit(&credits, &billed);
+                return Ok(credits);
             }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(err) => return Err(err.into()),
         }
     }
 
@@ -499,9 +495,21 @@ impl Library {
         album_id: &str,
         provider_credits: &[ArtistCredit],
     ) -> Result<bool, LibraryError> {
+        self.resolve_album_display_credit_with_guard(album_id, provider_credits, || Ok(()))
+    }
+
+    /// Acquire the source scan lock before a caller's result-application guard.
+    /// This lets a scan invalidate queued repairs without reversing lock order.
+    pub fn resolve_album_display_credit_with_guard<G>(
+        &self,
+        album_id: &str,
+        provider_credits: &[ArtistCredit],
+        application_guard: impl FnOnce() -> Result<G, LibraryError>,
+    ) -> Result<bool, LibraryError> {
         let started = std::time::Instant::now();
-        let _scan = crate::indexing::SCAN_LOCK.lock();
-        let write = self.db.begin_write()?;
+        let _scan = crate::indexing::scan_lock(&self.cancellation)?;
+        let _application_guard = application_guard()?;
+        let write = crate::begin_write_cancellable(&self.db, &self.cancellation)?;
         {
             let sources = write.open_table(ALBUM_CREDITS_TABLE)?;
             let Some(value) = sources.get(album_id)? else {
@@ -563,8 +571,19 @@ impl Library {
                 &[1u8][..],
             )?;
         }
-        write.commit()?;
-        crate::indexing::scan_locked(&self.roots, &self.db, false, None, started, None)?;
+        self.check_cancelled()?;
+        write.commit_cancellable(&self.cancellation)?;
+        crate::indexing::scan_locked(
+            &self.roots,
+            &self.db,
+            false,
+            None,
+            started,
+            None,
+            &self.cancellation,
+            self.tag_reader.as_ref(),
+        )?;
+        self.catalog_changed();
         Ok(true)
     }
 
@@ -585,54 +604,28 @@ impl Library {
 
     pub fn album_credits(&self, album_id: &str) -> Result<ArtistCredits, LibraryError> {
         let read = self.db.begin_read()?;
-        match read.open_table(ALBUM_CREDITS_TABLE) {
-            Ok(table) => {
-                if let Some(value) = table.get(album_id)? {
-                    return presented_credits(&read, decode_value(value.value())?);
-                }
-            }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-        let Some(album) = self.get_album(album_id)? else {
-            return Ok(ArtistCredits::default());
-        };
-        let mut names = album.artist_names.clone();
-        if names.is_empty() {
-            if let Some(artist) = self.get_artist(&album.artist_id)? {
-                names.push(artist.name);
-            }
-        }
-        let mut credits = source_credits(&names.join(", "), &names, "album_artist", "legacy");
-        for (credit, id) in credits.credits.iter_mut().zip(album.all_artist_ids()) {
-            credit.artist_id = id.clone();
-        }
-        Ok(credits)
+        self.album_credits_from_read(&read, album_id)
+    }
+
+    pub(super) fn album_credits_from_read(
+        &self,
+        read: &redb::ReadTransaction,
+        album_id: &str,
+    ) -> Result<ArtistCredits, LibraryError> {
+        CreditReader::new(read).load_album_credits(album_id)
     }
 
     pub fn track_credits(&self, track_id: &str) -> Result<ArtistCredits, LibraryError> {
         let read = self.db.begin_read()?;
-        match read.open_table(TRACK_CREDITS_TABLE) {
-            Ok(table) => {
-                if let Some(value) = table.get(track_id)? {
-                    return presented_credits(&read, decode_value(value.value())?);
-                }
-            }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-        let Some(track) = self.get_track(track_id)? else {
-            return Ok(ArtistCredits::default());
-        };
-        let name = self
-            .get_artist(&track.artist_id)?
-            .map(|artist| artist.name)
-            .unwrap_or_default();
-        let mut credits = source_credits(&name, &[name.clone()], "track_artist", "legacy");
-        if let Some(credit) = credits.credits.first_mut() {
-            credit.artist_id = track.artist_id;
-        }
-        Ok(credits)
+        self.track_credits_from_read(&read, track_id)
+    }
+
+    pub(super) fn track_credits_from_read(
+        &self,
+        read: &redb::ReadTransaction,
+        track_id: &str,
+    ) -> Result<ArtistCredits, LibraryError> {
+        CreditReader::new(read).load_track_credits(track_id)
     }
 
     pub fn track_artist_ids(&self, track_id: &str) -> Result<Vec<String>, LibraryError> {
@@ -649,6 +642,13 @@ impl Library {
     /// retained in the catalog, but do not by themselves qualify an artist.
     pub fn billed_artist_ids(&self) -> Result<HashSet<String>, LibraryError> {
         let read = self.db.begin_read()?;
+        self.billed_artist_ids_from_read(&read)
+    }
+
+    pub(super) fn billed_artist_ids_from_read(
+        &self,
+        read: &redb::ReadTransaction,
+    ) -> Result<HashSet<String>, LibraryError> {
         let mut ids = HashSet::new();
         for entry in read.open_table(ALBUMS_TABLE)?.iter()? {
             let (_, value) = entry?;

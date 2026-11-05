@@ -1,3 +1,6 @@
+#[path = "account_notifications.rs"]
+mod notifications;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,6 +10,9 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+const NOTIFICATION_REVISIONS: TableDefinition<&str, u64> =
+    TableDefinition::new("stats_notification_revisions_v1");
 
 const STATS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("stats");
 
@@ -34,22 +40,60 @@ pub struct UserPeriodStats {
 #[derive(Clone)]
 pub struct StatsStore {
     db: Arc<Database>,
+    notifications: notifications::AccountNotifications,
 }
 
 impl StatsStore {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: Default::default(),
+        }
     }
 
     pub fn init_tables(&self) -> Result<(), StatsError> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = ::library::begin_write(&self.db)?;
         {
             let _ = write_txn.open_table(STATS_TABLE)?;
+            let _ = write_txn.open_table(NOTIFICATION_REVISIONS)?;
         }
         write_txn.commit()?;
         self.init_ledger()?;
         self.init_counters()?;
         Ok(())
+    }
+
+    pub(crate) fn subscribe_changes(&self, user: &str) -> notifications::Subscription {
+        self.notifications.subscribe(user)
+    }
+
+    pub fn notification_revision(&self, user: &str) -> Result<u64, StatsError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(NOTIFICATION_REVISIONS)?;
+        let revision = table.get(user)?.map(|v| v.value()).unwrap_or(0);
+        Ok(revision)
+    }
+
+    fn advance_notification(
+        &self,
+        txn: &redb::WriteTransaction,
+        user: &str,
+    ) -> Result<(), StatsError> {
+        let mut table = txn.open_table(NOTIFICATION_REVISIONS)?;
+        let next = table
+            .get(user)?
+            .map(|v| v.value())
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                StatsError::Invalid("statistics notification revision exhausted".into())
+            })?;
+        table.insert(user, next)?;
+        Ok(())
+    }
+
+    fn notify_committed(&self, user: &str) {
+        self.notifications.notify(user);
     }
 
     pub fn get_period(
@@ -109,7 +153,7 @@ impl StatsStore {
     }
 
     fn clear_entry(&self, key: &str) -> Result<(), StatsError> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = ::library::begin_write(&self.db)?;
         {
             let mut table = write_txn.open_table(STATS_TABLE)?;
             let _ = table.remove(key)?;

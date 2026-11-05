@@ -2,7 +2,7 @@
 use crate::http::json_error;
 pub use crate::library_views::{
     build_album_view, build_album_views, build_artist_view, build_artist_views, build_track_views,
-    AlbumView, ArtistView, TrackView,
+    AlbumView, TrackView,
 };
 use crate::state::{AppState, Playlist};
 use axum::{http::StatusCode, Json};
@@ -10,20 +10,22 @@ use std::collections::HashSet;
 
 pub(crate) fn liked_set(
     state: &AppState,
+    user_id: &str,
 ) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let liked_ids = state
         .user_data
-        .list_likes()
+        .list_likes(user_id)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
     Ok(liked_ids.into_iter().collect())
 }
 
 pub(crate) fn playlist_set(
     state: &AppState,
+    user_id: &str,
 ) -> Result<HashSet<String>, (StatusCode, Json<crate::state::ErrorResponse>)> {
     let playlists = state
         .user_data
-        .list_playlists()
+        .list_playlists(user_id)
         .map_err(|err| json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)))?;
     Ok(playlist_track_ids(&playlists))
 }

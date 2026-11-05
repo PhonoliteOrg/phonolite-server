@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use common::{artist_identity_id, Album, Artist, ArtistCredit, Track};
 use library::Library;
-use metadata::read_tags;
 use regex::Regex;
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -14,6 +13,7 @@ use serde_json::Value;
 use strsim::normalized_levenshtein;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::shutdown::Shutdown;
 use crate::{musicbrainz_http, performance};
 
 #[path = "musicbrainz_album_identity.rs"]
@@ -53,6 +53,7 @@ pub struct MusicBrainzAlbumArtistResolver<'a> {
     user_agent: &'a str,
     timeout: Duration,
     options: ResolveOptions,
+    shutdown: Option<Shutdown>,
 }
 
 pub struct AlbumArtistResolution {
@@ -72,7 +73,13 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
             user_agent,
             timeout,
             options,
+            shutdown: None,
         }
+    }
+
+    pub fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     pub async fn resolve_album_artists(
@@ -82,6 +89,9 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         tracks: &[Track],
         existing_artists: &[Artist],
     ) -> Result<Option<AlbumArtistResolution>, String> {
+        if library.is_cancelled() {
+            return Err("library work cancelled".into());
+        }
         if self.user_agent.trim().is_empty() {
             return Ok(None);
         }
@@ -109,9 +119,12 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         let base_name_map = default_artist_name_map();
         let started = performance::enabled().then(Instant::now);
         let result = self.resolve_album_with_musicbrainz(&local).await;
+        if library.is_cancelled() {
+            return Err("library work cancelled".into());
+        }
         if let Some(started) = started {
             tracing::info!(
-                target: "performance",
+                target: "metadata_external",
                 event = "metadata_source_fetch",
                 provider = "musicbrainz",
                 kind = "album_artists",
@@ -132,8 +145,18 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
             let repair_library = library.clone();
             let album_id = album.id.clone();
             let provider_credits = resolved.artist_credits.clone();
-            let repaired = tokio::task::spawn_blocking(move || {
-                repair_library.resolve_album_display_credit(&album_id, &provider_credits)
+            let apply_context = crate::metadata_coordinator::ApplyContext::current();
+            let repaired = blocking_work(self.shutdown.as_ref(), move || {
+                repair_library.resolve_album_display_credit_with_guard(
+                    &album_id,
+                    &provider_credits,
+                    || {
+                        apply_context
+                            .as_ref()
+                            .map(|context| context.guard())
+                            .transpose()
+                    },
+                )
             })
             .await
             .map_err(|err| err.to_string())?
@@ -148,7 +171,11 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
         }
         // Local collaborator tags are only needed after a remote release match.
         // Unmatched albums no longer reread every audio file during this sweep.
-        local.track_artists = read_local_track_artists(library, tracks).await?;
+        local.track_artists =
+            read_local_track_artists(library, tracks, self.shutdown.as_ref()).await?;
+        if library.is_cancelled() {
+            return Err("library work cancelled".into());
+        }
 
         let effective_name_map =
             build_effective_name_map(&base_name_map, Some(&resolved.auto_name_map));
@@ -250,7 +277,7 @@ impl<'a> MusicBrainzAlbumArtistResolver<'a> {
                 }));
             }
         }
-        tracing::info!(
+        tracing::info!(target: "metadata_external",
             provider = "musicbrainz",
             kind = "album_artists",
             album = %local.album_hint,
@@ -365,23 +392,46 @@ struct ReleaseRecording {
 async fn read_local_track_artists(
     library: &Library,
     tracks: &[Track],
+    shutdown: Option<&Shutdown>,
 ) -> Result<Vec<String>, String> {
+    if library.is_cancelled() {
+        return Err("library work cancelled".into());
+    }
+    let cancellation = library.cancellation_flag();
     let paths: Vec<Option<PathBuf>> = tracks
         .iter()
         .map(|track| library.resolve_relpath(&track.file_relpath))
         .collect();
-    tokio::task::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|path| {
-                path.and_then(|path| read_tags(&path).ok())
+    blocking_work(shutdown, move || {
+        let mut artists = Vec::with_capacity(paths.len());
+        for path in paths {
+            if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("library work cancelled".to_owned());
+            }
+            artists.push(
+                path.and_then(|path| crate::workers::read_tags_blocking(&path, &cancellation).ok())
                     .and_then(|tag| tag.artist.or(tag.album_artist))
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
+                    .unwrap_or_default(),
+            );
+        }
+        if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("library work cancelled".to_owned());
+        }
+        Ok(artists)
     })
     .await
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?
+}
+
+fn blocking_work<F, R>(shutdown: Option<&Shutdown>, work: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match shutdown {
+        Some(shutdown) => shutdown.spawn_blocking(work),
+        None => tokio::task::spawn_blocking(work),
+    }
 }
 
 fn build_local_album_info(album: &Album, track_count: usize) -> LocalAlbumInfo {

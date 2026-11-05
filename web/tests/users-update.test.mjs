@@ -78,7 +78,9 @@ class Element extends Events {
       checkbox.disabled = markup.includes('data-protected="1"');
       const edit = new Element("button"); edit.dataset.action = "edit";
       const remove = new Element("button"); remove.dataset.action = "delete";
-      row.append(checkbox, edit, remove);
+      const revoke = new Element("button"); revoke.dataset.action = "revoke-sessions";
+      const sessions = new Element("td"); sessions.className = "user-sessions";
+      row.append(checkbox, edit, remove, revoke, sessions);
       this.append(row);
     }
   }
@@ -107,6 +109,9 @@ function harness() {
   const toggle = new Element("button");
   const bulkDelete = new Element("button");
   const confirm = new Element("button");
+  const confirmSessions = new Element("button");
+  const sessionsMessage = new Element();
+  const sessionsError = new Element();
   function form() {
     const result = new Element("form");
     for (const [name, value, tag] of [["user_id", "one", "input"], ["username", "Alice", "input"], ["password", "", "input"], ["role", "user", "select"]]) {
@@ -121,14 +126,21 @@ function harness() {
     "users-card": card, "user-rows": rows, "toggle-edit": toggle, "bulk-bar": bulk,
     "bulk-count": count, "bulk-delete": bulkDelete, "users-inline-message": message,
     "form-add-user": addForm, "form-edit-user": editForm, "confirm-delete": confirm,
+    "confirm-sessions": confirmSessions, "sessions-message": sessionsMessage, "sessions-error": sessionsError,
     "delete-message": new Element(), "add-user-error": addError, "edit-user-error": editError, "delete-user-error": deleteError,
   };
   const body = new Element("body"); body.append(card, toggle, bulk, count, message, addForm, editForm, addError, editError, deleteError);
   const requests = [];
-  const document = { body, activeElement: body, getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
+  const timers = new Map();
+  let timerId = 0;
+  const document = Object.assign(new Events(), { body, activeElement: body, getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) });
   Object.assign(globalThis, {
     document,
-    window: { location: { href: "https://console.example/users" } },
+    window: Object.assign(new Events(), {
+      location: { href: "https://console.example/users" },
+      setTimeout(callback) { timers.set(++timerId, callback); return timerId; },
+      clearTimeout(id) { timers.delete(id); },
+    }),
     FormData: class { constructor(source) { this.values = source.children.filter((child) => child.name && !child.disabled).map((child) => [child.name, child.value]); } *[Symbol.iterator]() { yield* this.values; } },
     fetch(url, options) { const deferred = Promise.withResolvers(); requests.push({ url, options, ...deferred }); return deferred.promise; },
   });
@@ -136,7 +148,8 @@ function harness() {
   rows.innerHTML = rowHtml("one", "Alice") + rowHtml("two", "Bob") + rowHtml("admin", "Administrator", "superadmin", true);
   const dispose = setupUsers(); cleanups.push(dispose);
   return {
-    card, rows, scroll, toggle, bulk, count, message, addForm, editForm, requests, confirm, bulkDelete, editError, dispose,
+    card, rows, scroll, toggle, bulk, count, message, addForm, editForm, requests, confirm, confirmSessions, sessionsMessage, sessionsError, bulkDelete, editError, dispose, timers,
+    poll() { const [id, callback] = timers.entries().next().value; timers.delete(id); callback(); },
     submit(target = editForm) { target.emit("submit", { preventDefault() {}, submitter: target.querySelector("button[type=submit]") }); },
     select(...ids) { rows.children.forEach((row) => { row.querySelector(".row-select").checked = ids.includes(row.dataset.userId); }); card.emit("change", { target: rows.children[0].querySelector(".row-select") }); },
   };
@@ -211,4 +224,65 @@ test("disposing an in-flight account mutation aborts it and prevents stale row c
   assert.deepEqual(subject.rows.children, originalRows);
   assert.equal(subject.card.listeners.get("click").size, 0);
   assert.equal(subject.editForm.listeners.get("submit").size, 0);
+});
+
+test("live session polling only updates counts and disposes pending requests", async () => {
+  const subject = harness();
+  subject.toggle.emit("click"); subject.select("one");
+  const originalRows = [...subject.rows.children];
+  subject.poll();
+  assert.equal(subject.requests[0].url, "/users/activity");
+  subject.requests[0].resolve(response({ sessions: { one: 2, two: 0, admin: 1 } }));
+  await settle();
+  assert.deepEqual(subject.rows.children, originalRows);
+  assert.equal(subject.rows.children[0].querySelector(".user-sessions").textContent, "2");
+  assert.equal(subject.rows.children[1].querySelector(".user-sessions").textContent, "0");
+  assert.equal(subject.rows.children[0].querySelector(".row-select").checked, true);
+  assert.equal(subject.scroll.scrollTop, 145);
+  subject.poll();
+  subject.dispose();
+  assert.equal(subject.requests[1].options.signal.aborted, true);
+  subject.requests[1].resolve(response({ sessions: { one: 9 } }));
+  await settle();
+  assert.equal(subject.rows.children[0].querySelector(".user-sessions").textContent, "2");
+  assert.equal(subject.timers.size, 0);
+});
+
+
+test("sign out all app sessions names the selected account and only submits after confirmation", async () => {
+  const subject = harness();
+  const row = subject.rows.children[0];
+  const button = row.children.find((element) => element.dataset.action === "revoke-sessions");
+  subject.card.emit("click", { target: button });
+  assert.equal(subject.requests.length, 0);
+  assert.match(subject.sessionsMessage.textContent, /Alice/);
+  assert.match(subject.sessionsMessage.textContent, /Admin console sessions will stay signed in/);
+  subject.confirmSessions.emit("click"); subject.confirmSessions.emit("click");
+  assert.equal(subject.requests.length, 1);
+  assert.equal(subject.requests[0].url, "/users/one/sessions/revoke-all");
+  subject.requests[0].resolve(response({ error: "Permission changed" }, false, 403));
+  await settle();
+  assert.equal(subject.sessionsError.textContent, "Permission changed");
+  assert.equal(subject.rows.children[0], row);
+  subject.confirmSessions.emit("click");
+  assert.equal(subject.requests.length, 2);
+  subject.requests[1].resolve(response({ html: rowHtml("one", "Alice") + rowHtml("two", "Bob") + rowHtml("admin", "Administrator", "superadmin", true) }));
+  await settle();
+  assert.equal(subject.rows.children[0], row);
+});
+
+test("signing out the current administrator's apps preserves the console in the confirmation and response", async () => {
+  const subject = harness();
+  const row = subject.rows.children.find((element) => element.dataset.userId === "admin");
+  const button = row.children.find((element) => element.dataset.action === "revoke-sessions");
+  subject.card.emit("click", { target: button });
+  assert.equal(subject.sessionsMessage.textContent, "Sign out all app sessions for Administrator? Their apps will need to sign in again. Admin console sessions will stay signed in.");
+  assert.equal(subject.requests.length, 0);
+  subject.confirmSessions.emit("click");
+  assert.equal(subject.requests[0].url, "/users/admin/sessions/revoke-all");
+  subject.requests[0].resolve(response({ html: rowHtml("one", "Alice") + rowHtml("two", "Bob") + rowHtml("admin", "Administrator", "superadmin", true) }));
+  await settle();
+  assert.equal(subject.rows.children[2], row);
+  assert.equal(subject.sessionsError.textContent, "");
+  assert.equal(subject.message.textContent, "Users updated.");
 });

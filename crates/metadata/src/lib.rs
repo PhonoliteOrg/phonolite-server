@@ -2,8 +2,14 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+mod adts;
+mod mp4;
+
 use lofty::config::ParseOptions;
 use lofty::error::LoftyError;
+use lofty::file::{FileType, TaggedFile};
+use lofty::iff::aiff::{AiffCompressionType, AiffFile};
+use lofty::iff::wav::{WavFile, WavFormat};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{AudioFile, ItemKey, TaggedFileExt};
 use lofty::probe::Probe;
@@ -36,6 +42,9 @@ pub struct TagInfo {
     pub album_artists_structured: bool,
     #[serde(default)]
     pub contributions: Vec<TagContribution>,
+    /// Audio encoding read from the source, independent of its extension.
+    #[serde(default)]
+    pub codec: Option<common::Codec>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,12 +78,57 @@ impl From<LoftyError> for MetadataError {
 }
 
 pub fn read_tags(path: &Path) -> Result<TagInfo, MetadataError> {
-    let tagged_file = Probe::open(path)?
-        .options(ParseOptions::new().read_cover_art(false))
-        .read()?;
+    // Ogg and MP4 extensions describe containers, so inspect the content before
+    // choosing a reader or identifying the audio encoding.
+    let probe = Probe::open(path)?.guess_file_type()?;
+    let file_type = probe.file_type();
+    let read_cover_art = !matches!(
+        file_type,
+        Some(FileType::Mpeg | FileType::Flac | FileType::Aac)
+    );
+    // Lofty's ADTS bitrate pass searches inside compressed payloads and can
+    // mistake their bytes for headers. Walk ADTS frame boundaries separately.
+    let options = ParseOptions::new()
+        .read_cover_art(read_cover_art)
+        .read_properties(file_type != Some(FileType::Aac));
+    let (tagged_file, codec): (TaggedFile, _) = if file_type == Some(FileType::Wav) {
+        let file = WavFile::read_from(&mut probe.into_inner(), options)?;
+        let codec = matches!(
+            file.properties().format(),
+            WavFormat::PCM | WavFormat::IEEE_FLOAT
+        )
+        .then_some(common::Codec::Pcm);
+        (file.into(), codec)
+    } else if file_type == Some(FileType::Aiff) {
+        let file = AiffFile::read_from(&mut probe.into_inner(), options)?;
+        let codec = matches!(
+            file.properties().compression_type(),
+            None | Some(
+                AiffCompressionType::None
+                    | AiffCompressionType::sowt
+                    | AiffCompressionType::fl32
+                    | AiffCompressionType::fl64
+                    | AiffCompressionType::FL32
+            )
+        )
+        .then_some(common::Codec::Pcm);
+        (file.into(), codec)
+    } else {
+        let file = probe.options(options).read()?;
+        let codec = match file.file_type() {
+            FileType::Mpeg => Some(common::Codec::Mp3),
+            FileType::Flac => Some(common::Codec::Flac),
+            FileType::Aac => Some(common::Codec::Aac),
+            FileType::Opus => Some(common::Codec::Opus),
+            FileType::Vorbis => Some(common::Codec::Vorbis),
+            _ => None,
+        };
+        (file, codec)
+    };
     let properties = tagged_file.properties();
 
     let mut info = TagInfo::default();
+    info.codec = codec;
 
     let duration_ms = properties.duration().as_millis();
     if duration_ms > 0 {
@@ -85,6 +139,13 @@ pub fn read_tags(path: &Path) -> Result<TagInfo, MetadataError> {
     info.sample_rate = properties.sample_rate();
     info.channels = properties.channels();
     info.bitrate = properties.audio_bitrate().or(properties.overall_bitrate());
+    if file_type == Some(FileType::Aac) {
+        adts::read_properties(path, &mut info)?;
+    } else if file_type == Some(FileType::Mp4) {
+        // Read flexible sample descriptions (including ALAC with extra bitrate
+        // boxes) and select audio even when a video track appears first.
+        mp4::read_properties(path, &mut info)?;
+    }
 
     if let Some(tag) = tagged_file
         .primary_tag()
@@ -93,13 +154,20 @@ pub fn read_tags(path: &Path) -> Result<TagInfo, MetadataError> {
         read_tag_fields(tag, &mut info);
     }
 
-    info.has_embedded_cover = has_embedded_cover(path)?;
+    info.has_embedded_cover = if read_cover_art {
+        pick_tag_picture(tagged_file.tags()).is_some()
+    } else {
+        has_embedded_cover(path)?
+    };
 
     Ok(info)
 }
 
 pub fn read_cover(path: &Path) -> Result<Option<CoverArt>, MetadataError> {
-    let tagged_file = lofty::read_from_path(path)?;
+    let tagged_file = Probe::open(path)?
+        .guess_file_type()?
+        .options(ParseOptions::new().read_properties(false))
+        .read()?;
     let picture = match pick_tag_picture(tagged_file.tags()) {
         Some(picture) => picture,
         None => return Ok(None),
@@ -496,15 +564,89 @@ fn u24(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_embedded_cover, parse_genres, parse_year, pick_tag_picture, read_tag_fields,
-        synchsafe_u32, TagInfo,
+        has_embedded_cover, parse_genres, parse_year, pick_tag_picture, read_cover,
+        read_tag_fields, read_tags, synchsafe_u32, TagInfo,
     };
     use lofty::ogg::VorbisComments;
     use lofty::picture::{Picture, PictureType};
-    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn format_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../server/tests/fixtures/formats")
+            .join(name)
+    }
+
+    #[test]
+    fn reads_actual_codec_and_audio_properties_for_all_music_formats() {
+        use common::Codec;
+        for (name, expected) in [
+            ("aac.m4a", Codec::Aac),
+            ("aac.mp4", Codec::Aac),
+            ("tone.aac", Codec::Aac),
+            ("alac.m4a", Codec::Alac),
+            ("alac.mp4", Codec::Alac),
+            ("opus.opus", Codec::Opus),
+            ("opus.ogg", Codec::Opus),
+            ("opus.oga", Codec::Opus),
+            ("vorbis.ogg", Codec::Vorbis),
+            ("vorbis.oga", Codec::Vorbis),
+            ("tone.wav", Codec::Pcm),
+            ("tone.aif", Codec::Pcm),
+            ("tone.aiff", Codec::Pcm),
+        ] {
+            let tags =
+                read_tags(&format_fixture(name)).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+            assert_eq!(tags.codec, Some(expected), "{name}");
+            assert_eq!(tags.sample_rate, Some(48_000), "{name}");
+            assert_eq!(tags.channels, Some(2), "{name}");
+            assert!(
+                (350..=500).contains(&tags.duration_ms.unwrap()),
+                "{name}: {:?}",
+                tags.duration_ms
+            );
+            assert!(tags.bitrate.is_some_and(|bitrate| bitrate > 0), "{name}");
+            if name != "tone.aac" {
+                assert_eq!(tags.title.as_deref(), Some("Format tone"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn discovers_and_reads_artwork_in_new_containers() {
+        use lofty::config::WriteOptions;
+
+        let picture = [0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 1, 2, 3];
+        for (name, tag_type) in [
+            ("aac.m4a", TagType::Mp4Ilst),
+            ("alac.mp4", TagType::Mp4Ilst),
+            ("tone.aac", TagType::Id3v2),
+            ("opus.ogg", TagType::VorbisComments),
+            ("vorbis.oga", TagType::VorbisComments),
+            ("tone.wav", TagType::Id3v2),
+            ("tone.aiff", TagType::Id3v2),
+        ] {
+            let path = temp_path(name);
+            fs::copy(format_fixture(name), &path).unwrap();
+            let mut tag = Tag::new(tag_type);
+            tag.push_picture(Picture::new_unchecked(
+                PictureType::CoverFront,
+                Some(lofty::picture::MimeType::Png),
+                None,
+                picture.to_vec(),
+            ));
+            tag.save_to_path(&path, WriteOptions::default()).unwrap();
+            let tags = read_tags(&path).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+            assert!(tags.has_embedded_cover, "{name}");
+            let cover = read_cover(&path).unwrap().unwrap();
+            assert_eq!(cover.data, picture, "{name}");
+            assert_eq!(cover.mime.as_deref(), Some("image/png"), "{name}");
+            fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn detects_id3v24_apic_without_picture_payload() {

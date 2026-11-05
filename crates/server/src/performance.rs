@@ -7,8 +7,8 @@ use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use tower_http::trace::{
-    DefaultMakeSpan, DefaultOnEos, DefaultOnRequest, DefaultOnResponse, MakeSpan, OnEos, OnRequest,
-    OnResponse,
+    DefaultMakeSpan, DefaultOnEos, DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, MakeSpan,
+    OnEos, OnFailure, OnRequest, OnResponse,
 };
 use tower_http::LatencyUnit;
 use tracing::{Level, Span};
@@ -38,7 +38,7 @@ pub async fn http_request(request: Request, next: Next) -> Response {
             .unwrap_or_else(|| "unmatched".to_owned());
         (route, request.method().to_string(), Instant::now())
     });
-    let mut response = next.run(request).await;
+    let mut response = crate::metadata_requests::log_request(request, next).await;
     if polling {
         response.extensions_mut().insert(ConsolePollResponse);
     }
@@ -53,7 +53,10 @@ struct ConsolePollResponse;
 
 fn is_console_poll(method: &axum::http::Method, path: &str) -> bool {
     matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
-        && matches!(path, "/logs/tail" | "/logs/issues" | "/status/library")
+        && matches!(
+            path,
+            "/logs/tail" | "/logs/issues" | "/status/library" | "/users/activity" | "/performance/data"
+        )
 }
 
 fn quiet_poll_response<B>(response: &axum::http::Response<B>) -> bool {
@@ -63,7 +66,11 @@ fn quiet_poll_response<B>(response: &axum::http::Response<B>) -> bool {
 // Successful observation must not generate new records in the log it is
 // observing. Keep failures and ordinary requests visible in HTTP diagnostics.
 pub fn trace_span<B>(request: &axum::http::Request<B>) -> Span {
-    if is_console_poll(request.method(), request.uri().path()) {
+    if crate::metadata_requests::request_kind(request.uri().path()).is_some() {
+        // Keep a marker at the server's normal INFO level so the failure
+        // callback can distinguish metadata even when DEBUG spans are disabled.
+        tracing::info_span!(target: "metadata_request", "metadata_http")
+    } else if is_console_poll(request.method(), request.uri().path()) {
         Span::none()
     } else {
         DefaultMakeSpan::new().make_span(request)
@@ -71,7 +78,9 @@ pub fn trace_span<B>(request: &axum::http::Request<B>) -> Span {
 }
 
 pub fn trace_request<B>(request: &axum::http::Request<B>, span: &Span) {
-    if !is_console_poll(request.method(), request.uri().path()) {
+    if !is_console_poll(request.method(), request.uri().path())
+        && crate::metadata_requests::request_kind(request.uri().path()).is_none()
+    {
         DefaultOnRequest::new().on_request(request, span);
     }
 }
@@ -79,13 +88,35 @@ pub fn trace_request<B>(request: &axum::http::Request<B>, span: &Span) {
 pub fn trace_end(trailers: Option<&axum::http::HeaderMap>, duration: Duration, span: &Span) {
     // Poll spans are deliberately absent. Without this check the default DEBUG
     // end-of-stream event would restart the feedback loop when debug is enabled.
-    if span.id().is_some() {
+    if span.id().is_some() && !metadata_trace_span(span) {
         DefaultOnEos::new().on_eos(trailers, duration, span);
     }
 }
 
+pub fn trace_failure(
+    failure: tower_http::classify::ServerErrorsFailureClass,
+    latency: Duration,
+    span: &Span,
+) {
+    // Dedicated metadata diagnostics include HTTP and body failures. Avoid a
+    // second copy in the severity logs through TraceLayer's default callback.
+    if !metadata_trace_span(span) {
+        DefaultOnFailure::new().on_failure(failure, latency, span);
+    }
+}
+
+fn metadata_trace_span(span: &Span) -> bool {
+    span.metadata()
+        .is_some_and(|metadata| metadata.target() == "metadata_request")
+}
+
 pub fn trace_response<B>(response: &axum::http::Response<B>, latency: Duration, span: &Span) {
-    if !quiet_poll_response(response) {
+    if !quiet_poll_response(response)
+        && response
+            .extensions()
+            .get::<crate::metadata_requests::MetadataResponse>()
+            .is_none()
+    {
         DefaultOnResponse::new()
             .level(Level::INFO)
             .latency_unit(LatencyUnit::Millis)
@@ -95,6 +126,13 @@ pub fn trace_response<B>(response: &axum::http::Response<B>, latency: Duration, 
 
 fn log_http_measurement(response: &Response, method: &str, route: &str, started: Instant) {
     if quiet_poll_response(response) {
+        return;
+    }
+    if response
+        .extensions()
+        .get::<crate::metadata_requests::MetadataResponse>()
+        .is_some()
+    {
         return;
     }
     let declared_response_bytes = response
@@ -142,7 +180,7 @@ impl MetadataTiming {
     pub fn stage(&mut self, stage: &'static str) {
         let now = Instant::now();
         tracing::info!(
-            target: "performance",
+            target: "metadata_external",
             event = "metadata_pipeline_stage",
             operation_id = self.operation_id,
             kind = self.kind,
@@ -155,7 +193,7 @@ impl MetadataTiming {
 
     pub fn finish(self, outcome: &'static str, updated: bool) {
         tracing::info!(
-            target: "performance",
+            target: "metadata_external",
             event = "metadata_pipeline_finished",
             operation_id = self.operation_id,
             kind = self.kind,
@@ -320,6 +358,106 @@ mod tests {
     }
 
     #[test]
+    fn metadata_trace_callbacks_do_not_duplicate_dedicated_logs_at_info_or_debug_levels() {
+        for level in [tracing::Level::INFO, tracing::Level::TRACE] {
+            let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let writer = Capture(output.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(level)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                for path in [
+                    "/api/browse/artists/artist/releases",
+                    "/api/library/albums/album/cover",
+                    "/covers/artists/artist",
+                ] {
+                    let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+                    let span = super::trace_span(&request);
+                    assert!(span.id().is_some(), "metadata marker disabled at {level}");
+                    let mut response = axum::response::Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                    response
+                        .extensions_mut()
+                        .insert(crate::metadata_requests::MetadataResponse);
+                    let latency = std::time::Duration::from_millis(1);
+                    super::trace_request(&request, &span);
+                    super::trace_response(&response, latency, &span);
+                    super::trace_failure(
+                        tower_http::classify::ServerErrorsFailureClass::StatusCode(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        ),
+                        latency,
+                        &span,
+                    );
+                    super::trace_failure(
+                        tower_http::classify::ServerErrorsFailureClass::Error(
+                            "artwork source read failed".into(),
+                        ),
+                        latency,
+                        &span,
+                    );
+                    super::trace_end(None, latency, &span);
+                    super::log_http_measurement(&response, "GET", path, std::time::Instant::now());
+                }
+            });
+            assert!(
+                output.lock().is_empty(),
+                "metadata callbacks duplicated logs with maximum level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_http_and_body_failures_remain_visible_with_debug_spans_disabled() {
+        let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = Capture(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let request = Request::builder()
+                .uri("/api/player/settings")
+                .body(Body::empty())
+                .unwrap();
+            let span = super::trace_span(&request);
+            assert!(
+                span.id().is_none(),
+                "ordinary DEBUG span should be filtered"
+            );
+            let mut response = axum::response::Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            let latency = std::time::Duration::from_millis(1);
+            super::trace_response(&response, latency, &span);
+            super::trace_failure(
+                tower_http::classify::ServerErrorsFailureClass::StatusCode(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                latency,
+                &span,
+            );
+            super::trace_failure(
+                tower_http::classify::ServerErrorsFailureClass::Error(
+                    "ordinary response stream failed".into(),
+                ),
+                latency,
+                &span,
+            );
+        });
+        let contents = String::from_utf8(output.lock().clone()).unwrap();
+        assert!(contents.contains("finished processing request"));
+        assert!(contents.contains("status=503"));
+        assert_eq!(contents.matches("response failed").count(), 2);
+        assert!(contents.contains("ERROR"));
+        assert!(contents.contains("ordinary response stream failed"));
+    }
+
+    #[test]
     fn idle_console_polls_do_not_write_trace_or_profile_logs_but_failures_do() {
         let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let writer = Capture(output.clone());
@@ -331,7 +469,13 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..100 {
-                for path in ["/logs/tail?lines=1000", "/logs/issues", "/status/library"] {
+                for path in [
+                    "/logs/tail?lines=1000",
+                    "/logs/issues",
+                    "/status/library",
+                    "/users/activity",
+                    "/performance/data",
+                ] {
                     let request = Request::builder().uri(path).body(Body::empty()).unwrap();
                     assert!(super::is_console_poll(
                         request.method(),

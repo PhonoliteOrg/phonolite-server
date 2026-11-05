@@ -6,12 +6,14 @@ import { setupLogsPage } from "./logs.js";
 import { setupAuth } from "./auth.js";
 import { setupConsoleNavigation } from "./navigation.js";
 import { setupArtwork } from "./artwork.js";
+import { setupProcessPerformance } from "./process-performance.js?v=20261027-device-worker-metrics";
 
 const pages = {
   users: setupUsers,
   settings: setupSettings,
   library: setupLibrary,
   logs: setupLogsPage,
+  performance: setupProcessPerformance,
   login: setupAuth,
   setup: setupAuth,
 };

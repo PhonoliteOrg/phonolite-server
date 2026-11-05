@@ -1,7 +1,7 @@
 import { closeAllModals } from "./dialogs.js";
 import { clearInlineError, configureNavigation, showInlineError } from "./shared.js";
 
-const routes = new Set(["/", "/users", "/library", "/settings", "/logs", "/login", "/setup"]);
+const routes = new Set(["/", "/users", "/library", "/settings", "/logs", "/performance", "/login", "/setup"]);
 
 export function consoleUrl(value, base) {
   try {
@@ -22,7 +22,7 @@ export function renderConsoleView(view) {
   // signing in/out changes the shell's navigation markup.
   if (navigation && Boolean(navigation.querySelector(".nav")) !== Boolean(view.nav)) navigation.innerHTML = view.nav;
   navigation?.querySelectorAll(".nav-links > a").forEach((link) => {
-    const page = { "/": "library", "/users": "users", "/library": "library", "/settings": "settings", "/logs": "logs" }[new URL(link.href).pathname];
+    const page = { "/": "library", "/users": "users", "/library": "library", "/settings": "settings", "/logs": "logs", "/performance": "performance" }[new URL(link.href).pathname];
     if (page === view.page) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
   });

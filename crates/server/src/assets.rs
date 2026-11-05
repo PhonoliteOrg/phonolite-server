@@ -3,11 +3,12 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use common::CoverRef;
 use library::Library;
 
+use crate::artist_artwork::{stored_artist_artwork_ref, ArtistArtworkKind};
 use crate::config::resolve_path;
 use crate::state::AppState;
 
@@ -90,7 +91,13 @@ pub fn resolve_artist_logo_source(
     artist_id: &str,
 ) -> Result<Option<CoverSource>, String> {
     if let Some(artist) = library.get_artist(artist_id).map_err(|e| e.to_string())? {
-        if let Some(logo_ref) = &artist.logo_ref {
+        let logo_ref = artist
+            .logo_ref
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                stored_artist_artwork_ref(metadata_root, artist_id, ArtistArtworkKind::Logo)
+            });
+        if let Some(logo_ref) = logo_ref {
             return Ok(Some(CoverSource::External(metadata_root.join(logo_ref))));
         }
     }
@@ -103,7 +110,13 @@ pub fn resolve_artist_banner_source(
     artist_id: &str,
 ) -> Result<Option<CoverSource>, String> {
     if let Some(artist) = library.get_artist(artist_id).map_err(|e| e.to_string())? {
-        if let Some(banner_ref) = &artist.banner_ref {
+        let banner_ref = artist
+            .banner_ref
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                stored_artist_artwork_ref(metadata_root, artist_id, ArtistArtworkKind::Banner)
+            });
+        if let Some(banner_ref) = banner_ref {
             return Ok(Some(CoverSource::External(metadata_root.join(banner_ref))));
         }
     }
@@ -140,17 +153,17 @@ pub async fn warm_cover_cache(
     ensure_cover_cached(state, key, source).await.map(|_| ())
 }
 
-async fn ensure_cover_cached(
+pub(crate) async fn ensure_cover_cached(
     state: &AppState,
     key: &CoverCacheKey,
     source: CoverSource,
 ) -> Result<PathBuf, String> {
     let metadata_root = metadata_root_path(state);
     let cache_dir = metadata_root.join("covers");
-    ensure_cover_cached_at(&cache_dir, key, source).await
+    ensure_cover_cached_at_with_shutdown(&state.shutdown, &cache_dir, key, source).await
 }
 
-async fn cover_source_fingerprint(source: &CoverSource) -> Result<String, String> {
+pub(crate) async fn cover_source_fingerprint(source: &CoverSource) -> Result<String, String> {
     let (kind, path) = match source {
         CoverSource::Embedded(path) => ("embedded", path),
         CoverSource::File(path) => ("file", path),
@@ -167,11 +180,29 @@ async fn cover_source_fingerprint(source: &CoverSource) -> Result<String, String
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+#[cfg(test)]
 async fn ensure_cover_cached_at(
     cache_dir: &Path,
     key: &CoverCacheKey,
     source: CoverSource,
 ) -> Result<PathBuf, String> {
+    ensure_cover_cached_at_with_shutdown(&crate::shutdown::Shutdown::new(), cache_dir, key, source)
+        .await
+}
+
+async fn ensure_cover_cached_at_with_shutdown(
+    shutdown: &crate::shutdown::Shutdown,
+    cache_dir: &Path,
+    key: &CoverCacheKey,
+    source: CoverSource,
+) -> Result<PathBuf, String> {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(20);
+    static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    static LOCKS: std::sync::OnceLock<Vec<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    ensure_asset_running(shutdown)?;
+    let _slot = SLOTS
+        .try_acquire()
+        .map_err(|_| "cover cache capacity reached")?;
     tokio::fs::create_dir_all(cache_dir)
         .await
         .map_err(|err| format!("failed to create cover cache: {err}"))?;
@@ -180,6 +211,16 @@ async fn ensure_cover_cached_at(
     // Separate generations also avoid concurrent requests overwriting one
     // another's cached source while files are being rescanned.
     let fingerprint = cover_source_fingerprint(&source).await?;
+    let stripe = fingerprint.bytes().fold(0usize, |hash, value| {
+        hash.wrapping_mul(31).wrapping_add(value as usize)
+    }) % 32;
+    let locks = LOCKS.get_or_init(|| (0..32).map(|_| tokio::sync::Mutex::new(())).collect());
+    let _fill = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Err("server shutting down".into()),
+        fill = locks[stripe].lock() => fill,
+    };
+    ensure_asset_running(shutdown)?;
 
     let (id, prefix) = match key {
         CoverCacheKey::Album(id) => (id.clone(), "album".to_string()),
@@ -195,7 +236,12 @@ async fn ensure_cover_cached_at(
         }
     }
 
-    let (data, mime) = fetch_cover(source.clone()).await?;
+    let worker = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Err("server shutting down".into()),
+        worker = WORKERS.acquire() => worker.map_err(|_| "cover cache closed")?,
+    };
+    let (data, mime) = fetch_cover(shutdown, source.clone()).await?;
     if cover_source_fingerprint(&source).await? != fingerprint {
         return Err("cover source changed while reading".to_owned());
     }
@@ -203,44 +249,91 @@ async fn ensure_cover_cached_at(
     let ext = image_ext_from_mime(&mime).unwrap_or("jpg");
     let filename = format!("{}-{}.{}.{}", prefix, id, fingerprint, ext);
     let path = cache_dir.join(filename);
-    tokio::fs::write(&path, &data)
+    ensure_asset_running(shutdown)?;
+    let temporary = cache_dir.join(format!("{}.part", uuid::Uuid::new_v4()));
+    let publication = path.clone();
+    let cancellation = shutdown.clone();
+    shutdown
+        .spawn_blocking_commit("cover cache publication", move || {
+            let _worker = worker;
+            let _cleanup = CoverTemporaryFile(temporary.clone());
+            ensure_asset_running(&cancellation)?;
+            std::fs::write(&temporary, data)
+                .map_err(|error| format!("failed to store cached cover: {error}"))?;
+            ensure_asset_running(&cancellation)?;
+            if let Err(error) = std::fs::rename(&temporary, &publication) {
+                if !publication.exists() {
+                    return Err(format!("failed to publish cached cover: {error}"));
+                }
+            }
+            Ok::<(), String>(())
+        })
         .await
-        .map_err(|err| format!("failed to store cached cover: {err}"))?;
+        .map_err(|error| error.to_string())??;
 
     Ok(path)
 }
 
-pub async fn fetch_cover_cached(
-    state: &AppState,
-    key: CoverCacheKey,
-    source: CoverSource,
-) -> Result<(Vec<u8>, String), String> {
-    let path = ensure_cover_cached(state, &key, source).await?;
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|_| "failed to read cached cover".to_string())?;
-    let mime = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
-    Ok((data, mime))
+struct CoverTemporaryFile(PathBuf);
+
+impl Drop for CoverTemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
-pub async fn fetch_cover(source: CoverSource) -> Result<(Vec<u8>, String), String> {
+/// Serve a source without buffering a full file per HTTP consumer. Embedded
+/// covers are extracted once through the bounded, atomically published cache.
+pub async fn stream_cover_response(
+    state: &AppState,
+    key: &CoverCacheKey,
+    source: CoverSource,
+    headers: &HeaderMap,
+) -> Response {
+    let fingerprint = match cover_source_fingerprint(&source).await {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return crate::http::json_error_response(StatusCode::NOT_FOUND, error),
+    };
+    let path = match source {
+        CoverSource::File(path) | CoverSource::External(path) => path,
+        source @ CoverSource::Embedded(_) => match ensure_cover_cached(state, key, source).await {
+            Ok(path) => path,
+            Err(error) => return crate::http::json_error_response(StatusCode::NOT_FOUND, error),
+        },
+    };
+    let etag = format!("W/\"{fingerprint}\"");
+    crate::artwork_cache::file_response(&path, &etag, headers, false).await
+}
+
+pub async fn fetch_cover(
+    shutdown: &crate::shutdown::Shutdown,
+    source: CoverSource,
+) -> Result<(Vec<u8>, String), String> {
+    ensure_asset_running(shutdown)?;
     match source {
         CoverSource::File(path) | CoverSource::External(path) => {
             let data = tokio::fs::read(&path)
                 .await
                 .map_err(|_| "failed to read cover file".to_string())?;
+            ensure_asset_running(shutdown)?;
             let mime = mime_guess::from_path(&path)
                 .first_or_octet_stream()
                 .to_string();
             Ok((data, mime))
         }
         CoverSource::Embedded(path) => {
-            let art = tokio::task::spawn_blocking(move || metadata::read_cover(&path))
-                .await
-                .map_err(|e| format!("embedded cover task failed: {}", e))?
-                .map_err(|e| format!("failed to read embedded cover: {:?}", e))?;
+            static EMBEDDED_WORKERS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            let workers = EMBEDDED_WORKERS
+                .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+                .clone();
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Err("server shutting down".into()),
+                permit = workers.acquire_owned() => permit.map_err(|_| "cover extractor closed")?,
+            };
+            let art = crate::workers::read_cover(shutdown, &path, permit).await?;
+            ensure_asset_running(shutdown)?;
             match art {
                 Some(art) => Ok((
                     art.data,
@@ -250,6 +343,14 @@ pub async fn fetch_cover(source: CoverSource) -> Result<(Vec<u8>, String), Strin
                 None => Err("no embedded cover found".to_string()),
             }
         }
+    }
+}
+
+fn ensure_asset_running(shutdown: &crate::shutdown::Shutdown) -> Result<(), String> {
+    if shutdown.is_cancelled() {
+        Err("server shutting down".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -365,55 +466,48 @@ pub async fn prune_stale_metadata_assets(
 }
 
 fn load_artist_ids(library: &Library) -> Result<HashSet<String>, String> {
-    let mut ids = HashSet::new();
-    let mut cursor = None;
-    let page_size = 500usize;
-    loop {
-        let (items, total) = library
-            .page_artists(&mut cursor, page_size)
-            .map_err(|e| e.to_string())?;
-        for item in items {
-            ids.insert(item.id);
-        }
-        if ids.len() >= total {
-            break;
-        }
-    }
-    Ok(ids)
+    collect_catalogue_ids(
+        500,
+        |cursor, limit| library.page_artists(cursor, limit),
+        |artist| artist.id,
+    )
 }
 
 fn load_album_ids(library: &Library) -> Result<HashSet<String>, String> {
-    let mut ids = HashSet::new();
-    let mut cursor = None;
-    let page_size = 500usize;
-    loop {
-        let (items, total) = library
-            .page_albums(&mut cursor, page_size)
-            .map_err(|e| e.to_string())?;
-        for item in items {
-            ids.insert(item.id);
-        }
-        if ids.len() >= total {
-            break;
-        }
-    }
-    Ok(ids)
+    collect_catalogue_ids(
+        500,
+        |cursor, limit| library.page_albums(cursor, limit),
+        |album| album.id,
+    )
 }
 
 fn load_track_ids(library: &Library) -> Result<HashSet<String>, String> {
+    collect_catalogue_ids(
+        1000,
+        |cursor, limit| library.page_tracks(cursor, limit),
+        |track| track.id,
+    )
+}
+
+fn collect_catalogue_ids<T>(
+    page_size: usize,
+    mut read_page: impl FnMut(
+        &mut Option<String>,
+        usize,
+    ) -> Result<(Vec<T>, usize), library::LibraryError>,
+    item_id: impl Fn(T) -> String,
+) -> Result<HashSet<String>, String> {
     let mut ids = HashSet::new();
     let mut cursor = None;
-    let page_size = 1000usize;
     loop {
-        let (items, total) = library
-            .page_tracks(&mut cursor, page_size)
-            .map_err(|e| e.to_string())?;
-        for item in items {
-            ids.insert(item.id);
-        }
-        if ids.len() >= total {
+        let (items, _) = read_page(&mut cursor, page_size).map_err(|e| e.to_string())?;
+        // Page totals count name-index rows, including stale names and aliases
+        // for the same ID. Only exhausted pages establish that every live ID
+        // was visited; deduplicated IDs may never reach the reported total.
+        if items.is_empty() {
             break;
         }
+        ids.extend(items.into_iter().map(&item_id));
     }
     Ok(ids)
 }
@@ -555,6 +649,107 @@ async fn prune_legacy_artist_assets(
 mod tests {
     use super::*;
 
+    #[test]
+    fn asset_id_collection_exhausts_pages_with_stale_names_and_duplicate_aliases() {
+        use redb::{Database, TableDefinition};
+        use std::sync::Arc;
+
+        const ARTISTS: TableDefinition<&str, &[u8]> = TableDefinition::new("artists");
+        const NAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("artists_by_name");
+
+        for (aliases, stale_names, expected_reads) in [(0, 0, 3), (0, 2, 3), (2, 0, 4), (2, 2, 4)] {
+            let db = Arc::new(
+                Database::builder()
+                    .create_with_backend(redb::backends::InMemoryBackend::new())
+                    .unwrap(),
+            );
+            let library = Library::load_or_scan_with_db(Vec::new(), db.clone())
+                .unwrap()
+                .0;
+            let write = db.begin_write().unwrap();
+            {
+                let mut artists = write.open_table(ARTISTS).unwrap();
+                let mut names = write.open_table(NAMES).unwrap();
+                for index in 0..3 {
+                    let id = format!("artist-{index}");
+                    let artist = common::Artist {
+                        id: id.clone(),
+                        name: id.clone(),
+                        genres: Vec::new(),
+                        summary: None,
+                        logo_ref: None,
+                        banner_ref: None,
+                    };
+                    artists
+                        .insert(id.as_str(), bincode::serialize(&artist).unwrap().as_slice())
+                        .unwrap();
+                    names
+                        .insert(format!("{id}\x1f{id}").as_str(), id.as_bytes())
+                        .unwrap();
+                }
+                for index in 0..aliases {
+                    names
+                        .insert(
+                            format!("alias-{index}\x1fartist-0").as_str(),
+                            b"artist-0".as_slice(),
+                        )
+                        .unwrap();
+                }
+                for index in 0..stale_names {
+                    names
+                        .insert(
+                            format!("stale-{index}\x1fmissing").as_str(),
+                            b"missing".as_slice(),
+                        )
+                        .unwrap();
+                }
+            }
+            write.commit().unwrap();
+
+            let mut reads = 0;
+            let ids = collect_catalogue_ids(
+                2,
+                |cursor, limit| {
+                    reads += 1;
+                    // Bound regressions: the old count-based termination would
+                    // keep querying empty pages forever for either bad index.
+                    assert!(reads <= expected_reads, "repeated an exhausted page");
+                    library.page_artists(cursor, limit)
+                },
+                |artist| artist.id,
+            )
+            .unwrap();
+            assert_eq!(reads, expected_reads);
+            assert_eq!(
+                ids,
+                HashSet::from([
+                    "artist-0".to_owned(),
+                    "artist-1".to_owned(),
+                    "artist-2".to_owned()
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn asset_id_collection_never_returns_partial_ids_after_a_page_failure() {
+        let mut reads = 0;
+        let result = collect_catalogue_ids(
+            2,
+            |_, _| {
+                reads += 1;
+                match reads {
+                    1 => Ok((vec!["live-artwork-owner".to_owned()], 2)),
+                    2 => Err(library::LibraryError::Cancelled),
+                    _ => panic!("collection must stop after a page failure"),
+                }
+            },
+            |id| id,
+        );
+        assert_eq!(reads, 2);
+        assert_eq!(result.unwrap_err(), "library work cancelled");
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -570,6 +765,74 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn artist_page_and_image_recover_saved_artwork_before_enrichment() {
+        use crate::artist_artwork::{recover_artist_artwork, ArtistAssetSource};
+
+        let dir = TestDirectory::new();
+        let music = dir.0.join("music");
+        let album = music.join("Artist/Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("Track.mp3"), b"untagged audio fixture").unwrap();
+        let (library, _) = Library::load_or_scan(
+            vec![library::LibraryRoot::new(String::new(), music)],
+            dir.0.join("index.redb"),
+        )
+        .unwrap();
+        let (mut artists, total) = library.list_artists_for_browse(None, 10, 0, false).unwrap();
+        assert_eq!(total, 1);
+        let artist_id = artists[0].id.clone();
+        assert!(artists[0].logo_ref.is_none());
+        let metadata = dir.0.join("metadata");
+        let logos = metadata.join("logos");
+        std::fs::create_dir_all(&logos).unwrap();
+        let bytes = b"already downloaded artist logo";
+        let filename = format!("{artist_id}.{}.png", blake3::hash(bytes).to_hex());
+        std::fs::write(logos.join(&filename), bytes).unwrap();
+        std::fs::write(
+            logos.join(format!("{artist_id}.source")),
+            serde_json::to_vec(&ArtistAssetSource {
+                url: "https://provider.example/logo.png".into(),
+                filename: filename.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        for artist in &mut artists {
+            recover_artist_artwork(&metadata, artist);
+        }
+        let views = crate::library_views::build_artist_views(&library, artists).unwrap();
+        let expected_ref = format!("logos/{filename}");
+        assert_eq!(views[0].logo_ref.as_deref(), Some(expected_ref.as_str()));
+
+        // The image endpoint must resolve the same file even though the stored
+        // artist still has no reference and no provider lookup has happened.
+        let source = resolve_artist_logo_source(&library, &metadata, &artist_id)
+            .unwrap()
+            .unwrap();
+        let cached = ensure_cover_cached_at(
+            &metadata.join("covers"),
+            &CoverCacheKey::Artist {
+                id: artist_id.clone(),
+                variant: "logo".into(),
+            },
+            source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(cached).unwrap(), bytes);
+        assert!(library
+            .get_artist(&artist_id)
+            .unwrap()
+            .unwrap()
+            .logo_ref
+            .is_none());
+        assert!(resolve_artist_logo_source(&library, &metadata, "unknown")
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -740,5 +1003,34 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "private, no-cache"
         );
+    }
+    #[tokio::test]
+    async fn shutdown_prevents_source_reads_and_new_cover_cache_writes() {
+        let directory = TestDirectory::new();
+        let cache = directory.0.join("not-created");
+        let shutdown = crate::shutdown::Shutdown::new();
+        shutdown.cancel();
+        for source in [
+            CoverSource::Embedded(directory.0.join("missing.flac")),
+            CoverSource::File(directory.0.join("missing.jpg")),
+        ] {
+            assert_eq!(
+                fetch_cover(&shutdown, source.clone()).await.unwrap_err(),
+                "server shutting down"
+            );
+            assert_eq!(
+                ensure_cover_cached_at_with_shutdown(
+                    &shutdown,
+                    &cache,
+                    &CoverCacheKey::Track("cancelled".into()),
+                    source
+                )
+                .await
+                .unwrap_err(),
+                "server shutting down"
+            );
+        }
+        assert!(!cache.exists());
+        assert!(shutdown.drain(std::time::Duration::from_secs(1)).await);
     }
 }

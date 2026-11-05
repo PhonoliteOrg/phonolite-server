@@ -93,6 +93,8 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
     pub quic_enabled: bool,
+    /// Startup-only opt-in; enable after client/server migration validation.
+    pub quic_allow_client_migration: bool,
     pub quic_port: u16,
     pub quic_cert_path: String,
     pub quic_key_path: String,
@@ -114,6 +116,11 @@ pub struct ServerConfig {
     pub external_metadata_on_tag_error: bool,
     pub stream_cache_enabled: bool,
     pub stream_cache_dir: String,
+    /// Disk budgets for prepared offline downloads, including the file being encoded.
+    pub download_cache_max_mib: u64,
+    pub download_file_max_mib: u64,
+    /// Startup-only memory and workload budgets; restart after changing them.
+    pub resources: crate::resources::ResourceLimits,
 }
 
 fn default_admin_port() -> u16 {
@@ -135,9 +142,10 @@ impl Default for ServerConfig {
             log_debug_enabled: false,
             port: 3000,
             admin_port: default_admin_port(),
-            admin_bind_addr: "127.0.0.1".to_string(),
+            admin_bind_addr: "0.0.0.0".to_string(),
             bind_addr: None,
             quic_enabled: true,
+            quic_allow_client_migration: false,
             quic_port: 3001,
             quic_cert_path: "quic_cert.pem".to_string(),
             quic_key_path: "quic_key.pem".to_string(),
@@ -157,6 +165,9 @@ impl Default for ServerConfig {
             external_metadata_on_tag_error: true,
             stream_cache_enabled: true,
             stream_cache_dir: "stream_cache".to_string(),
+            download_cache_max_mib: 1024,
+            download_file_max_mib: 256,
+            resources: crate::resources::ResourceLimits::default(),
         }
     }
 }
@@ -168,6 +179,7 @@ pub enum ConfigError {
     InvalidPorts(&'static str),
     InvalidAdminBind(&'static str),
     InvalidBackupLimits(&'static str),
+    InvalidResources(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -178,6 +190,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidPorts(err) => f.write_str(err),
             ConfigError::InvalidAdminBind(err) => f.write_str(err),
             ConfigError::InvalidBackupLimits(err) => f.write_str(err),
+            ConfigError::InvalidResources(err) => f.write_str(err),
         }
     }
 }
@@ -209,6 +222,21 @@ pub fn validate_backup_limits(config: &ServerConfig) -> Result<(), &'static str>
     if config.metadata_backup_max_manifest_mib * 1024 * 1024 > isize::MAX as u64 {
         return Err(
             "metadata backup manifest limit exceeds this platform's addressable allocation size",
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_download_limits(config: &ServerConfig) -> Result<(), &'static str> {
+    if config.download_file_max_mib == 0
+        || config.download_cache_max_mib < config.download_file_max_mib
+        || config
+            .download_cache_max_mib
+            .checked_mul(1024 * 1024)
+            .is_none()
+    {
+        return Err(
+            "download file limit must be positive and fit within the download cache limit in MiB",
         );
     }
     Ok(())
@@ -329,6 +357,11 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
         validate_ports(config.port, config.admin_port, config.quic_port)
             .map_err(ConfigError::InvalidPorts)?;
         validate_backup_limits(&config).map_err(ConfigError::InvalidBackupLimits)?;
+        validate_download_limits(&config).map_err(ConfigError::InvalidResources)?;
+        config
+            .resources
+            .validate()
+            .map_err(ConfigError::InvalidResources)?;
         config.admin_bind_addr = parse_admin_bind_addr(&config.admin_bind_addr)
             .map_err(ConfigError::InvalidAdminBind)?
             .to_string();
@@ -341,7 +374,12 @@ pub fn load_or_create_config(path: &Path) -> Result<(ServerConfig, bool), Config
 }
 
 pub fn save_config(path: &Path, config: &ServerConfig) -> Result<(), ConfigError> {
+    config
+        .resources
+        .validate()
+        .map_err(ConfigError::InvalidResources)?;
     validate_backup_limits(config).map_err(ConfigError::InvalidBackupLimits)?;
+    validate_download_limits(config).map_err(ConfigError::InvalidResources)?;
     validate_ports(config.port, config.admin_port, config.quic_port)
         .map_err(ConfigError::InvalidPorts)?;
     parse_admin_bind_addr(&config.admin_bind_addr).map_err(ConfigError::InvalidAdminBind)?;
@@ -524,6 +562,18 @@ mod tests {
         split_bind_addr, validate_ports, ConfigError, MusicRootConfig, ServerConfig,
     };
 
+    #[test]
+    fn client_migration_requires_an_explicit_configuration_opt_in() {
+        let legacy: ServerConfig = serde_yaml::from_str("quic_enabled: true\n").unwrap();
+        assert!(!legacy.quic_allow_client_migration);
+        let enabled: ServerConfig =
+            serde_yaml::from_str("quic_allow_client_migration: true\n").unwrap();
+        assert!(enabled.quic_allow_client_migration);
+        let round_trip: ServerConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&enabled).unwrap()).unwrap();
+        assert!(round_trip.quic_allow_client_migration);
+    }
+
     struct TemporaryConfig(std::path::PathBuf);
 
     impl TemporaryConfig {
@@ -539,6 +589,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn download_limits_default_safely_and_reject_invalid_or_overflowing_budgets() {
+        let mut config: ServerConfig = serde_yaml::from_str("music_root: ''\n").unwrap();
+        assert_eq!(config.download_cache_max_mib, 1024);
+        assert_eq!(config.download_file_max_mib, 256);
+        assert!(super::validate_download_limits(&config).is_ok());
+        config.download_file_max_mib = 0;
+        assert!(super::validate_download_limits(&config).is_err());
+        config.download_file_max_mib = 2048;
+        assert!(super::validate_download_limits(&config).is_err());
+        config.download_cache_max_mib = u64::MAX;
+        assert!(super::validate_download_limits(&config).is_err());
     }
 
     #[test]

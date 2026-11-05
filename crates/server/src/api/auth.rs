@@ -20,6 +20,7 @@ use crate::state::{AppState, HealthResponse};
 pub(crate) struct PasswordChangeState {
     auth: AuthStore,
     security: Arc<SecurityState>,
+    shutdown: crate::shutdown::Shutdown,
 }
 
 impl FromRef<AppState> for PasswordChangeState {
@@ -27,6 +28,7 @@ impl FromRef<AppState> for PasswordChangeState {
         Self {
             auth: state.auth.clone(),
             security: state.security.clone(),
+            shutdown: state.shutdown.clone(),
         }
     }
 }
@@ -125,12 +127,15 @@ async fn auth_password(
         Err(status) => return json_error_response(status, "too many password change attempts"),
     };
     let auth = state.auth.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // The permit outlives the HTTP request if a timeout/cancellation occurs.
-        let _permit = permit;
-        auth.change_own_password(&token, &payload.current_password, &payload.new_password)
-    })
-    .await;
+    let result = state
+        .shutdown
+        .clone()
+        .spawn_blocking_named("api_auth.rs", move || {
+            // The permit outlives the HTTP request if a timeout/cancellation occurs.
+            let _permit = permit;
+            auth.change_own_password(&token, &payload.current_password, &payload.new_password)
+        })
+        .await;
     match result {
         Ok(Ok(())) => {
             state.security.invalidate_user_attempts(&user.id);
@@ -165,6 +170,10 @@ pub async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> R
             format!("auth error: {}", err),
         );
     }
+    state
+        .process_metrics
+        .network()
+        .clear_playback_session(&token);
 
     Json(HealthResponse { status: "ok" }).into_response()
 }
@@ -206,7 +215,11 @@ mod password_tests {
             let token = auth.create_session(&user.id).unwrap().token;
             let security = SecurityState::new(auth.opaque_setup().unwrap());
             Self {
-                state: PasswordChangeState { auth, security },
+                state: PasswordChangeState {
+                    auth,
+                    security,
+                    shutdown: Default::default(),
+                },
                 user,
                 token,
                 _cleanup: TemporaryDatabase(path),

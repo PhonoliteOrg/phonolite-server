@@ -1,5 +1,5 @@
 [Unit]
-Description=Phonolite music server
+Description=Phonolite Server
 After=network.target
 
 [Service]
@@ -13,6 +13,8 @@ Environment=PHONOLITE_CONFIG=/var/lib/phonolite/config.yaml
 ExecStart=/usr/local/bin/phonolite-server
 Restart=on-failure
 RestartSec=5
+# The server drains work for 20s, then bounds runtime cleanup to another 5s.
+TimeoutStopSec=35s
 UMask=0077
 NoNewPrivileges=true
 

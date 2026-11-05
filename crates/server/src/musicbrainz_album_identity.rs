@@ -1148,27 +1148,27 @@ impl MusicBrainzAlbumArtistResolver<'_> {
                     }
                 }
             }
-            tracing::info!(provider="musicbrainz", kind="album_identity", album_id=%album.id, album=%local.title, search_query=%query,
+            tracing::info!(target: "metadata_external", provider="musicbrainz", kind="album_identity", album_id=%album.id, album=%local.title, search_query=%query,
                 returned_candidates, provider_count, truncated, unexamined_candidates, verified_groups=verified.len(), release_detail_requests=detail_count, group_browses=seen_groups.len(), "MusicBrainz album identity discovery stage completed");
             if verified.len() > 1 {
-                tracing::info!(provider="musicbrainz", kind="album_identity", album_id=%album.id, reason="ambiguous_verified_programmes", group_count=verified.len(), "MusicBrainz album identity was not selected");
+                tracing::info!(target: "metadata_external", provider="musicbrainz", kind="album_identity", album_id=%album.id, reason="ambiguous_verified_programmes", group_count=verified.len(), "MusicBrainz album identity was not selected");
                 return Ok(AlbumIdentityOutcome::Ambiguous);
             }
         }
         truncated |= group_budget_exhausted;
         if group_budget_exhausted {
-            tracing::info!(provider="musicbrainz", kind="album_identity", album_id=%album.id, reason="group_detail_budget_exhausted_without_unique_identity", group_details=group_lookups.len(), "MusicBrainz album identity remains inconclusive");
+            tracing::info!(target: "metadata_external", provider="musicbrainz", kind="album_identity", album_id=%album.id, reason="group_detail_budget_exhausted_without_unique_identity", group_details=group_lookups.len(), "MusicBrainz album identity remains inconclusive");
             return Ok(AlbumIdentityOutcome::NoMatch);
         }
         if let Some(identity) = verified.into_values().next() {
-            tracing::info!(provider="musicbrainz", kind="album_identity", album_id=%album.id, release_id=%identity.release_id,
+            tracing::info!(target: "metadata_external", provider="musicbrainz", kind="album_identity", album_id=%album.id, release_id=%identity.release_id,
                 release_group_id=%identity.release_group_id, evidence=%identity.evidence.match_kind, truncated, unexamined_candidates,
                 "MusicBrainz album group identity verified against local programme within the bounded search");
             return Ok(AlbumIdentityOutcome::Verified(identity));
         }
         let mut reasons: Vec<_> = rejections.into_iter().collect();
         reasons.sort_unstable_by_key(|(reason, _)| *reason);
-        tracing::info!(provider="musicbrainz", kind="album_identity", album_id=%album.id, album=%local.title,
+        tracing::info!(target: "metadata_external", provider="musicbrainz", kind="album_identity", album_id=%album.id, album=%local.title,
             reason=if truncated { "search_budget_exhausted_without_verified_identity" } else { "no_verified_programme" }, truncated, unexamined_candidates, rejection_counts=?reasons,
             release_detail_requests=detail_count, group_browses=seen_groups.len(), "MusicBrainz album identity was not selected");
         Ok(AlbumIdentityOutcome::NoMatch)

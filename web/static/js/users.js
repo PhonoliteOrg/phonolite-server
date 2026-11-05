@@ -1,5 +1,5 @@
 import { openModal, closeModal } from "./dialogs.js";
-import { beginBusy, clearInlineError, showInlineError, toParams, fetchJson } from "./shared.js";
+import { beginBusy, clearInlineError, showInlineError, toParams, fetchJson, startPolling } from "./shared.js";
 
 // Keep the table, edit controls, and unchanged accounts mounted. Server markup
 // remains authoritative for role restrictions after each account mutation.
@@ -42,6 +42,17 @@ export function setupUsers() {
   const controller = new AbortController();
   const listeners = [];
   const rows = document.getElementById("user-rows");
+  const stopActivity = startPolling(async (signal) => {
+    const data = await fetchJson("/users/activity", undefined, { signal });
+    if (signal.aborted || controller.signal.aborted || !rows) return;
+    for (const row of rows.children) {
+      const count = data.sessions?.[row.dataset.userId];
+      const cell = row.querySelector(".user-sessions");
+      if (cell && Number.isSafeInteger(count) && count >= 0 && cell.textContent !== String(count)) {
+        cell.textContent = String(count);
+      }
+    }
+  }, 5000, { immediate: false });
   let submitting = false;
   function listen(element, event, callback) {
     if (!element) return;
@@ -94,6 +105,11 @@ export function setupUsers() {
   const deleteError = document.getElementById("delete-user-error");
 
   let deleteTargets = [];
+  let sessionsTarget = "";
+  const modalSessions = document.getElementById("modal-sessions");
+  const sessionsMessage = document.getElementById("sessions-message");
+  const sessionsError = document.getElementById("sessions-error");
+  const sessionsConfirm = document.getElementById("confirm-sessions");
 
   function setPageMessage(message) {
     if (!inlineMessage) return;
@@ -149,6 +165,15 @@ export function setupUsers() {
       }
       if (userIdInput) userIdInput.value = userId;
       openModal(modalEdit);
+      return;
+    }
+
+    if (button.dataset.action === "revoke-sessions") {
+      if (protectedUser && userId !== currentUserId) return;
+      sessionsTarget = userId;
+      clearInlineError(sessionsError);
+      sessionsMessage.textContent = `Sign out all app sessions for ${username}? Their apps will need to sign in again. Admin console sessions will stay signed in.`;
+      openModal(modalSessions);
       return;
     }
 
@@ -235,6 +260,12 @@ export function setupUsers() {
     submitAction(`/users/${userId}/update`, params, event.submitter || editForm.querySelector("button[type=submit]"), editError, modalEdit);
   });
 
+  listen(sessionsConfirm, "click", () => {
+    if (!sessionsTarget) return;
+    clearInlineError(sessionsError);
+    submitAction(`/users/${encodeURIComponent(sessionsTarget)}/sessions/revoke-all`, new URLSearchParams(), sessionsConfirm, sessionsError, modalSessions);
+  });
+
   listen(deleteConfirm, "click", () => {
     clearInlineError(deleteError);
     if (deleteTargets.length === 0) {
@@ -251,6 +282,7 @@ export function setupUsers() {
     }
   });
   return () => {
+    stopActivity();
     controller.abort();
     listeners.forEach((remove) => remove());
   };

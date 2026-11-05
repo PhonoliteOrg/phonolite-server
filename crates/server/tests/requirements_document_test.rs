@@ -65,7 +65,7 @@ fn requirements_document_records_current_security_transport_and_cache_limits() {
             "LIM-001: Password hashing currently uses plain SHA-256",
             "LIM-010: QUIC peer certificate verification is currently disabled",
             "STREAM-001: The server",
-            "XCODE-021: The shared memory-backed stream cache shall reserve at most sixty-four `5s` ranges of `4 MiB` each, for a total encoded-audio payload budget of `256 MiB`; ephemeral ranges when caching is disabled shall use the same reservations, and exhausted pinned capacity shall return a retryable error.",
+            "XCODE-021: The shared memory-backed stream cache shall reserve `5s` ranges of at most `4 MiB` each within the configured audio payload budget, defaulting to `32 MiB`; ephemeral ranges when caching is disabled shall use the same reservations, and exhausted pinned capacity shall return a retryable error.",
         ],
     );
 }

@@ -4,21 +4,21 @@ use super::{
     views::{liked_set, playlist_set},
 };
 use crate::download_files::{
-    checksum_for_file, download_content_disposition, download_content_type, download_etag,
-    percent_encode_path_component, range_error_response,
+    checksum_for_file_cancellable as checksum_for_file, download_content_disposition,
+    download_content_type, download_etag, percent_encode_path_component, range_error_response,
 };
 use crate::http::{json_error, json_error_response};
 use crate::offline_metadata::{
     offline_metadata_for_track, OfflineTrackMetadata, OFFLINE_METADATA_SCHEMA_VERSION,
 };
 use crate::range::{parse_range_header, ByteRange};
-use crate::state::{AppState, JsonResult};
+use crate::state::{AppState, AuthContext, JsonResult};
 use axum::{
     body::Body,
     extract::{Path as AxumPath, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -168,11 +168,12 @@ pub async fn download_track(
 
 pub async fn create_download_batch(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Json(request): Json<DownloadBatchRequest>,
 ) -> JsonResult<DownloadBatchResponse> {
     let library = library_or_json_error(&state)?;
-    let liked_set = liked_set(&state)?;
-    let playlist_set = playlist_set(&state)?;
+    let liked_set = liked_set(&state, &ctx.user.id)?;
+    let playlist_set = playlist_set(&state, &ctx.user.id)?;
 
     let mut seen = HashSet::new();
     let track_ids = request
@@ -241,7 +242,7 @@ pub async fn create_download_batch(
                     continue;
                 }
             };
-        let sha256 = match checksum_for_file(&path, &metadata).await {
+        let sha256 = match checksum_for_file(&path, &metadata, &state.shutdown).await {
             Ok(sha256) => sha256,
             Err(err) => {
                 unavailable.push(DownloadBatchUnavailable {
@@ -288,6 +289,7 @@ pub async fn create_download_batch(
 
 pub async fn get_offline_track_metadata(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     AxumPath(track_id): AxumPath<String>,
 ) -> JsonResult<OfflineTrackMetadata> {
     let library = library_or_json_error(&state)?;
@@ -301,8 +303,8 @@ pub async fn get_offline_track_metadata(
             ))
         }
     };
-    let liked_set = liked_set(&state)?;
-    let playlist_set = playlist_set(&state)?;
+    let liked_set = liked_set(&state, &ctx.user.id)?;
+    let playlist_set = playlist_set(&state, &ctx.user.id)?;
     offline_metadata_for_track(&library, &track, &liked_set, &playlist_set)
         .map(Json)
         .map_err(|err| {

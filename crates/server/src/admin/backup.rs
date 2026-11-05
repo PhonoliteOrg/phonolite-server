@@ -105,6 +105,12 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Library, Response>
 }
 
 fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if state.shutdown.is_cancelled() {
+        return Err(json_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down",
+        ));
+    }
     match admin_user_from_headers(state, headers) {
         Ok(Some(user)) if is_admin(&user) => {}
         Ok(Some(_)) => {
@@ -127,6 +133,94 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response
         }
     }
     Ok(())
+}
+
+// This context is local to an admitted blocking backup operation. It never
+// changes the transaction policy: only unfinished archive preparation stops.
+thread_local! {
+    static ARCHIVE_CANCELLATION: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+struct BackupCancellation(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+impl BackupCancellation {
+    fn new(shutdown: &crate::shutdown::Shutdown) -> Self {
+        Self(ARCHIVE_CANCELLATION.with(|slot| slot.replace(Some(shutdown.flag()))))
+    }
+}
+impl Drop for BackupCancellation {
+    fn drop(&mut self) {
+        ARCHIVE_CANCELLATION.with(|slot| slot.replace(self.0.take()));
+    }
+}
+fn ensure_archive_running() -> Result<(), String> {
+    let cancelled = ARCHIVE_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    });
+    if cancelled {
+        Err("server shutting down".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn cancelled_archive_stops_before_reading_and_restores_worker_context() {
+        struct NeverRead;
+        impl std::io::Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("cancelled archive performed I/O")
+            }
+        }
+        let shutdown = crate::shutdown::Shutdown::new();
+        let scope = BackupCancellation::new(&shutdown);
+        shutdown.cancel();
+        assert!(std::io::Read::read(&mut ArchiveReader(NeverRead), &mut [0; 8]).is_err());
+        assert!(archive::export(
+            vec![CatalogBackup::default()],
+            Path::new("."),
+            archive::Limits::from_config(&crate::config::ServerConfig::default()).unwrap()
+        )
+        .is_err());
+        drop(scope);
+        assert!(ensure_archive_running().is_ok());
+    }
+
+    #[test]
+    fn cancelled_restore_keeps_existing_assets_and_publishes_no_partial_file() {
+        let scratch = archive::Scratch::new().unwrap();
+        let root = scratch.path("metadata");
+        let committed = BTreeMap::from([("restored/old.png".into(), b"committed".to_vec())]);
+        write_assets(&root, &committed).unwrap();
+        let shutdown = crate::shutdown::Shutdown::new();
+        let _scope = BackupCancellation::new(&shutdown);
+        shutdown.cancel();
+        let incoming = BTreeMap::from([("restored/new.png".into(), vec![7; 128 * 1024])]);
+        assert!(write_assets(&root, &incoming).is_err());
+        assert_eq!(
+            std::fs::read(root.join("restored/old.png")).unwrap(),
+            b"committed"
+        );
+        assert!(!root.join("restored/new.png").exists());
+        assert!(std::fs::read_dir(root.join("restored"))
+            .unwrap()
+            .all(|entry| {
+                entry.unwrap().path().extension().and_then(|v| v.to_str()) != Some("part")
+            }));
+    }
+}
+struct ArchiveReader<R>(R);
+impl<R: std::io::Read> std::io::Read for ArchiveReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        ensure_archive_running().map_err(std::io::Error::other)?;
+        // Limit the interval between cancellation checks even if the caller
+        // requests the entire archive at once.
+        let length = bytes.len().min(64 * 1024);
+        self.0.read(&mut bytes[..length])
+    }
 }
 
 pub async fn export(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -153,14 +247,21 @@ pub async fn export(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let id = snapshot.id.clone();
     let root = metadata_root_path(&state);
     let store = state.backup_jobs.clone();
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let _busy = _busy;
-            let catalogs = library.export_metadata().map_err(|err| err.to_string())?;
-            let archive = archive::export(catalogs, &root, parts::whole_limits(limits))?;
-            parts::split(archive, limits.archive)
-        })
-        .await;
+    let shutdown = state.shutdown.clone();
+    state.shutdown.spawn(async move {
+        let cancellation = shutdown.clone();
+        let result = shutdown
+            .spawn_blocking(move || {
+                let _scope = BackupCancellation::new(&cancellation);
+                let _busy = _busy;
+                ensure_backup_running(&cancellation)?;
+                let catalogs = library.export_metadata().map_err(|err| err.to_string())?;
+                ensure_backup_running(&cancellation)?;
+                let archive = archive::export(catalogs, &root, parts::whole_limits(limits))?;
+                ensure_backup_running(&cancellation)?;
+                parts::split(archive, limits.archive)
+            })
+            .await;
         match result {
             Ok(Ok(prepared)) => {
                 store.with(&id, |job| {
@@ -348,21 +449,26 @@ async fn upload(state: AppState, headers: HeaderMap, request: Request, commit: b
     let scratch = Arc::new(scratch);
     let store = state.backup_jobs.clone();
     let operation_state = state.clone();
-    let staged = tokio::task::spawn_blocking(move || {
-        // Once the body is on disk, accepting/checking it survives cancellation
-        // of this HTTP request. Keep the operation lock inside that work too.
-        let guard = _busy;
-        transfer.checking();
-        let header = parts::inspect(&mut file, limits);
-        drop(file);
-        let (id, complete) = register_upload(&store, scratch, header?)?;
-        drop(transfer);
-        if complete {
-            start_processing(operation_state, library, id.clone(), limits, commit, guard);
-        }
-        Ok::<_, String>(id)
-    })
-    .await;
+    let staged = state
+        .shutdown
+        .spawn_blocking(move || {
+            // Once the body is on disk, accepting/checking it survives cancellation
+            // of this HTTP request. Keep the operation lock inside that work too.
+            let _scope = BackupCancellation::new(&operation_state.shutdown);
+            let guard = _busy;
+            ensure_backup_running(&operation_state.shutdown)?;
+            transfer.checking();
+            let header = parts::inspect(&mut file, limits);
+            drop(file);
+            ensure_backup_running(&operation_state.shutdown)?;
+            let (id, complete) = register_upload(&store, scratch, header?)?;
+            drop(transfer);
+            if complete {
+                start_processing(operation_state, library, id.clone(), limits, commit, guard);
+            }
+            Ok::<_, String>(id)
+        })
+        .await;
     let id = match staged {
         Ok(Ok(value)) => value,
         Ok(Err(err)) => return json_error_response(StatusCode::BAD_REQUEST, err),
@@ -502,6 +608,12 @@ fn start_processing(
     commit: bool,
     guard: tokio::sync::MutexGuard<'static, ()>,
 ) {
+    if state.shutdown.is_cancelled() {
+        state
+            .backup_jobs
+            .phase(&id, "failed", "server shutting down");
+        return;
+    }
     state.backup_jobs.phase(
         &id,
         if commit { "restoring" } else { "checking" },
@@ -511,25 +623,30 @@ fn start_processing(
             "Checking backup from disk…"
         },
     );
-    tokio::spawn(async move {
+    state.shutdown.clone().spawn(async move {
         let root = metadata_root_path(&state);
         let events = state.metadata_events.clone();
         let operation_state = state.clone();
         let operation_id = id.clone();
         let result =
-        tokio::task::spawn_blocking(move || -> Result<RestoreReport, String> {
+        state.shutdown.spawn_blocking(move || -> Result<RestoreReport, String> {
+            let _scope = BackupCancellation::new(&operation_state.shutdown);
             let _busy = guard;
+            ensure_backup_running(&operation_state.shutdown)?;
             let (uploaded, received) = operation_state.backup_jobs.with(&operation_id, |job| (job.scratch.clone(), job.received.clone())).ok_or("Backup expired.")?;
             let scratch = archive::Scratch::new()?;
+            ensure_backup_running(&operation_state.shutdown)?;
             let mut file = if received.is_empty() {
                 std::fs::File::open(uploaded.path("upload.phonolite")).map_err(|e| e.to_string())?
             } else {
                 operation_state.backup_jobs.phase(&operation_id, if commit { "restoring" } else { "checking" }, "Reading backup parts from disk…");
                 parts::assemble(&uploaded, &received, &scratch)?
             };
+            ensure_backup_running(&operation_state.shutdown)?;
             let parsed = archive::import(&mut file, &scratch, if received.is_empty() { limits } else { parts::whole_limits(limits) });
             drop(file);
             let file = parsed?;
+            ensure_backup_running(&operation_state.shutdown)?;
             // Pin the destination through the restore. Configuration edits and
             // new scans wait until the source-driven transaction has finished.
             let config = operation_state.config.read();
@@ -543,8 +660,10 @@ fn start_processing(
             }
             if commit {
                 operation_state.backup_jobs.phase(&operation_id, "restoring", "Restoring artwork from disk…");
+                ensure_backup_running(&operation_state.shutdown)?;
                 file.write_assets(&root)?;
             }
+            ensure_backup_running(&operation_state.shutdown)?;
             operation_state.backup_jobs.phase(&operation_id, if commit { "restoring" } else { "checking" }, if commit { "Applying saved metadata…" } else { "Matching backup to library…" });
             let report = if commit {
                 library.restore_metadata(&file.catalogs)
@@ -555,6 +674,12 @@ fn start_processing(
             drop(library_state);
             drop(config);
             if commit {
+                // A committed transaction stays committed. Cancellation stops
+                // optional response/event work after this atomic boundary.
+                if operation_state.shutdown.is_cancelled() {
+                    return Ok(report);
+                }
+                events.emit_catalogue(library.browse_revision());
                 for album in library
                     .list_albums(None, usize::MAX, 0)
                     .map_err(|err| err.to_string())?
@@ -613,6 +738,14 @@ fn start_processing(
                 .phase(&id, "failed", "Backup processing failed."),
         }
     });
+}
+
+fn ensure_backup_running(shutdown: &crate::shutdown::Shutdown) -> Result<(), String> {
+    if shutdown.is_cancelled() {
+        Err("server shutting down".into())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -803,27 +936,41 @@ fn write_assets(root: &Path, images: &BTreeMap<String, Vec<u8>>) -> Result<(), S
                 .file_name()
                 .ok_or("Invalid artwork filename.")?,
         );
-        match std::fs::OpenOptions::new()
+        ensure_archive_running()?;
+        if path.exists() {
+            let metadata = std::fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != bytes.len() as u64
+                || std::fs::read(&path).map_err(|err| err.to_string())? != *bytes
+            {
+                return Err("Existing restored artwork failed its integrity check.".into());
+            }
+            continue;
+        }
+        let temporary = restored.join(format!(".restore-{}.part", uuid::Uuid::new_v4()));
+        struct PendingAsset(std::path::PathBuf);
+        impl Drop for PendingAsset {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = PendingAsset(temporary.clone());
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => file
-                .write_all(bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|err| err.to_string())?,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
-                if !metadata.is_file()
-                    || metadata.file_type().is_symlink()
-                    || metadata.len() != bytes.len() as u64
-                    || std::fs::read(&path).map_err(|err| err.to_string())? != *bytes
-                {
-                    return Err("Existing restored artwork failed its integrity check.".into());
-                }
-            }
-            Err(err) => return Err(err.to_string()),
+            .open(&temporary)
+            .map_err(|err| err.to_string())?;
+        for chunk in bytes.chunks(64 * 1024) {
+            ensure_archive_running()?;
+            file.write_all(chunk).map_err(|err| err.to_string())?;
         }
+        file.sync_all().map_err(|err| err.to_string())?;
+        drop(file);
+        ensure_archive_running()?;
+        // Publish a complete immutable file. A later catalogue rollback can
+        // leave a complete unreferenced asset, never a partially visible one.
+        std::fs::rename(&temporary, &path).map_err(|err| err.to_string())?;
     }
     Ok(())
 }

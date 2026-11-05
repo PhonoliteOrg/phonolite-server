@@ -125,7 +125,7 @@ fn raw_opus_transcode_and_cache_contracts_are_encoded() {
             "Auto",
             "TranscodeMode::Fixed",
             "if decoded_channels == 0 || decoded_channels > 2 {",
-            "LinearResampler::new(",
+            "SincResampler::new(",
             "buf.extend_from_slice(b\"OPUSR01\\0\");",
             "if header_len > u16::MAX as usize {",
             "2 | 5 | 10 | 20 | 40 | 60 => Ok(frame_ms),",
