@@ -294,7 +294,14 @@ on every `stream` announcement. Missing/false flags retain legacy fixed-quality
 behavior. Clients without range switching support never opt in; older servers ignore the new open field.
 
 The server selects fixed Low (48 kbit/s), Medium (96 kbit/s) and High
-(160 kbit/s) safety renditions for Auto, starting at Medium. A capable client
+(160 kbit/s) safety renditions for Auto. A cold listener/path starts at Medium;
+subsequent track opens and new QUIC connections inherit the last established
+preset for five minutes. History is bounded to 1024 entries and scoped to the
+authenticated user, a digest of that device's auth session, and active peer IP.
+Other accounts/devices and changed network paths cannot overwrite that estimate.
+Cold empty buffers and short paused/prepared horizons do not write history;
+active delivery or a genuine pressure downgrade does. A prepared successor
+refreshes its inherited preset when first becoming active. A capable client
 also requests `adaptive_original: true`. For negotiated Auto sessions, each
 `stream` announcement includes an `original` descriptor containing the Original
 file's `source_version`, `total_length` and `duration_ms`. The file identity is
@@ -312,6 +319,16 @@ Wi-Fi-only requirement applies. Subsequent delivery variation is absorbed by
 the reserve; falling below two seconds or a decoder failure selects the ready
 compressed stream and starts a thirty-second retry cooldown. A fully decoded
 tail can drain normally without a needless downgrade.
+The worker also remembers audible Original success for five minutes, scoped to
+endpoint, pinned identity, account credential and network-route generation, with
+at most sixteen entries. A new track on that route can probe Original before its
+first PCM and wait at most one additional second for the same four-second reserve
+and 15% delivery headroom. If ready, its first audible quality is Original;
+otherwise the inherited compressed preset starts while preparation continues.
+Each file retains fresh identity, format and delivery validation. Prepared audio
+cannot publish audible success. Network pressure/cooldown survives skips; old
+queued OG after a route change cannot validate the new route. A fresh process,
+expired estimate or changed route uses the normal cold preparation gate.
 Source-rate/channel conversion runs on the existing decoder isolate, keeping
 the output pump independent of network reads and resampling work.
 Preparation retains the native decoder's startup budget. If container setup
@@ -345,13 +362,17 @@ is consumed. A demanded stalled transfer can report zero; an unavailable sample
 is omitted. This measures useful delivery, not radio bars. Older clients omit
 the fields and retain their buffer-based adaptation; older servers ignore them.
 
-After a five-second change cooldown, a buffer below three seconds or measured
-delivery below 125% of the current preset reduces quality. A severe throughput
-drop can move directly to Low. To upgrade one step, the client must maintain a
+After a five-second change cooldown, a buffer below three seconds reduces
+quality promptly. With a larger buffer, delivery below the current preset's
+nominal bitrate must persist for four seconds and consume at least 500 ms of
+reserve before lowering quality. One poor sample, healthy backpressure and
+capacity between 100% and 125% of HQ no longer force MQ. A severe throughput drop
+can move directly to Low. To upgrade one step, the client must maintain a
 5–10-second reserve (the requested horizon minus three seconds, bounded to that
-range) and measured capacity of at least 150% of the next preset
-for thirty seconds. Missing measurements or a reporting gap longer than three
-seconds restart that stability window. Paused/prepared horizons do not drive
+range) and measured capacity of at least 125% of the next preset for twenty
+seconds, or at least 200% for ten continuous seconds. Legacy unmeasured clients
+retain the thirty-second buffer window. Missing measurements or a reporting gap
+longer than three seconds restart the stability and delivery-pressure windows. Paused/prepared horizons do not drive
 adaptation and refresh the normal five-second refill grace, so becoming audible
 with a small prepared reserve does not immediately force Low. Active Auto retains an eight-second horizon on loopback too, so
 localhost playback is not mistaken for an intentionally short paused/prepared
@@ -362,8 +383,9 @@ Buffer reports include retained PCM plus nonoverlapping encoded coverage while
 a continuation or reconnect waits for its next header. Only a cold start or an
 uncached seek reports no reserve for the new position. A range request does not
 empty accepted playback or reset Auto's stability timer merely by changing the
-transport generation. Starting at Medium still requires one thirty-second
-healthy interval to select High; Low needs two steps. Already queued audio and
+transport generation. Cold Medium still needs one measured healthy interval
+to select High; Low needs two steps. Recent established HQ starts the next track
+at HQ without repeating that upgrade window. Already queued audio and
 range boundaries add delay before the visible audible-quality tag changes.
 
 Auto diagnostics use ten-second intervals. The native `QUIC client stats`
@@ -374,12 +396,13 @@ records audible quality, playable and PCM reserve, position, and pause/refill/
 continuation/repair state. Native QUIC path `delivery_rate` describes the
 sender's ACK feedback; it must not be interpreted as downloaded audio capacity.
 
-The server's `QUIC Auto quality sample` with `policy_revision=2` records the
+The server's `QUIC Auto quality sample` with `policy_revision=3` records the
 selected rendition, active decision reason, required upgrade reserve/rate,
 healthy-window duration, and cumulative window resets with the last reset
 reason. Decisions still run on every buffer report; logging does not throttle
-adaptation. Resets between samples remain visible in the counter. Revision 2
-identifies the refill-margin/continuation fixes and these diagnostics. Capture
+adaptation. Resets between samples remain visible in the counter. Revision 3
+identifies listener/path carryover and downgrade hysteresis. Each Auto open also
+logs its starting preset and `history_hit`, without account tokens. Capture
 both updated builds before tuning thresholds; old logs cannot distinguish
 missing capacity evidence from low headroom or a repeatedly reset window.
 

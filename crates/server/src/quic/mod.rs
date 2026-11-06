@@ -20,6 +20,7 @@ use crate::transcode::{TranscodeMode, TranscodeQuality};
 #[cfg(test)]
 mod migration_tests;
 mod adaptive;
+mod quality_history;
 mod source;
 mod udp;
 
@@ -511,6 +512,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
     tracing::info!("QUIC listening on {}", local_addr);
 
     let mut connections: HashMap<Vec<u8>, ClientConn> = HashMap::new();
+    let mut quality_history = quality_history::QualityHistory::default();
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; socket.receive_capacity(MAX_QUIC_DATAGRAM)];
     let mut send_buf = vec![0u8; MAX_QUIC_DATAGRAM];
@@ -660,7 +662,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                     &lookup_id,
                     config.quic_allow_client_migration,
                 );
-                handle_readable(&state, client);
+                handle_readable(&state, client, &mut quality_history);
                 flush_source_requests(&state, client);
                 flush_control(&mut client.session, &mut client.conn);
                 flush_streams(&mut client.session, &mut client.conn);
@@ -744,7 +746,7 @@ pub async fn run(state: AppState) -> Result<(), String> {
                         id,
                         config.quic_allow_client_migration,
                     );
-                    handle_readable(&state, client);
+                    handle_readable(&state, client, &mut quality_history);
                     flush_source_requests(&state, client);
                     flush_control(&mut client.session, &mut client.conn);
                     flush_streams(&mut client.session, &mut client.conn);
@@ -891,7 +893,11 @@ fn generate_cid() -> Vec<u8> {
     scid.to_vec()
 }
 
-fn handle_readable(state: &AppState, client: &mut ClientConn) {
+fn handle_readable(
+    state: &AppState,
+    client: &mut ClientConn,
+    history: &mut quality_history::QualityHistory,
+) {
     let mut buf = [0u8; 65535];
     let readable: Vec<u64> = client.conn.readable().collect();
     for stream_id in readable {
@@ -904,7 +910,7 @@ fn handle_readable(state: &AppState, client: &mut ClientConn) {
                     if client.session.control_stream == Some(stream_id) {
                         let messages = client.session.control_parser.push(&buf[..len]);
                         for msg in messages {
-                            handle_control_message(state, client, msg);
+                            handle_control_message(state, client, msg, history);
                         }
                     }
                 }
@@ -918,7 +924,20 @@ fn handle_readable(state: &AppState, client: &mut ClientConn) {
     }
 }
 
-fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: ControlMessage) {
+fn listener_path(client: &ClientConn) -> Option<quality_history::ListenerPath> {
+    Some(quality_history::ListenerPath::new(
+        client.session.user_id.as_deref()?,
+        client.session.auth_token.as_deref()?,
+        client.conn.path_stats().find(|path| path.active)?.peer_addr.ip(),
+    ))
+}
+
+fn handle_control_message(
+    state: &AppState,
+    client: &mut ClientConn,
+    msg: ControlMessage,
+    history: &mut quality_history::QualityHistory,
+) {
     if let Some(presence) = &client.session.presence {
         presence.touch();
     }
@@ -1093,6 +1112,19 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 adaptive_ranges,
                 Instant::now(),
             );
+            let key = listener_path(client);
+            if let Some(auto) = client.session.adaptive_quality.as_mut() {
+                let remembered = key.as_ref().and_then(|key| history.quality(key, Instant::now()));
+                if let Some(quality) = remembered {
+                    auto.resume(quality);
+                }
+                tracing::info!(
+                    policy_revision = 3,
+                    history_hit = remembered.is_some(),
+                    quality = ?auto.quality(),
+                    "QUIC Auto starting quality"
+                );
+            }
             client.session.adaptive_original = adaptive_original && client.session.adaptive_quality.is_some();
             client.session.open_request_id = request_id;
             cancel_source_ranges(&mut client.session, &mut client.conn);
@@ -1187,17 +1219,22 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             if request_id.is_some() && request_id != client.session.open_request_id {
                 return;
             }
+            let key = listener_path(client);
             if let Some(auto) = client.session.adaptive_quality.as_mut() {
                 let target = target_ms.unwrap_or(client.session.buffer_target_ms);
+                let now = Instant::now();
+                if let Some(quality) = key.as_ref().and_then(|key| history.quality(key, now)) {
+                    auto.resume_first_active(quality, target);
+                }
                 if let Some(sample) = auto.observe(
                     buffer_ms,
                     target,
                     delivery_metrics,
                     delivery_bps,
-                    Instant::now(),
+                    now,
                 ) {
                     tracing::info!(
-                        policy_revision = 2,
+                        policy_revision = 3,
                         request_id,
                         quality = ?sample.quality,
                         reason = sample.reason,
@@ -1213,6 +1250,9 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                         last_reset_reason = sample.last_reset_reason,
                         "QUIC Auto quality sample"
                     );
+                }
+                if let (Some(key), Some(quality)) = (key, auto.remembered_quality(target)) {
+                    history.remember(key, quality, now);
                 }
             }
             client.session.client_buffer_ms = buffer_ms;

@@ -7,6 +7,10 @@ pub(super) struct AdaptiveQuality {
     quality: TranscodeQuality,
     last_change: Instant,
     high_since: Option<Instant>,
+    fast_since: Option<Instant>,
+    pressure_since: Option<(Instant, u32)>,
+    established: bool,
+    active_reported: bool,
     last_observed: Option<Instant>,
     last_diagnostic: Option<Instant>,
     window_resets: u32,
@@ -34,6 +38,10 @@ impl AdaptiveQuality {
             quality: TranscodeQuality::Medium,
             last_change: now,
             high_since: None,
+            fast_since: None,
+            pressure_since: None,
+            established: false,
+            active_reported: false,
             last_observed: None,
             last_diagnostic: None,
             window_resets: 0,
@@ -43,6 +51,21 @@ impl AdaptiveQuality {
 
     pub fn quality(&self) -> TranscodeQuality {
         self.quality
+    }
+
+    pub fn resume(&mut self, quality: TranscodeQuality) {
+        self.quality = quality;
+    }
+
+    pub fn resume_first_active(&mut self, quality: TranscodeQuality, target_ms: u32) {
+        if target_ms >= 8000 && !self.active_reported {
+            self.quality = quality;
+            self.active_reported = true;
+        }
+    }
+
+    pub fn remembered_quality(&self, target_ms: u32) -> Option<TranscodeQuality> {
+        (self.established && target_ms >= 8000).then_some(self.quality)
     }
 
     pub fn observe(
@@ -60,6 +83,8 @@ impl AdaptiveQuality {
         let was_healthy = self.high_since.is_some();
         if report_gap {
             self.high_since = None;
+            self.fast_since = None;
+            self.pressure_since = None;
         }
         self.last_observed = Some(now);
         let reason = self.evaluate(buffered_ms, target_ms, delivery_metrics, delivery_bps, now);
@@ -82,7 +107,7 @@ impl AdaptiveQuality {
             reason,
             quality: self.quality,
             upgrade_buffer_ms: target_ms.saturating_sub(3000).clamp(5000, 10000),
-            upgrade_bps: higher.map(|quality| u64::from(quality_bitrate(quality)) * 3 / 2),
+            upgrade_bps: higher.map(|quality| u64::from(quality_bitrate(quality)) * 5 / 4),
             healthy_ms: self
                 .high_since
                 .map_or(0, |since| now.saturating_duration_since(since).as_millis()),
@@ -104,17 +129,32 @@ impl AdaptiveQuality {
         // backpressure, not evidence that their network cannot sustain audio.
         if target_ms < 8000 {
             self.high_since = None;
+            self.fast_since = None;
+            self.pressure_since = None;
             // Its intentionally small reserve needs the same refill grace as
             // a cold start when playback becomes active again.
             self.last_change = now;
             return "inactive_horizon";
         }
+        self.active_reported = true;
+        self.established |= buffered_ms >= 3000;
         let delivery_bps = delivery_bps.filter(|_| delivery_metrics);
-        let insufficient_delivery = delivery_bps
-            .is_some_and(|rate| rate < u64::from(quality_bitrate(self.quality)) * 5 / 4);
+        let insufficient_delivery =
+            delivery_bps.is_some_and(|rate| rate < u64::from(quality_bitrate(self.quality)));
+        let sustained_pressure = if insufficient_delivery {
+            let (since, initial_reserve) = *self.pressure_since.get_or_insert((now, buffered_ms));
+            now.saturating_duration_since(since) >= Duration::from_secs(4)
+                && buffered_ms.saturating_add(500) <= initial_reserve
+        } else {
+            self.pressure_since = None;
+            false
+        };
         if buffered_ms < 3000 || insufficient_delivery {
             self.high_since = None;
-            if now.duration_since(self.last_change) >= Duration::from_secs(5) {
+            self.fast_since = None;
+            if (buffered_ms < 3000 || sustained_pressure)
+                && now.duration_since(self.last_change) >= Duration::from_secs(5)
+            {
                 let lower = match self.quality {
                     TranscodeQuality::High => TranscodeQuality::Medium,
                     _ => TranscodeQuality::Low,
@@ -122,19 +162,19 @@ impl AdaptiveQuality {
                 self.quality = match delivery_bps {
                     // A severe drop can skip Medium rather than spend another
                     // range exhausting the reserve at an unsustainable rate.
-                    Some(rate)
-                        if rate < u64::from(quality_bitrate(TranscodeQuality::Medium)) * 5 / 4 =>
-                    {
+                    Some(rate) if rate < u64::from(quality_bitrate(TranscodeQuality::Medium)) => {
                         TranscodeQuality::Low
                     }
                     _ => lower,
                 };
                 self.last_change = now;
+                self.established = true;
+                self.pressure_since = None;
             }
             return if buffered_ms < 3000 {
                 "low_reserve"
             } else {
-                "low_delivery"
+                "delivery_pressure"
             };
         }
 
@@ -144,6 +184,7 @@ impl AdaptiveQuality {
         let upgrade_buffer = target_ms.saturating_sub(3000).clamp(5000, 10000);
         if buffered_ms < upgrade_buffer {
             self.high_since = None;
+            self.fast_since = None;
             return "upgrade_reserve";
         }
         let higher = match self.quality {
@@ -154,9 +195,10 @@ impl AdaptiveQuality {
         // Old adaptive clients retain their buffer-based policy. A measured
         // client must prove headroom; an absent/stale sample is not fast LTE.
         if delivery_metrics
-            && !delivery_bps.is_some_and(|rate| rate >= u64::from(quality_bitrate(higher)) * 3 / 2)
+            && !delivery_bps.is_some_and(|rate| rate >= u64::from(quality_bitrate(higher)) * 5 / 4)
         {
             self.high_since = None;
+            self.fast_since = None;
             return if delivery_bps.is_none() {
                 "missing_delivery_sample"
             } else {
@@ -164,10 +206,22 @@ impl AdaptiveQuality {
             };
         }
         let since = *self.high_since.get_or_insert(now);
-        if now.duration_since(since) >= Duration::from_secs(30) {
+        let fast = delivery_metrics
+            && delivery_bps.is_some_and(|rate| rate >= u64::from(quality_bitrate(higher)) * 2);
+        if fast {
+            self.fast_since.get_or_insert(now);
+        } else {
+            self.fast_since = None;
+        }
+        let fast_ready = self
+            .fast_since
+            .is_some_and(|since| now.duration_since(since) >= Duration::from_secs(10));
+        let healthy_window = Duration::from_secs(if delivery_metrics { 20 } else { 30 });
+        if now.duration_since(since) >= healthy_window || fast_ready {
             self.quality = higher;
             self.last_change = now;
             self.high_since = Some(now);
+            self.fast_since = None;
             return "upgraded";
         }
         "healthy_window"
@@ -187,7 +241,7 @@ mod tests {
             .unwrap();
         assert_eq!(initial.reason, "healthy_window");
         assert_eq!(initial.upgrade_buffer_ms, 5000);
-        assert_eq!(initial.upgrade_bps, Some(240_000));
+        assert_eq!(initial.upgrade_bps, Some(200_000));
         for second in 1..10 {
             assert!(auto
                 .observe(
@@ -331,62 +385,174 @@ mod tests {
     }
 
     #[test]
-    fn delivery_shortfall_reduces_quality_before_a_large_buffer_runs_out() {
+    fn delivery_shortfall_requires_sustained_pressure_and_a_draining_reserve() {
         let now = Instant::now();
         let mut auto = AdaptiveQuality::new(now);
-        auto.observe(
-            16_000,
-            20_000,
-            true,
-            Some(75_000),
-            now + Duration::from_secs(5),
-        );
-        assert_eq!(auto.quality(), TranscodeQuality::Low);
-        // A temporary fast burst cannot immediately reverse the decision.
-        auto.observe(
-            16_000,
-            20_000,
-            true,
-            Some(500_000),
-            now + Duration::from_secs(6),
-        );
-        assert_eq!(auto.quality(), TranscodeQuality::Low);
-        for second in 7..=36 {
+        auto.resume(TranscodeQuality::High);
+        for second in 0..=10 {
+            // Content delivery and backpressure can report less than nominal
+            // without starving playback. A stable reserve must keep HQ.
             auto.observe(
-                16_000,
-                20_000,
+                16000,
+                20000,
                 true,
-                Some(500_000),
-                now + Duration::from_secs(second),
-            );
-        }
-        assert_eq!(auto.quality(), TranscodeQuality::Medium);
-        for second in 37..=66 {
-            auto.observe(
-                16_000,
-                20_000,
-                true,
-                Some(500_000),
+                Some(150_000),
                 now + Duration::from_secs(second),
             );
         }
         assert_eq!(auto.quality(), TranscodeQuality::High);
         auto.observe(
-            16_000,
-            20_000,
+            15000,
+            20000,
             true,
             Some(150_000),
-            now + Duration::from_secs(71),
+            now + Duration::from_secs(11),
         );
         assert_eq!(auto.quality(), TranscodeQuality::Medium);
-        auto.observe(
-            16_000,
-            20_000,
-            true,
-            Some(70_000),
-            now + Duration::from_secs(76),
-        );
+        // A real capacity collapse must lower quality before a large reserve empties.
+        for second in 12..=16 {
+            auto.observe(
+                15000 - (second as u32 - 12) * 250,
+                20000,
+                true,
+                Some(70_000),
+                now + Duration::from_secs(second),
+            );
+        }
         assert_eq!(auto.quality(), TranscodeQuality::Low);
+    }
+
+    #[test]
+    fn hq_at_modest_headroom_and_a_single_poor_sample_do_not_downgrade() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        auto.resume(TranscodeQuality::High);
+        for second in 0..=60 {
+            let rate = if second == 20 { 60_000 } else { 180_000 };
+            auto.observe(
+                7000,
+                8000,
+                true,
+                Some(rate),
+                now + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(auto.quality(), TranscodeQuality::High);
+        // Buffer pressure remains an urgent override, even without a rate sample.
+        auto.observe(2000, 8000, true, None, now + Duration::from_secs(61));
+        assert_eq!(auto.quality(), TranscodeQuality::Medium);
+    }
+
+    #[test]
+    fn missing_samples_report_gaps_and_pauses_cannot_extend_delivery_pressure() {
+        let now = Instant::now();
+        for (target, rate, gap) in [
+            (8000, None, 1),
+            (2000, Some(10_000), 1),
+            (8000, Some(10_000), 10),
+        ] {
+            let mut auto = AdaptiveQuality::new(now);
+            auto.resume(TranscodeQuality::High);
+            auto.observe(8000, 8000, true, Some(10_000), now + Duration::from_secs(5));
+            auto.observe(7000, target, true, rate, now + Duration::from_secs(5 + gap));
+            auto.observe(
+                6000,
+                8000,
+                true,
+                Some(10_000),
+                now + Duration::from_secs(6 + gap),
+            );
+            assert_eq!(auto.quality(), TranscodeQuality::High);
+        }
+    }
+
+    #[test]
+    fn fresh_headroom_upgrades_in_twenty_seconds_or_ten_with_double_capacity() {
+        let now = Instant::now();
+        for (rate, window) in [(210_000, 20), (400_000, 10)] {
+            let mut auto = AdaptiveQuality::new(now);
+            for second in 0..window {
+                auto.observe(
+                    6500,
+                    8000,
+                    true,
+                    Some(rate),
+                    now + Duration::from_secs(second),
+                );
+            }
+            assert_eq!(auto.quality(), TranscodeQuality::Medium);
+            auto.observe(
+                6500,
+                8000,
+                true,
+                Some(rate),
+                now + Duration::from_secs(window),
+            );
+            assert_eq!(auto.quality(), TranscodeQuality::High);
+        }
+    }
+
+    #[test]
+    fn one_fast_burst_does_not_shorten_the_normal_upgrade_window() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        for second in 0..=15 {
+            auto.observe(
+                6500,
+                8000,
+                true,
+                Some(210_000),
+                now + Duration::from_secs(second),
+            );
+        }
+        auto.observe(
+            6500,
+            8000,
+            true,
+            Some(1_000_000),
+            now + Duration::from_secs(16),
+        );
+        assert_eq!(auto.quality(), TranscodeQuality::Medium);
+        for second in 17..=20 {
+            auto.observe(
+                6500,
+                8000,
+                true,
+                Some(210_000),
+                now + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(auto.quality(), TranscodeQuality::High);
+    }
+
+    #[test]
+    fn cold_or_prepared_reserves_do_not_overwrite_recent_audible_quality() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        auto.resume(TranscodeQuality::High);
+        auto.observe(0, 8000, true, None, now);
+        assert!(auto.remembered_quality(8000).is_none());
+        auto.observe(5000, 5000, true, Some(10_000), now + Duration::from_secs(1));
+        assert!(auto.remembered_quality(5000).is_none());
+        // Refresh at handoff if the preceding track changed quality after preparation.
+        auto.resume_first_active(TranscodeQuality::Low, 8000);
+        assert_eq!(auto.quality(), TranscodeQuality::High); // already reported active
+        let mut prepared = AdaptiveQuality::new(now);
+        prepared.observe(2000, 2000, true, None, now);
+        prepared.resume_first_active(TranscodeQuality::High, 8000);
+        assert_eq!(prepared.quality(), TranscodeQuality::High);
+        prepared.observe(
+            6000,
+            8000,
+            true,
+            Some(200_000),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            prepared.remembered_quality(8000),
+            Some(TranscodeQuality::High)
+        );
+        assert!(prepared.remembered_quality(2000).is_none());
     }
 
     #[test]
