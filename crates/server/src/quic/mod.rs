@@ -53,6 +53,8 @@ enum ControlMessage {
         mode: Option<String>,
         #[serde(default)]
         adaptive_ranges: bool,
+        #[serde(default)]
+        adaptive_original: bool,
         quality: Option<String>,
         frame_ms: Option<u32>,
         queue: Option<Vec<String>>,
@@ -129,6 +131,8 @@ enum ControlResponse<'a> {
         end_of_track: bool,
         source_version: &'a str,
         adaptive_ranges: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        original: Option<source::OriginalDescriptor>,
     },
     #[serde(rename = "open_ok")]
     OpenOk { track_id: &'a str },
@@ -339,6 +343,7 @@ struct SessionState {
     playback_frame_ms: u32,
     playback_quality: TranscodeQuality,
     adaptive_quality: Option<adaptive::AdaptiveQuality>,
+    adaptive_original: bool,
     buffer_target_ms: u32,
     client_buffer_ms: u32,
     last_buffer_report: Instant,
@@ -376,6 +381,7 @@ impl SessionState {
             playback_frame_ms: 20,
             playback_quality: TranscodeQuality::High,
             adaptive_quality: None,
+            adaptive_original: false,
             buffer_target_ms: 8000,
             client_buffer_ms: 0,
             last_buffer_report: now,
@@ -1058,6 +1064,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             track_id,
             mode,
             adaptive_ranges,
+            adaptive_original,
             quality,
             frame_ms,
             queue,
@@ -1086,6 +1093,7 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 adaptive_ranges,
                 Instant::now(),
             );
+            client.session.adaptive_original = adaptive_original && client.session.adaptive_quality.is_some();
             client.session.open_request_id = request_id;
             cancel_source_ranges(&mut client.session, &mut client.conn);
             client.session.pending_seek_id = None;
@@ -1411,6 +1419,7 @@ struct PreparedRangeStream {
     range_end_ms: u32,
     end_of_track: bool,
     source_version: String,
+    original: Option<source::OriginalDescriptor>,
 }
 
 fn spawn_track_transcode(
@@ -1421,6 +1430,7 @@ fn spawn_track_transcode(
     quality: TranscodeQuality,
     start_ms: u32,
     operation: Option<OperationTiming>,
+    adaptive_original: bool,
 ) -> Result<PreparedRangeStream, String> {
     if state.shutdown.is_cancelled() {
         return Err("server shutting down".into());
@@ -1446,6 +1456,16 @@ fn spawn_track_transcode(
         .with_source(&path)
         .map_err(|error| error.to_string())?;
     let source_version = key.source_version().to_owned();
+    let original = if adaptive_original {
+        let descriptor = source::describe(&path, track_id, meta.duration_ms)?;
+        let current = key.clone().with_source(&path).map_err(|error| error.to_string())?;
+        if current.source_version() != source_version {
+            return Err("source changed while preparing Auto audio".into());
+        }
+        Some(descriptor)
+    } else {
+        None
+    };
     let end_of_track = range_end_ms >= meta.duration_ms;
     let shared = state.stream_cache.enabled();
     let writer = state
@@ -1538,6 +1558,7 @@ fn spawn_track_transcode(
         range_end_ms,
         end_of_track,
         source_version,
+        original,
     })
 }
 
@@ -1621,7 +1642,7 @@ fn start_track_stream(
         None
     };
     let prepared = spawn_track_transcode(
-        state, &track_id, frame_ms, mode, quality, start_ms, operation,
+        state, &track_id, frame_ms, mode, quality, start_ms, operation, client.session.adaptive_original,
     )?;
 
     let stream_id = create_server_uni_stream(&mut client.session, &mut client.conn)
@@ -1679,6 +1700,7 @@ fn start_track_stream(
             end_of_track: prepared.end_of_track,
             source_version: &prepared.source_version,
             adaptive_ranges: client.session.adaptive_quality.is_some(),
+            original: prepared.original,
         },
     );
 
@@ -2850,6 +2872,42 @@ mod streaming_tests {
     }
 
     #[test]
+    fn auto_original_is_explicitly_negotiated_and_announces_a_pinned_file() {
+        for enabled in [false, true] {
+            let message = format!("{{\"type\":\"open\",\"track_id\":\"track\",\"mode\":\"auto\",\"adaptive_ranges\":true,\"adaptive_original\":{enabled}}}");
+            let ControlMessage::Open {
+                adaptive_original, ..
+            } = serde_json::from_str(&message).unwrap()
+            else {
+                panic!("open");
+            };
+            assert_eq!(adaptive_original, enabled);
+        }
+        let response = ControlResponse::Stream {
+            request_id: Some(1),
+            track_id: "track",
+            stream_id: 3,
+            role: "active",
+            frame_ms: 20,
+            seek_id: None,
+            position_ms: 0,
+            range_end_ms: 5000,
+            end_of_track: false,
+            source_version: "opus-presentation-version",
+            adaptive_ranges: true,
+            original: Some(source::OriginalDescriptor {
+                source_version: "original-file-version".into(),
+                total_length: 123456,
+                duration_ms: 20000,
+            }),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["original"]["source_version"], "original-file-version");
+        assert_eq!(json["original"]["total_length"], 123456);
+        assert_eq!(json["source_version"], "opus-presentation-version");
+    }
+
+    #[test]
     fn request_generation_and_seek_range_are_announced_out_of_band() {
         let response = ControlResponse::Stream {
             request_id: Some(42),
@@ -2863,6 +2921,7 @@ mod streaming_tests {
             end_of_track: false,
             source_version: "version",
             adaptive_ranges: false,
+            original: None,
         };
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["request_id"], 42);

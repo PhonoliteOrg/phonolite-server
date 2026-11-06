@@ -66,6 +66,28 @@ pub(super) struct SourceWindow {
     pub bytes: Bytes,
 }
 
+/// A pinned source identity shared with the client's parallel Auto decoder.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct OriginalDescriptor {
+    pub source_version: String,
+    pub total_length: u64,
+    pub duration_ms: u32,
+}
+
+pub(super) fn describe(
+    path: &Path,
+    track_id: &str,
+    duration_ms: u32,
+) -> Result<OriginalDescriptor, String> {
+    let file = File::open(path).map_err(|error| format!("source open failed: {error}"))?;
+    let identity = SourceIdentity::read(&file, path)?;
+    Ok(OriginalDescriptor {
+        source_version: identity.version(path, track_id),
+        total_length: identity.length,
+        duration_ms,
+    })
+}
+
 pub(super) struct PendingSource {
     pub request_id: u64,
     pub track_id: String,
@@ -831,6 +853,18 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().unwrap().len(), SOURCE_CHUNK_BYTES);
         assert!(rx.try_recv().is_err());
         assert!(shutdown.drain(std::time::Duration::from_secs(2)).await);
+    }
+
+    #[test]
+    fn auto_descriptor_pins_the_same_identity_as_original_reads() {
+        let source = SourceFile::new(b"exact original bytes");
+        let descriptor = describe(&source.0, "original", 20_000).unwrap();
+        let read = window(&source.0, 0, 20, Some(&descriptor.source_version)).unwrap();
+        assert_eq!(descriptor.source_version, read.source_version);
+        assert_eq!(descriptor.total_length, read.total_length);
+        assert_eq!(descriptor.duration_ms, 20_000);
+        std::fs::write(&source.0, b"replacement file content").unwrap();
+        assert!(window(&source.0, 0, 20, Some(&descriptor.source_version)).is_err());
     }
 
     #[test]

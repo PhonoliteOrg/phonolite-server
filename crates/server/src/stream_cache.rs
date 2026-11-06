@@ -57,6 +57,11 @@ impl CacheKey {
             metadata.len(),
             metadata.modified()?
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.source.push_str(&format!(":{}:{}", metadata.dev(), metadata.ino()));
+        }
         Ok(self)
     }
     pub fn with_range(mut self, start_ms: u32) -> Self {

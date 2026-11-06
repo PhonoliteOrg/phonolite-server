@@ -293,9 +293,47 @@ QUIC `open` command. The server acknowledges acceptance with `adaptive_ranges`
 on every `stream` announcement. Missing/false flags retain legacy fixed-quality
 behavior. Clients without range switching support never opt in; older servers ignore the new open field.
 
-Auto selects the existing fixed Low (48 kbit/s), Medium (96 kbit/s) and High
-(160 kbit/s) renditions, starting at Medium. It does not continuously retune a
-running encoder or switch to Original.
+The server selects fixed Low (48 kbit/s), Medium (96 kbit/s) and High
+(160 kbit/s) safety renditions for Auto, starting at Medium. A capable client
+also requests `adaptive_original: true`. For negotiated Auto sessions, each
+`stream` announcement includes an `original` descriptor containing the Original
+file's `source_version`, `total_length` and `duration_ms`. The file identity is
+the same one validated by `source_open`; the Opus presentation fingerprint
+remains separate. `/api/server/capabilities` advertises
+`adaptive_original_audio: true`. Old clients retain the three Opus renditions;
+new clients receiving no descriptor retain compressed Auto.
+
+The app prepares Original on an independently owned, pinned QUIC decoder once
+compressed reserve has remained above six seconds for two seconds. The decoder
+starts at a future five-second position and builds at most eight seconds of
+normalized PCM. Four seconds ready and useful decoded delivery of at least
+1.15 times playback speed permit a mid-track upgrade. No RTT, zero-loss or
+Wi-Fi-only requirement applies. Subsequent delivery variation is absorbed by
+the reserve; falling below two seconds or a decoder failure selects the ready
+compressed stream and starts a thirty-second retry cooldown. A fully decoded
+tail can drain normally without a needless downgrade.
+Source-rate/channel conversion runs on the existing decoder isolate, keeping
+the output pump independent of network reads and resampling work.
+Preparation retains the native decoder's startup budget. If container setup
+takes long enough to move its planned position behind playback, it seeks to a
+fresh future boundary before collecting the handoff buffer.
+
+Original and Opus share one PCM32 output rate/channel format, one presentation
+clock, and the existing audible-quality timeline. A ten-millisecond linear
+blend joins aligned samples without flushing, reopening the device, or changing
+the playback occurrence. Original is resampled/rechannelled when needed in
+Auto; manually selected Original keeps its existing source-format policy. If
+the output cannot open PCM32, compressed Auto remains available on PCM16.
+
+Compressed audio continues as a safety stream while OG plays, using additional
+network bandwidth and server transcoding. This makes fallback available without
+a seek or a new connection at the handoff. Buffered Original can also continue
+while safety packets are delayed; recovered Opus frames already rendered from
+Original are discarded by presentation position. Optional preparation failures
+leave accepted playback intact. Pause bounds preparation, while seek, stop,
+track replacement and disposal cancel and await the independent decoder.
+Routine ten-second playback samples include `original_reserve_ms`; preparation
+and actual rendition transitions produce individual diagnostic events.
 
 Capable clients send `delivery_metrics: true` and an optional `delivery_bps` in
 buffer reports. The native receiver measures actual audio payload bytes over

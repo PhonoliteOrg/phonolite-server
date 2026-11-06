@@ -781,7 +781,18 @@ mod tests {
 
     #[test]
     fn independently_encoded_auto_renditions_preserve_exact_range_frames() {
-        let frames = 57600u32;
+        auto_range_fixture(false);
+    }
+
+    #[test]
+    fn auto_original_resampling_retains_the_shared_presentation_clock() {
+        auto_range_fixture(true);
+    }
+
+    fn auto_range_fixture(original: bool) {
+        let rate = if original { 44100u32 } else { 48000u32 };
+        let duration_ms = if original { 20000u32 } else { 1200u32 };
+        let frames = rate * duration_ms / 1000;
         let path = std::env::temp_dir().join(format!("phonolite-auto-{}.wav", uuid::Uuid::new_v4()));
         let mut wave = Vec::new();
         wave.extend_from_slice(b"RIFF");
@@ -790,14 +801,15 @@ mod tests {
         wave.extend_from_slice(&16u32.to_le_bytes());
         wave.extend_from_slice(&1u16.to_le_bytes());
         wave.extend_from_slice(&1u16.to_le_bytes());
-        wave.extend_from_slice(&48000u32.to_le_bytes());
-        wave.extend_from_slice(&96000u32.to_le_bytes());
+        wave.extend_from_slice(&rate.to_le_bytes());
+        wave.extend_from_slice(&(rate * 2).to_le_bytes());
         wave.extend_from_slice(&2u16.to_le_bytes());
         wave.extend_from_slice(&16u16.to_le_bytes());
         wave.extend_from_slice(b"data");
         wave.extend_from_slice(&(frames * 2).to_le_bytes());
         for frame in 0..frames {
-            let sample = ((f64::from(frame) * 0.0576).sin() * 10000.0) as i16;
+            let sample =
+                ((f64::from(frame) * 0.0576 * 48000.0 / f64::from(rate)).sin() * 10000.0) as i16;
             wave.extend_from_slice(&sample.to_le_bytes());
         }
         std::fs::write(&path, wave).unwrap();
@@ -806,13 +818,23 @@ mod tests {
         let mut version = None;
         let mut fixture_ranges = Vec::new();
         let mut joined = Vec::new();
-        for (start, end, quality) in [
-            (0, 240, TranscodeQuality::Medium),
-            (240, 480, TranscodeQuality::Low),
-            (480, 720, TranscodeQuality::Medium),
-            (720, 960, TranscodeQuality::High),
-            (960, 1200, TranscodeQuality::Low),
-        ] {
+        let ranges = if original {
+            vec![
+                (0, 5000, TranscodeQuality::Medium),
+                (5000, 10000, TranscodeQuality::High),
+                (10000, 15000, TranscodeQuality::High),
+                (15000, 20000, TranscodeQuality::High),
+            ]
+        } else {
+            vec![
+                (0, 240, TranscodeQuality::Medium),
+                (240, 480, TranscodeQuality::Low),
+                (480, 720, TranscodeQuality::Medium),
+                (720, 960, TranscodeQuality::High),
+                (960, 1200, TranscodeQuality::Low),
+            ]
+        };
+        for (start, end, quality) in ranges {
             let key = CacheKey::new("auto", 20, TranscodeMode::Fixed, quality)
                 .with_range(start)
                 .with_source(&path)
@@ -834,7 +856,7 @@ mod tests {
                     title: "tone".into(),
                     artist: String::new(),
                     album: String::new(),
-                    duration_ms: 1200,
+                    duration_ms,
                     codec: "pcm".into(),
                     container: "wav".into(),
                 },
@@ -844,7 +866,7 @@ mod tests {
             )
             .unwrap();
             writer.finalize().unwrap();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
             cache
                 .reader(&key)
                 .unwrap()
@@ -872,14 +894,24 @@ mod tests {
             assert!(samples.len() >= skip + audible as usize);
             rendered += samples[skip..skip + audible as usize].len() as u64;
             joined.extend_from_slice(&samples[skip..skip + audible as usize]);
+            let payload = if original {
+                use base64::Engine as _;
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(payload))
+            } else {
+                serde_json::json!(payload)
+            };
             fixture_ranges.push(serde_json::json!({
                 "start_ms": start, "end_ms": end,
                 "bitrate_bps": quality_bitrate(quality), "payload": payload,
             }));
         }
         std::fs::remove_file(path).unwrap();
-        assert_eq!(rendered, u64::from(frames));
-        for boundary in [240usize, 480, 720, 960] {
+        assert_eq!(rendered, u64::from(duration_ms) * 48);
+        for boundary in if original {
+            vec![5000usize, 10000, 15000]
+        } else {
+            vec![240usize, 480, 720, 960]
+        } {
             let center = boundary * 48;
             let mut error = 0.0;
             let mut energy = 0.0;
@@ -888,13 +920,21 @@ mod tests {
                 error += (f64::from(joined[index]) - expected).powi(2);
                 energy += expected.powi(2);
             }
-            assert!(error / energy < 0.05, "boundary {boundary}ms: {}", error / energy);
+            assert!(
+                error / energy < 0.05,
+                "boundary {boundary}ms: {}",
+                error / energy
+            );
         }
         // Optional deterministic export is shared with the app's real-decoder
         // continuity test; ordinary server checks only use temporary source data.
-        if let Ok(path) = std::env::var("PHONOLITE_AUTO_QUALITY_FIXTURE") {
+        if let Ok(path) = std::env::var(if original {
+            "PHONOLITE_AUTO_ORIGINAL_FIXTURE"
+        } else {
+            "PHONOLITE_AUTO_QUALITY_FIXTURE"
+        }) {
             let fixture = serde_json::json!({
-                "sample_rate": 48000, "channels": 1, "duration_ms": 1200,
+                "sample_rate": 48000, "channels": 1, "duration_ms": duration_ms, "original_sample_rate": rate,
                 "amplitude": 10000, "angular_frequency": 0.0576,
                 "ranges": fixture_ranges,
             });
