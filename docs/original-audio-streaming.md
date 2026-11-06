@@ -291,18 +291,48 @@ or dropping audible audio at boundaries.
 client explicitly requests `adaptive_ranges: true` with `mode: "auto"` on the
 QUIC `open` command. The server acknowledges acceptance with `adaptive_ranges`
 on every `stream` announcement. Missing/false flags retain legacy fixed-quality
-behavior. An old client never opts in; an old server ignores the new open field.
+behavior. Clients without range switching support never opt in; older servers ignore the new open field.
 
-Auto begins at 96 kbit/s. Buffer reports below three seconds after a five-second
-cooldown reduce the desired rendition one level (160/96/48 kbit/s). A reserve
-of 8–12 seconds, according to the requested horizon, must remain healthy for
-thirty seconds before upgrading one level. Intentionally small paused/prepared
-horizons do not drive adaptation. New independently encoded five-second ranges
-use the selected quality; in-flight ranges retain their original encoder and
-cache key. Renditions remain isolated by quality. The client validates the
-source identity and output format while permitting negotiated bitrate changes,
-then applies each range's preroll and exact presentation trimming as usual.
+Auto selects the existing fixed Low (48 kbit/s), Medium (96 kbit/s) and High
+(160 kbit/s) renditions, starting at Medium. It does not continuously retune a
+running encoder or switch to Original.
+
+Capable clients send `delivery_metrics: true` and an optional `delivery_bps` in
+buffer reports. The native receiver measures actual audio payload bytes over
+active range delivery time, excluding reported read-ahead backpressure, pauses
+and a full local delivery queue. Inter-range idle time is not a slow-network
+sample, tiny tails cannot establish capacity, and samples expire after ten
+seconds. Useful delivery evidence survives a range ending before its QUIC FIN
+is consumed. A demanded stalled transfer can report zero; an unavailable sample
+is omitted. This measures useful delivery, not radio bars. Older clients omit
+the fields and retain their buffer-based adaptation; older servers ignore them.
+
+After a five-second change cooldown, a buffer below three seconds or measured
+delivery below 125% of the current preset reduces quality. A severe throughput
+drop can move directly to Low. To upgrade one step, the client must maintain an
+8–12-second reserve and measured capacity of at least 150% of the next preset
+for thirty seconds. Missing measurements or a reporting gap longer than three
+seconds restart that stability window. Paused/prepared horizons do not drive
+adaptation.
+
+New independently encoded five-second ranges use the selected fixed quality;
+in-flight and buffered ranges retain their existing encoder and cache key.
+Renditions remain isolated by quality. The client accepts only the three known
+presets after negotiating Auto, while retaining source identity, track and
+output-format validation. Each range's encoder preroll and exact frame trimming
+join one continuous PCM timeline on the same output; a quality change does not
+flush the device or restart the track. Decoder diagnostics report the ranges in
+decode order rather than comparing a prefetched header with a lagging cursor.
 Original and manually selected HQ/MQ/LQ retain their requested quality.
+
+The server's `independently_encoded_auto_renditions_preserve_exact_range_frames`
+test checks repeated up/down switches and signal continuity around every join.
+Set `PHONOLITE_AUTO_QUALITY_FIXTURE` when running that test to regenerate the
+app's `test/fixtures/audio/auto_quality_ranges.json`. The app's
+`auto_quality_streaming_test.dart` replays those bytes through the production
+receiver, cache and native Opus decoder, checking one output, one start, exact
+frame counts and boundary signal error. It requires `PHONOLITE_OPUS_LIBRARY` to
+point to a compiled native Opus library; neither test launches an app or server.
 
 ## Poor-network verification
 

@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn independently_encoded_auto_renditions_preserve_exact_range_frames() {
-        let frames = 19200u32;
+        let frames = 57600u32;
         let path = std::env::temp_dir().join(format!("phonolite-auto-{}.wav", uuid::Uuid::new_v4()));
         let mut wave = Vec::new();
         wave.extend_from_slice(b"RIFF");
@@ -804,10 +804,14 @@ mod tests {
         let cache = StreamCache::new(PathBuf::new(), true);
         let mut rendered = 0u64;
         let mut version = None;
+        let mut fixture_ranges = Vec::new();
+        let mut joined = Vec::new();
         for (start, end, quality) in [
-            (0, 100, TranscodeQuality::High),
-            (100, 200, TranscodeQuality::Medium),
-            (200, 400, TranscodeQuality::Low),
+            (0, 240, TranscodeQuality::Medium),
+            (240, 480, TranscodeQuality::Low),
+            (480, 720, TranscodeQuality::Medium),
+            (720, 960, TranscodeQuality::High),
+            (960, 1200, TranscodeQuality::Low),
         ] {
             let key = CacheKey::new("auto", 20, TranscodeMode::Fixed, quality)
                 .with_range(start)
@@ -826,11 +830,11 @@ mod tests {
                 },
                 20,
                 RawOpusMeta {
-                    track_id: "auto".into(),
+                    track_id: "track".into(),
                     title: "tone".into(),
                     artist: String::new(),
                     album: String::new(),
-                    duration_ms: 400,
+                    duration_ms: 1200,
                     codec: "pcm".into(),
                     container: "wav".into(),
                 },
@@ -858,16 +862,44 @@ mod tests {
             assert_eq!(audible, u64::from(end - start) * 48);
             let mut decoder = OpusDecoderWrapper::new(48000, 1).unwrap();
             let mut samples = Vec::new();
+            let mut payload = header.to_vec();
             while let Ok(Ok(packet)) = rx.try_recv() {
+                payload.extend_from_slice(&packet);
                 if packet.as_ref() != [0, 0] {
                     samples.extend(decoder.decode(&packet[2..]).unwrap());
                 }
             }
             assert!(samples.len() >= skip + audible as usize);
             rendered += samples[skip..skip + audible as usize].len() as u64;
+            joined.extend_from_slice(&samples[skip..skip + audible as usize]);
+            fixture_ranges.push(serde_json::json!({
+                "start_ms": start, "end_ms": end,
+                "bitrate_bps": quality_bitrate(quality), "payload": payload,
+            }));
         }
         std::fs::remove_file(path).unwrap();
         assert_eq!(rendered, u64::from(frames));
+        for boundary in [240usize, 480, 720, 960] {
+            let center = boundary * 48;
+            let mut error = 0.0;
+            let mut energy = 0.0;
+            for index in center - 240..center + 240 {
+                let expected = (index as f64 * 0.0576).sin() * 10000.0;
+                error += (f64::from(joined[index]) - expected).powi(2);
+                energy += expected.powi(2);
+            }
+            assert!(error / energy < 0.05, "boundary {boundary}ms: {}", error / energy);
+        }
+        // Optional deterministic export is shared with the app's real-decoder
+        // continuity test; ordinary server checks only use temporary source data.
+        if let Ok(path) = std::env::var("PHONOLITE_AUTO_QUALITY_FIXTURE") {
+            let fixture = serde_json::json!({
+                "sample_rate": 48000, "channels": 1, "duration_ms": 1200,
+                "amplitude": 10000, "angular_frequency": 0.0576,
+                "ranges": fixture_ranges,
+            });
+            std::fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        }
     }
 
     #[test]

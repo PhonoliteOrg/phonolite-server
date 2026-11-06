@@ -82,6 +82,9 @@ enum ControlMessage {
         request_id: Option<u64>,
         buffer_ms: u32,
         target_ms: Option<u32>,
+        #[serde(default)]
+        delivery_metrics: bool,
+        delivery_bps: Option<u64>,
     },
     #[serde(rename = "seek")]
     Seek {
@@ -1170,6 +1173,8 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
             request_id,
             buffer_ms,
             target_ms,
+            delivery_metrics,
+            delivery_bps,
         } => {
             if request_id.is_some() && request_id != client.session.open_request_id {
                 return;
@@ -1178,6 +1183,8 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 auto.observe(
                     buffer_ms,
                     target_ms.unwrap_or(client.session.buffer_target_ms),
+                    delivery_metrics,
+                    delivery_bps,
                     Instant::now(),
                 );
             }
@@ -2851,6 +2858,42 @@ mod streaming_tests {
         })
         .unwrap();
         assert_eq!(error["request_id"], 42);
+    }
+
+    #[test]
+    fn buffer_telemetry_accepts_measured_delivery_and_legacy_reports() {
+        for (extra, expected_metrics, expected_rate) in [
+            ("", false, None),
+            (",\"delivery_metrics\":true", true, None),
+            (
+                ",\"delivery_metrics\":true,\"delivery_bps\":75000",
+                true,
+                Some(75_000),
+            ),
+            (
+                ",\"delivery_metrics\":true,\"delivery_bps\":0",
+                true,
+                Some(0),
+            ),
+        ] {
+            let mut parser = ControlParser::new();
+            let json = format!(
+                "{{\"type\":\"buffer\",\"request_id\":7,\"buffer_ms\":9000,\"target_ms\":12000{extra}}}\n"
+            );
+            let messages = parser.push(json.as_bytes());
+            let [ControlMessage::Buffer {
+                request_id,
+                delivery_metrics,
+                delivery_bps,
+                ..
+            }] = messages.as_slice()
+            else {
+                panic!("buffer report must preserve connection measurements");
+            };
+            assert_eq!(*request_id, Some(7));
+            assert_eq!(*delivery_metrics, expected_metrics);
+            assert_eq!(*delivery_bps, expected_rate);
+        }
     }
     #[test]
     fn reconnect_open_target_and_seek_generation_are_parsed() {
