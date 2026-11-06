@@ -309,11 +309,41 @@ the fields and retain their buffer-based adaptation; older servers ignore them.
 
 After a five-second change cooldown, a buffer below three seconds or measured
 delivery below 125% of the current preset reduces quality. A severe throughput
-drop can move directly to Low. To upgrade one step, the client must maintain an
-8–12-second reserve and measured capacity of at least 150% of the next preset
+drop can move directly to Low. To upgrade one step, the client must maintain a
+5–10-second reserve (the requested horizon minus three seconds, bounded to that
+range) and measured capacity of at least 150% of the next preset
 for thirty seconds. Missing measurements or a reporting gap longer than three
 seconds restart that stability window. Paused/prepared horizons do not drive
-adaptation.
+adaptation and refresh the normal five-second refill grace, so becoming audible
+with a small prepared reserve does not immediately force Low. Active Auto retains an eight-second horizon on loopback too, so
+localhost playback is not mistaken for an intentionally short paused/prepared
+request. The upgrade reserve stays below the read-ahead ceiling, allowing normal
+consumption/refill cycles to satisfy the stability window.
+
+Buffer reports include retained PCM plus nonoverlapping encoded coverage while
+a continuation or reconnect waits for its next header. Only a cold start or an
+uncached seek reports no reserve for the new position. A range request does not
+empty accepted playback or reset Auto's stability timer merely by changing the
+transport generation. Starting at Medium still requires one thirty-second
+healthy interval to select High; Low needs two steps. Already queued audio and
+range boundaries add delay before the visible audible-quality tag changes.
+
+Auto diagnostics use ten-second intervals. The native `QUIC client stats`
+sample with `diagnostics_revision=2` includes demanded payload goodput, its
+sample age, receiver suspension, range bytes/demand time, and the last
+buffer/target/rate report sent to the server. The paired `Auto playback sample`
+records audible quality, playable and PCM reserve, position, and pause/refill/
+continuation/repair state. Native QUIC path `delivery_rate` describes the
+sender's ACK feedback; it must not be interpreted as downloaded audio capacity.
+
+The server's `QUIC Auto quality sample` with `policy_revision=2` records the
+selected rendition, active decision reason, required upgrade reserve/rate,
+healthy-window duration, and cumulative window resets with the last reset
+reason. Decisions still run on every buffer report; logging does not throttle
+adaptation. Resets between samples remain visible in the counter. Revision 2
+identifies the refill-margin/continuation fixes and these diagnostics. Capture
+both updated builds before tuning thresholds; old logs cannot distinguish
+missing capacity evidence from low headroom or a repeatedly reset window.
 
 New independently encoded five-second ranges use the selected fixed quality;
 in-flight and buffered ranges retain their existing encoder and cache key.

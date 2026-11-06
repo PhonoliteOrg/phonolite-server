@@ -1180,13 +1180,32 @@ fn handle_control_message(state: &AppState, client: &mut ClientConn, msg: Contro
                 return;
             }
             if let Some(auto) = client.session.adaptive_quality.as_mut() {
-                auto.observe(
+                let target = target_ms.unwrap_or(client.session.buffer_target_ms);
+                if let Some(sample) = auto.observe(
                     buffer_ms,
-                    target_ms.unwrap_or(client.session.buffer_target_ms),
+                    target,
                     delivery_metrics,
                     delivery_bps,
                     Instant::now(),
-                );
+                ) {
+                    tracing::info!(
+                        policy_revision = 2,
+                        request_id,
+                        quality = ?sample.quality,
+                        reason = sample.reason,
+                        buffer_ms,
+                        target_ms = target,
+                        delivery_metrics,
+                        delivery_bps,
+                        upgrade_buffer_ms = sample.upgrade_buffer_ms,
+                        upgrade_bps = sample.upgrade_bps,
+                        healthy_ms = sample.healthy_ms as u64,
+                        report_gap = sample.report_gap,
+                        window_resets = sample.window_resets,
+                        last_reset_reason = sample.last_reset_reason,
+                        "QUIC Auto quality sample"
+                    );
+                }
             }
             client.session.client_buffer_ms = buffer_ms;
             client.session.last_buffer_report = Instant::now();

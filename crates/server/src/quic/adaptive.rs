@@ -8,6 +8,20 @@ pub(super) struct AdaptiveQuality {
     last_change: Instant,
     high_since: Option<Instant>,
     last_observed: Option<Instant>,
+    last_diagnostic: Option<Instant>,
+    window_resets: u32,
+    last_reset_reason: &'static str,
+}
+
+pub(super) struct AutoDiagnostic {
+    pub reason: &'static str,
+    pub quality: TranscodeQuality,
+    pub upgrade_buffer_ms: u32,
+    pub upgrade_bps: Option<u64>,
+    pub healthy_ms: u128,
+    pub report_gap: bool,
+    pub window_resets: u32,
+    pub last_reset_reason: &'static str,
 }
 
 impl AdaptiveQuality {
@@ -21,6 +35,9 @@ impl AdaptiveQuality {
             last_change: now,
             high_since: None,
             last_observed: None,
+            last_diagnostic: None,
+            window_resets: 0,
+            last_reset_reason: "none",
         }
     }
 
@@ -35,20 +52,62 @@ impl AdaptiveQuality {
         delivery_metrics: bool,
         delivery_bps: Option<u64>,
         now: Instant,
-    ) {
-        if delivery_metrics
+    ) -> Option<AutoDiagnostic> {
+        let report_gap = delivery_metrics
             && self.last_observed.is_some_and(|previous| {
                 now.saturating_duration_since(previous) > Duration::from_secs(3)
-            })
-        {
+            });
+        let was_healthy = self.high_since.is_some();
+        if report_gap {
             self.high_since = None;
         }
         self.last_observed = Some(now);
+        let reason = self.evaluate(buffered_ms, target_ms, delivery_metrics, delivery_bps, now);
+        if was_healthy && (report_gap || self.high_since.is_none()) {
+            self.window_resets = self.window_resets.saturating_add(1);
+            self.last_reset_reason = if report_gap { "report_gap" } else { reason };
+        }
+        if self.last_diagnostic.is_some_and(|previous| {
+            now.saturating_duration_since(previous) < Duration::from_secs(10)
+        }) {
+            return None;
+        }
+        self.last_diagnostic = Some(now);
+        let higher = match self.quality {
+            TranscodeQuality::Low => Some(TranscodeQuality::Medium),
+            TranscodeQuality::Medium => Some(TranscodeQuality::High),
+            TranscodeQuality::High => None,
+        };
+        Some(AutoDiagnostic {
+            reason,
+            quality: self.quality,
+            upgrade_buffer_ms: target_ms.saturating_sub(3000).clamp(5000, 10000),
+            upgrade_bps: higher.map(|quality| u64::from(quality_bitrate(quality)) * 3 / 2),
+            healthy_ms: self
+                .high_since
+                .map_or(0, |since| now.saturating_duration_since(since).as_millis()),
+            report_gap,
+            window_resets: self.window_resets,
+            last_reset_reason: self.last_reset_reason,
+        })
+    }
+
+    fn evaluate(
+        &mut self,
+        buffered_ms: u32,
+        target_ms: u32,
+        delivery_metrics: bool,
+        delivery_bps: Option<u64>,
+        now: Instant,
+    ) -> &'static str {
         // Paused/prepared clients intentionally keep a small horizon. This is
         // backpressure, not evidence that their network cannot sustain audio.
         if target_ms < 8000 {
             self.high_since = None;
-            return;
+            // Its intentionally small reserve needs the same refill grace as
+            // a cold start when playback becomes active again.
+            self.last_change = now;
+            return "inactive_horizon";
         }
         let delivery_bps = delivery_bps.filter(|_| delivery_metrics);
         let insufficient_delivery = delivery_bps
@@ -72,18 +131,25 @@ impl AdaptiveQuality {
                 };
                 self.last_change = now;
             }
-            return;
+            return if buffered_ms < 3000 {
+                "low_reserve"
+            } else {
+                "low_delivery"
+            };
         }
 
-        let upgrade_buffer = target_ms.saturating_sub(1000).clamp(8000, 12000);
+        // Playback must fall below the fetch ceiling to request more audio.
+        // Leave a real refill margin instead of requiring an eight-second
+        // reserve to remain continuously full against an eight-second target.
+        let upgrade_buffer = target_ms.saturating_sub(3000).clamp(5000, 10000);
         if buffered_ms < upgrade_buffer {
             self.high_since = None;
-            return;
+            return "upgrade_reserve";
         }
         let higher = match self.quality {
             TranscodeQuality::Low => TranscodeQuality::Medium,
             TranscodeQuality::Medium => TranscodeQuality::High,
-            TranscodeQuality::High => return,
+            TranscodeQuality::High => return "highest_quality",
         };
         // Old adaptive clients retain their buffer-based policy. A measured
         // client must prove headroom; an absent/stale sample is not fast LTE.
@@ -91,20 +157,95 @@ impl AdaptiveQuality {
             && !delivery_bps.is_some_and(|rate| rate >= u64::from(quality_bitrate(higher)) * 3 / 2)
         {
             self.high_since = None;
-            return;
+            return if delivery_bps.is_none() {
+                "missing_delivery_sample"
+            } else {
+                "upgrade_headroom"
+            };
         }
         let since = *self.high_since.get_or_insert(now);
         if now.duration_since(since) >= Duration::from_secs(30) {
             self.quality = higher;
             self.last_change = now;
             self.high_since = Some(now);
+            return "upgraded";
         }
+        "healthy_window"
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_is_bounded_without_throttling_quality_decisions() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        let initial = auto
+            .observe(8500, 8000, true, Some(1_000_000), now)
+            .unwrap();
+        assert_eq!(initial.reason, "healthy_window");
+        assert_eq!(initial.upgrade_buffer_ms, 5000);
+        assert_eq!(initial.upgrade_bps, Some(240_000));
+        for second in 1..10 {
+            assert!(auto
+                .observe(
+                    500,
+                    8000,
+                    true,
+                    Some(70_000),
+                    now + Duration::from_secs(second)
+                )
+                .is_none());
+        }
+        assert_eq!(auto.quality(), TranscodeQuality::Low);
+        let sample = auto
+            .observe(
+                8500,
+                8000,
+                true,
+                Some(1_000_000),
+                now + Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(sample.quality, TranscodeQuality::Low);
+        assert_eq!(sample.last_reset_reason, "low_reserve");
+        assert_eq!(sample.window_resets, 1);
+    }
+
+    #[test]
+    fn diagnostic_distinguishes_unavailable_capacity_from_insufficient_headroom() {
+        let now = Instant::now();
+        for (rate, reason) in [
+            (None, "missing_delivery_sample"),
+            (Some(190_000), "upgrade_headroom"),
+        ] {
+            let mut auto = AdaptiveQuality::new(now);
+            let sample = auto.observe(8500, 8000, true, rate, now).unwrap();
+            assert_eq!(sample.reason, reason);
+            assert_eq!(sample.healthy_ms, 0);
+            assert_eq!(sample.quality, TranscodeQuality::Medium);
+        }
+    }
+
+    #[test]
+    fn diagnostic_retains_brief_window_resets_between_log_intervals() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        let _ = auto.observe(8500, 8000, true, Some(1_000_000), now);
+        for second in 1..=10 {
+            let rate = if second == 5 { None } else { Some(1_000_000) };
+            let sample = auto.observe(8500, 8000, true, rate, now + Duration::from_secs(second));
+            if second == 10 {
+                let sample = sample.unwrap();
+                assert_eq!(sample.reason, "healthy_window");
+                assert_eq!(sample.healthy_ms, 4000);
+                assert_eq!(sample.window_resets, 1);
+                assert_eq!(sample.last_reset_reason, "missing_delivery_sample");
+            }
+        }
+    }
 
     #[test]
     fn adaptation_requires_both_auto_and_explicit_client_support() {
@@ -114,6 +255,49 @@ mod tests {
         assert!(AdaptiveQuality::negotiate(Some("original"), true, now).is_none());
         assert!(AdaptiveQuality::negotiate(None, true, now).is_none());
         assert!(AdaptiveQuality::negotiate(Some("auto"), true, now).is_some());
+    }
+
+    #[test]
+    fn normal_eight_second_read_ahead_can_upgrade_across_healthy_refill_cycles() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        for second in 0..=30 {
+            // Playback consumes some reserve before the next fixed range
+            // replenishes it. Crossing below the fetch ceiling is normal.
+            let reserve = if second % 5 == 0 { 6500 } else { 8500 };
+            auto.observe(
+                reserve,
+                8000,
+                true,
+                Some(1_000_000),
+                now + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(auto.quality(), TranscodeQuality::High);
+    }
+
+    #[test]
+    fn a_prepared_track_gets_the_normal_refill_grace_when_it_becomes_active() {
+        let now = Instant::now();
+        let mut auto = AdaptiveQuality::new(now);
+        auto.observe(2000, 2000, true, None, now + Duration::from_secs(120));
+        auto.observe(
+            2000,
+            8000,
+            true,
+            Some(1_000_000),
+            now + Duration::from_secs(121),
+        );
+        assert_eq!(auto.quality(), TranscodeQuality::Medium);
+        // Genuine pressure after the normal grace still lowers the rendition.
+        auto.observe(
+            500,
+            8000,
+            true,
+            Some(75_000),
+            now + Duration::from_secs(126),
+        );
+        assert_eq!(auto.quality(), TranscodeQuality::Low);
     }
 
     #[test]
